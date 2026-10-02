@@ -61,8 +61,62 @@ CASES = [
 ]
 
 
+SAFE_PLATFORM_ERRORS = {
+    "Io", "InvalidJson", "Authentication", "KeyUnavailable", "KeyLost",
+    "UnsupportedSecretService", "UnsupportedContext", "Busy", "Conflict",
+    "UnsafePath", "InvalidPayload",
+}
+SAFE_RUST_FILES = {"active.rs", "files.rs", "paths.rs", "protection.rs", "vault.rs", "lib.rs", "linux_vault.rs"}
+
+
+def safe_failure_metadata(output: bytes = b"", exit_code: int | None = None) -> dict[str, object]:
+    """Extract only source coordinates and safe enum names, never panic values."""
+    locations = []
+    for match in re.finditer(rb"crates[/\\]switcher-platform[/\\]src[/\\]([a-z_]+\.rs):(\d+):(\d+)", output):
+        filename = match.group(1).decode("ascii")
+        if filename in SAFE_RUST_FILES:
+            location = {"file": "crates/switcher-platform/src/" + filename,
+                        "line": int(match.group(2)), "column": int(match.group(3))}
+            if location not in locations:
+                locations.append(location)
+    errors = sorted({match.group(1).decode("ascii") for match in re.finditer(
+        rb"Err value: ([A-Za-z]+)(?:\W|$)", output)
+        if match.group(1).decode("ascii") in SAFE_PLATFORM_ERRORS})
+    metadata: dict[str, object] = {"panicLocations": locations, "platformErrors": errors}
+    if exit_code is not None:
+        metadata["exitCode"] = exit_code
+    return metadata
+
+
+def validate_failure_metadata(value: object) -> dict[str, object]:
+    """Constrain diagnostics received from the nested fixture subprocess."""
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, object] = {}
+    code = value.get("exitCode")
+    if isinstance(code, int) and -128 <= code <= 255:
+        result["exitCode"] = code
+    result["platformErrors"] = sorted({error for error in value.get("platformErrors", [])
+        if isinstance(error, str) and error in SAFE_PLATFORM_ERRORS})
+    locations = []
+    for item in value.get("panicLocations", []):
+        if not isinstance(item, dict):
+            continue
+        filename, line, column = item.get("file"), item.get("line"), item.get("column")
+        if (filename in {"crates/switcher-platform/src/" + name for name in SAFE_RUST_FILES}
+            and isinstance(line, int) and 0 < line < 100000
+            and isinstance(column, int) and 0 < column < 100000):
+            locations.append({"file": filename, "line": line, "column": column})
+    result["panicLocations"] = locations
+    return result
+
+
 class FixtureFailure(Exception):
-    """A deliberately redacted error carrying only a static operation name."""
+    """A deliberately redacted error carrying only static operation metadata."""
+
+    def __init__(self, step: str, metadata: dict[str, object] | None = None):
+        super().__init__(step)
+        self.metadata = metadata or {}
 
 
 def checked_run(command: list[str], *, env: dict[str, str], step: str,
@@ -74,7 +128,8 @@ def checked_run(command: list[str], *, env: dict[str, str], step: str,
     except (OSError, subprocess.TimeoutExpired) as error:
         raise FixtureFailure(step) from error
     if result.returncode:
-        raise FixtureFailure(step)
+        metadata = safe_failure_metadata(result.stdout + result.stderr, result.returncode) if command[0] == "cargo" else {}
+        raise FixtureFailure(step, metadata)
     return result
 
 
@@ -211,8 +266,14 @@ def start_daemon(env: dict[str, str]) -> subprocess.Popen[bytes]:
 
 def native_test(env: dict[str, str], name: str) -> None:
     print("Running isolated fixture: " + name, flush=True)
+    step = name
+    if name == "linux_secret_service_process_native":
+        phase = env.get("PRIMERSWITCH_NATIVE_PHASE")
+        if phase not in ("create", "reopen"):
+            raise FixtureFailure("unknown_process_fixture_phase")
+        step += "_" + phase
     checked_run(["cargo", "test", "-p", "switcher-platform", "--locked", "--offline", name,
-                 "--", "--ignored", "--test-threads=1"], env=env, step=name, timeout=420)
+                 "--", "--ignored", "--test-threads=1"], env=env, step=step, timeout=420)
 
 
 def inside(mode: str) -> int:
@@ -274,7 +335,14 @@ def run_session(mode: str, config: Path, env: dict[str, str]) -> None:
             # Only a strictly static inner failure token may reach the report.
             match = re.search(rb"^Isolated fixture failed: ([a-z_]+)$", stderr, re.MULTILINE)
             step = match.group(1).decode("ascii") if match else "isolated_" + mode + "_session"
-            raise FixtureFailure(step)
+            metadata_match = re.search(rb"^PRIMERSWITCH_SAFE_FAILURE=(\{[^\n]+\})$", stderr, re.MULTILINE)
+            metadata = {}
+            if metadata_match:
+                try:
+                    metadata = validate_failure_metadata(json.loads(metadata_match.group(1)))
+                except (ValueError, TypeError):
+                    pass
+            raise FixtureFailure(step, metadata)
         # Internal output is constrained to fixture names. Rebuild from static
         # metadata instead of forwarding even trusted child output.
         del stdout
@@ -300,6 +368,8 @@ def main() -> int:
             return inside(args.inside)
         except (FixtureFailure, OSError, KeyError, AssertionError) as error:
             print("Isolated fixture failed: " + (str(error) if isinstance(error, FixtureFailure) else "fixture_context"), file=sys.stderr)
+            if isinstance(error, FixtureFailure) and error.metadata:
+                print("PRIMERSWITCH_SAFE_FAILURE=" + json.dumps(validate_failure_metadata(error.metadata), sort_keys=True), file=sys.stderr)
             return 1
     if sys.platform != "linux":
         parser.error("native execution requires Linux; --validate and --help are safe on other platforms")
@@ -337,6 +407,8 @@ def main() -> int:
         return 0
     except (FixtureFailure, OSError, AssertionError) as error:
         report["failureStep"] = str(error) if isinstance(error, FixtureFailure) else "fixture_runner"
+        if isinstance(error, FixtureFailure) and error.metadata:
+            report["failureMetadata"] = validate_failure_metadata(error.metadata)
         write_report(report)
         print("Linux native storage fixtures failed: " + str(report["failureStep"]), file=sys.stderr)
         return 1

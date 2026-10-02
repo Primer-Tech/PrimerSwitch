@@ -373,12 +373,15 @@ ${EndIf}
         clock = SimpleNamespace(now=0.0)
         identifiers = []
         counts = iter(colors)
+        last = [(1, 0.15)]
         def capture(arguments, **options):
             if arguments[0] == "import":
                 identifiers.append(arguments[2])
                 screenshot.write_bytes(b"\x89PNG\r\n\x1a\nfixture")
                 return b""
-            return str(next(counts, 1)).encode("ascii")
+            value = next(counts, last[0])
+            last[0] = value if isinstance(value, tuple) else (value, 0.15)
+            return f"{last[0][0]} {last[0][1]}".encode("ascii")
         def advance(duration): clock.now += duration
         return screenshot, clock, identifiers, capture, advance
 
@@ -393,6 +396,25 @@ ${EndIf}
 
     def test_accessible_but_unpainted_window_cannot_pass_screenshot_gate(self):
         screenshot, clock, identifiers, capture, advance = self.screenshot_capture_fixture([1])
+        with patch.object(qualification, "output", side_effect=capture), patch.object(qualification.time, "monotonic", side_effect=lambda: clock.now), patch.object(qualification.time, "sleep", side_effect=advance):
+            with self.assertRaisesRegex(qualification.QualificationError, "^native-window-first-paint-timeout$"):
+                qualification.capture_painted_window("0x123", screenshot)
+        self.assertTrue(screenshot.is_file())
+        self.assertEqual(set(identifiers), {"0x123"})
+        self.assertEqual(clock.now, 8)
+
+    def test_capture_waits_for_dark_demo_after_nonblank_light_loading_frame(self):
+        screenshot, clock, identifiers, capture, advance = self.screenshot_capture_fixture([(513, 0.91), (2049, 0.18)])
+        with patch.object(qualification, "output", side_effect=capture), patch.object(qualification.time, "monotonic", side_effect=lambda: clock.now), patch.object(qualification.time, "sleep", side_effect=advance):
+            evidence = qualification.capture_painted_window("0x123", screenshot)
+        self.assertEqual(identifiers, ["0x123", "0x123"])
+        self.assertEqual(evidence["normalizedMean"], 0.18)
+        self.assertEqual(evidence["uniqueColors"], 2049)
+        self.assertEqual(evidence["expectedDefaultTheme"], "dark")
+        self.assertLess(clock.now, 8)
+
+    def test_nonblank_loading_frame_that_stays_light_cannot_pass(self):
+        screenshot, clock, identifiers, capture, advance = self.screenshot_capture_fixture([(2049, 0.91)])
         with patch.object(qualification, "output", side_effect=capture), patch.object(qualification.time, "monotonic", side_effect=lambda: clock.now), patch.object(qualification.time, "sleep", side_effect=advance):
             with self.assertRaisesRegex(qualification.QualificationError, "^native-window-first-paint-timeout$"):
                 qualification.capture_painted_window("0x123", screenshot)

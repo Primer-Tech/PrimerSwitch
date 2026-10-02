@@ -2,6 +2,11 @@ name: Qualify retained native packages
 on:
   workflow_dispatch:
     inputs:
+      platform:
+        description: Native qualification target
+        type: choice
+        options: [both, windows, linux]
+        default: both
       packageRun:
         description: Original same-repository package workflow run
         type: string
@@ -20,11 +25,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: windows-latest
-            bundle: nsis
-          - os: ubuntu-24.04
-            bundle: deb
+        include: ${{ fromJSON(inputs.platform == 'windows' && '[{"os":"windows-latest","bundle":"nsis"}]' || inputs.platform == 'linux' && '[{"os":"ubuntu-24.04","bundle":"deb"}]' || '[{"os":"windows-latest","bundle":"nsis"},{"os":"ubuntu-24.04","bundle":"deb"}]') }}
     runs-on: ${{ matrix.os }}
     env:
       GH_TOKEN: ${{ github.token }}

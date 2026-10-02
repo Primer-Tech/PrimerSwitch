@@ -191,12 +191,17 @@ def capture_painted_window(window_id: str, screenshot: Path, *, duration: float 
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            count = output(["identify", "-format", "%k", str(screenshot)], timeout=min(2.0, remaining)).decode("ascii").strip()
-            # The branded dashboard contains antialiased text and the Primer
-            # image. A flat gray/white frame has only a handful of colors.
-            if re.fullmatch(r"[0-9]+", count) and int(count) > 64:
-                return {"uniqueColors": int(count), "captureAttempts": attempts,
-                        "firstPaintTimeoutSeconds": duration, "minimumUniqueColorsExclusive": 64}
+            metrics = output(["identify", "-format", "%k %[fx:mean]", str(screenshot)], timeout=min(2.0, remaining)).decode("ascii").strip()
+            # ImageMagick's FX values are normalized to 0..1. The default demo
+            # is dark; an initial light loading frame can have many text colors
+            # even while AT-SPI already exposes the loaded demo DOM.
+            match = re.fullmatch(r"([0-9]+) ([0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)", metrics)
+            if match:
+                count, mean = int(match.group(1)), float(match.group(2))
+                if count > 64 and 0 <= mean < 0.5:
+                    return {"uniqueColors": count, "normalizedMean": mean, "captureAttempts": attempts,
+                            "firstPaintTimeoutSeconds": duration, "minimumUniqueColorsExclusive": 64,
+                            "maximumNormalizedMeanExclusive": 0.5, "expectedDefaultTheme": "dark"}
         except (QualificationError, OSError, UnicodeError, subprocess.SubprocessError):
             # A newly mapped window can briefly be unavailable to X11 capture.
             # Retrying remains bounded and never changes renderer/sandbox flags.
@@ -252,7 +257,7 @@ def worker(directory: Path) -> int:
         report["window"] = {key: value for key, value in window.items() if key != "id"}
         report["screenshotSha256"] = sha256(SCREENSHOT.read_bytes())
         report["checks"].update({"visibleNativeWindow": True, "englishAccountsAndSettings": True,
-                                 "nativeDemoSnapshotRendered": True, "nonblankNativeScreenshot": True, "duplicateAutomationNavigationAbsent": True,
+                                 "nativeDemoSnapshotRendered": True, "nonblankNativeScreenshot": True, "expectedDarkDemoFrameCaptured": True, "duplicateAutomationNavigationAbsent": True,
                                  "automationPanelPresent": True, "demoMutationButtonsDisabled": True})
         require(settings[0]["accessible"].queryAction().doAction(0), "settings-navigation-action-failed")
         deadline = time.monotonic() + 15

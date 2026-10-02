@@ -548,7 +548,11 @@
           </section>
           <section class="panel">
             <h2><Icon name="credits" />{t($language, 'codexResetCredits')}</h2>
-            <div class="credits-value">
+            <div
+              class="credits-value"
+              role="status"
+              aria-label={`${selected?.quota?.resetCreditsAvailable ?? t($language, 'unknown')} ${t($language, 'codexReadOnly')}`}
+            >
               <strong>{selected?.quota?.resetCreditsAvailable ?? '—'}</strong
               ><span>{t($language, 'codexReadOnly')}</span>
             </div>

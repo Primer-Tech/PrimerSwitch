@@ -69,6 +69,9 @@ describe('Codex dashboard and guarded workflows', () => {
         .closest('.usage-quota'),
     ).toHaveTextContent('Reset time unknown');
     expect(screen.getByText('12.50')).toBeVisible();
+    expect(
+      screen.getByRole('status', { name: 'Unknown Read-only' }),
+    ).toBeVisible();
     expect(screen.getByText('Personal Codex').closest('tr')).toHaveTextContent(
       'Saved reading',
     );

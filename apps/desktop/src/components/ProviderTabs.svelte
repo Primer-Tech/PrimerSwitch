@@ -37,7 +37,6 @@
   role="tablist"
   tabindex="-1"
   aria-label={t($language, 'providers')}
-  onkeydown={keyboard}
 >
   <button
     id="provider-claude"
@@ -47,6 +46,7 @@
     aria-controls="provider-content"
     tabindex={active === 'claude' ? 0 : -1}
     {disabled}
+    onkeydown={keyboard}
     onclick={() => select('claude')}>✳ Claude</button
   >
   <button
@@ -57,6 +57,7 @@
     aria-controls="provider-content"
     tabindex={active === 'codex' ? 0 : -1}
     {disabled}
+    onkeydown={keyboard}
     onclick={() => select('codex')}>Codex</button
   >
 </div>

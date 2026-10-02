@@ -1,0 +1,31 @@
+# Image-model UI proposals
+
+Created on 2026-10-02 with the built-in image generation tool at the owner's request. The owner selected Direction A (dark dashboard) on 2026-10-02. These generated images are the approved design direction, not screenshots of implemented behavior. The implementation uses English by default, supports Romanian, and offers both light and dark appearances. New installations start in dark mode; explicit saved appearance preferences are preserved.
+
+- [Direction A: dark dashboard](mockups/direction-a-dark.png)
+- [Direction B: light account rows](mockups/direction-b-light.png)
+
+The selected layout must use actual quota percentages and reset times. Do not implement illustrative model dropdowns, manual policy reordering, elapsed-hours quota interpretations or computed billing dates merely because a generated image included them. The provider's metadata, persisted manual renewal estimate and tested policy remain authoritative.
+
+## Implemented interface
+
+- [Dark dashboard](screenshots/dashboard-dark.png)
+- [Light appearance](screenshots/dashboard-light.png)
+
+These are captures of the Svelte implementation with fictional, read-only fixture accounts. The visual checks cover 1160 and 1536 pixel desktop widths, Romanian at 390 pixels, 200% device scale, dialog keyboard operation and focus restoration. They found no page errors, external resources or document overflow. A local table scroll keeps account actions reachable at narrow widths. Native packaged verification is recorded in [the evidence ledger](../migration/PROGRESS.md).
+
+Weekly effective usage is the higher of the overall and matching model limit. Its countdown follows the binding window; missing or ambiguous reset dates remain unknown. Billing dates are explicitly user-entered estimates.
+
+## Prompt A
+
+Use case: ui-mockup. Asset type: a high-fidelity desktop application design proposal, direction A, for PrimerSwitch. Create an exceptionally polished, production-ready Windows desktop UI, not a wireframe and not a marketing landing page. Exercise your own strong visual design judgment. It should feel like a premium modern developer productivity tool: calm, elegant, beautifully spaced, sharp typography, purposeful restrained accents and a clear reading hierarchy. Dark appearance with refined neutral charcoal surfaces and a subtle cool accent; avoid flat murky green, excessive rounded cards, giant empty space, decorative fake charts and dashboard clutter. Show one complete app window in a landscape canvas, straight-on, crisp and readable, no desk or laptop.
+Product facts: PrimerSwitch is an account switcher for AI coding assistants; Claude supported now, Codex planned. English is the default; settings will offer English and Romanian. The main task is understanding current quotas and choosing the next account. Real actions: add account via browser login, import current CLI login, import archive, refresh, switch a saved account, delete a saved account, settings. Show active Claude account, selected model Sonnet, 5-hour and weekly/model-specific usage, reset countdowns, saved accounts with different remaining headroom, next-account consumption order, saved reset credits and a manual subscription renewal estimate. Automation settings include threshold 95%, auto-switch, weekly-window priming and reset-credit use; automation status should be visible without exposing implementation internals. Include an unobtrusive settings/language control.
+Use only fictional accounts with example.invalid email addresses; sample active account Studio with 5-hour usage 68%, weekly overall 47%, Sonnet weekly 58%; next account Personal with 23%/24%; reserve account near its limit. Do not pretend Codex is usable: show it as Coming soon if present.
+Text: render the product name exactly "PrimerSwitch"; concise readable English labels such as "Accounts", "Active account", "5-hour usage", "Weekly usage", "Next up", "Auto-switch on", "Add account", "Switch", "Refresh", "Settings". Design a coherent, visually outstanding actual app that can be implemented in Svelte/Tauri, using standard icons, typography, layout, meters and controls. No branding from unrelated companies. No watermark.
+
+## Prompt B
+
+Use case: ui-mockup. Asset type: a high-fidelity desktop application design proposal, direction B, for PrimerSwitch. Create an exceptionally polished actual Windows desktop UI with your own expert design judgment. This alternative should be distinct from a dark developer dashboard: a beautiful light appearance, warm off-white and ink typography, exceptionally clear information architecture, restrained color, fine separators, excellent alignment and thoughtful compact density. It should feel modern and desirable, like a premium focused productivity application. No marketing landing page, no laptop or desk. One complete app window on a landscape canvas, straight-on and sharp. Do not overuse floating cards, washed-out contrast or generic statistics graphs.
+PrimerSwitch switches saved AI coding assistant accounts. Claude is supported today; Codex is a future provider, mark Coming soon if shown. Default language English, English/Romanian available in settings. Key screen: active account and selected Sonnet model; 5-hour and weekly/model-specific quota meters and reset times; clearly ranked saved accounts with switch/refresh actions and next-account indication; small reset-credit availability and manual subscription renewal estimate. Actions: add account via browser login, import current account, import archive, delete saved account, settings. Automation threshold95%, auto-switch, weekly priming and reset use need sensible status/settings access. Keep the main task easy to understand at a glance.
+Use only fictional Studio, Personal and Reserve accounts with example.invalid emails. Active Studio: 68% 5-hour, 47% weekly overall, 58% Sonnet weekly; next Personal23%/24%; Reserve almost exhausted. Show percentage as USED, never confusing remaining percentages. Text should be concise correct English: "PrimerSwitch", "Accounts", "Active", "Next up", "Add account", "Switch", "Refresh", "Settings". Design a beautiful implementable Svelte/Tauri desktop interface with real controls and deliberate typography, not an illustration of abstract UI. Avoid unrelated company logos and watermarks.
+

@@ -1,0 +1,70 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "PrimerSwitch",
+  "version": "0.1.0",
+  "identifier": "com.primertech.primerswitch",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [
+      {
+        "label": "main",
+        "create": false,
+        "title": "PrimerSwitch",
+        "width": 1160,
+        "height": 820,
+        "minWidth": 560,
+        "minHeight": 620,
+        "resizable": true,
+        "center": true,
+        "dragDropEnabled": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src ipc: http://ipc.localhost; font-src 'self'; object-src 'none'; base-uri 'self'; frame-src 'none'; form-action 'none'",
+      "capabilities": [
+        "main-window"
+      ]
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "shortDescription": "Claude account switching and quota monitoring",
+    "longDescription": "PrimerSwitch manages Claude coding accounts, monitors model quotas and automates switching from a shared Rust desktop runtime. Future providers have separate authentication and policies.",
+    "publisher": "Primer-Tech",
+    "category": "DeveloperTool",
+    "copyright": "Copyright 2026 Primer-Tech contributors",
+    "license": "MIT",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "nsis": {
+        "displayLanguageSelector": false,
+        "installMode": "currentUser"
+      }
+    },
+    "macOS": {
+      "minimumSystemVersion": "14.0"
+    },
+    "linux": {
+      "deb": {
+        "depends": [
+          "libwebkit2gtk-4.1-0",
+          "libgtk-3-0"
+        ]
+      }
+    },
+    "licenseFile": "../../../LICENSE"
+  }
+}

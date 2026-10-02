@@ -1,0 +1,19 @@
+[package]
+name = "switcher-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+[dependencies]
+switcher-core = { path = "../switcher-core" }
+switcher-platform = { path = "../switcher-platform" }
+provider-claude = { path = "../provider-claude" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+[dev-dependencies]
+tempfile.workspace = true
+async-trait.workspace = true

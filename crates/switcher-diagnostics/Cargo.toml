@@ -1,0 +1,15 @@
+[package]
+name = "switcher-diagnostics"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+[dependencies]
+switcher-core = { path = "../switcher-core" }
+switcher-platform = { path = "../switcher-platform" }
+switcher-runtime = { path = "../switcher-runtime" }
+serde_json.workspace = true
+tokio.workspace = true
+tempfile.workspace = true
+provider-claude = { path = "../provider-claude" }
+async-trait.workspace = true

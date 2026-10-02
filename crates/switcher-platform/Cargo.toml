@@ -1,0 +1,23 @@
+[package]
+name = "switcher-platform"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+sha2.workspace = true
+rand.workspace = true
+zeroize.workspace = true
+fs2.workspace = true
+tempfile.workspace = true
+chacha20poly1305 = "0.10.1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_System_Memory", "Win32_System_Threading", "Win32_Storage_FileSystem"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3.7"
+libc = "0.2"

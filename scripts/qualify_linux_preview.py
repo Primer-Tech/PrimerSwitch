@@ -162,10 +162,14 @@ def window_details() -> dict | None:
         match = re.search(r'(0x[0-9a-f]+) "(PrimerSwitch[^\"]*)".*? (\d+)x(\d+)\+', line, re.I)
         if match:
             details = output(["xwininfo", "-id", match.group(1)], timeout=8).decode("utf8", errors="replace")
-            require("Map State: IsViewable" in details, "native-demo-window-not-visible")
+            # The X11 window/title may exist before GTK maps or sizes it.
+            # Readiness polling waits; the final acceptance still needs both.
+            if "Map State: IsViewable" not in details:
+                continue
             width = int(re.search(r"Width: (\d+)", details).group(1))
             height = int(re.search(r"Height: (\d+)", details).group(1))
-            require(width >= 560 and height >= 620, "native-demo-window-too-small")
+            if width < 560 or height < 620:
+                continue
             return {"id": match.group(1), "title": match.group(2), "width": width, "height": height}
     return None
 

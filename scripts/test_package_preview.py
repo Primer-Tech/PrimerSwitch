@@ -357,6 +357,17 @@ ${EndIf}
                     packaging.verify_nsis_data_preservation(baseline + "\n" + harmful + "\n", destinations)
         self.rejects("installer-app-data-cleanup-not-update-guarded", lambda: packaging.verify_nsis_data_preservation(baseline.replace('${AndIf} $UpdateMode <> 1', ''), destinations))
 
+    def test_x11_window_readiness_waits_for_mapping_and_configured_size(self):
+        tree = b'0x123 "PrimerSwitch": ("primerswitch" "Primerswitch") 1160x820+0+0'
+        for incomplete in (b"Map State: IsUnMapped\nWidth: 1160\nHeight: 820",
+                           b"Map State: IsViewable\nWidth: 10\nHeight: 10"):
+            with patch.object(qualification, "output", side_effect=[tree, incomplete]):
+                self.assertIsNone(qualification.window_details())
+        mapped = b"Map State: IsViewable\nWidth: 1160\nHeight: 820"
+        with patch.object(qualification, "output", side_effect=[tree, mapped]):
+            details = qualification.window_details()
+        self.assertEqual(details, {"id": "0x123", "title": "PrimerSwitch", "width": 1160, "height": 820})
+
     def screenshot_capture_fixture(self, colors):
         screenshot = self.artifacts / "native-fixture.png"
         clock = SimpleNamespace(now=0.0)

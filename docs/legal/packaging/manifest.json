@@ -1,0 +1,53 @@
+{
+  "compressionObservation": {
+    "generatedRecipe": "target/release/nsis/x64/installer.nsi",
+    "observedCompressor": "lzma",
+    "previewCompressor": "zlib",
+    "recommendation": "Preview configuration uses zlib; package_preview.py verifies the actual regenerated NSIS recipe. Complete original NSIS COPYING is retained."
+  },
+  "formatVersion": 1,
+  "licenses": [
+    {
+      "binaryDistributionUrl": "https://github.com/tauri-apps/binary-releases/releases/download/nsis-3.11/nsis-3.11.zip",
+      "evidence": "Exact bytes copied from cached NSIS COPYING; local makensis /VERSION returns v3.11. Official source archive checksum is published by SourceForge; archive not downloaded in this check. Includes original zlib, bzip2, CPL-1.0 and NSIS LZMA linking exception texts.",
+      "file": "docs/legal/packaging/NSIS-COPYING.txt",
+      "package": "NSIS",
+      "sha256": "e7dd514003ab96cb3ddccbc028fe5c795fccf57dc41f21cfb9d4dd16ead23bf5",
+      "sourceArchivePublishedSha256": "19e72062676ebdc67c11dc032ba80b979cdbffd3886c60b04bb442cdd401ff4b",
+      "sourceArchiveUrl": "https://sourceforge.net/projects/nsis/files/NSIS%203/3.11/nsis-3.11-src.tar.bz2/download",
+      "version": "3.11"
+    },
+    {
+      "file": "docs/legal/packaging/NSIS-TAURI-UTILS-LICENSE_APACHE-2.0",
+      "package": "nsis-tauri-utils",
+      "pinnedCommit": "13d9edd27b69310e108d6fbd49f90992f8a05390",
+      "sha256": "0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594",
+      "url": "https://raw.githubusercontent.com/tauri-apps/nsis-tauri-utils/13d9edd27b69310e108d6fbd49f90992f8a05390/LICENSE_APACHE-2.0",
+      "version": "0.5.3"
+    },
+    {
+      "file": "docs/legal/packaging/NSIS-TAURI-UTILS-LICENSE_MIT",
+      "package": "nsis-tauri-utils",
+      "pinnedCommit": "13d9edd27b69310e108d6fbd49f90992f8a05390",
+      "sha256": "1c1020fa10a6bf318717e82c911bcc54ebdfb9bb280460ae332bcb2f82f57fbe",
+      "url": "https://raw.githubusercontent.com/tauri-apps/nsis-tauri-utils/13d9edd27b69310e108d6fbd49f90992f8a05390/LICENSE_MIT",
+      "version": "0.5.3"
+    }
+  ],
+  "nsisTauriUtils": {
+    "binaryUrl": "https://github.com/tauri-apps/nsis-tauri-utils/releases/download/nsis_tauri_utils-v0.5.3/nsis_tauri_utils.dll",
+    "cachedBinarySha1": "75197fee3c6a814fe035788d1c34ead39349b860",
+    "cachedBinarySha256": "5ba143b5db4a87d32d6e7802e033330aae56cbceabe0d1e3ba41948385ad4709",
+    "observedCommands": [
+      "SemverCompare",
+      "RunAsUser"
+    ],
+    "pinnedCommit": "13d9edd27b69310e108d6fbd49f90992f8a05390",
+    "publishedReleaseSha1": "75197fee3c6a814fe035788d1c34ead39349b860",
+    "releaseUrl": "https://github.com/tauri-apps/nsis-tauri-utils/releases/tag/nsis_tauri_utils-v0.5.3",
+    "scope": "Exact release plugin binary attribution; plugin dependency closure not separately reconstructed. Framework Cargo notices are generated separately.",
+    "sourceArchiveUrl": "https://github.com/tauri-apps/nsis-tauri-utils/archive/13d9edd27b69310e108d6fbd49f90992f8a05390.tar.gz",
+    "version": "0.5.3"
+  },
+  "scope": "Packaging attribution evidence, not legal clearance."
+}

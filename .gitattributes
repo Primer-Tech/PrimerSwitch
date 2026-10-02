@@ -6,3 +6,5 @@
 *.ico binary
 *.icns binary
 
+# Preserve the exact upstream NSIS copyright/license bytes and pinned checksum.
+docs/legal/packaging/NSIS-COPYING.txt -text

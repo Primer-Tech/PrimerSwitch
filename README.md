@@ -23,18 +23,20 @@ The adapter follows the original Claude subscription contracts. These include ve
 
 ## Build and run
 
-Install Rust using rustup and Node.js 24, plus the [native Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) for your operating system. The repository pins Rust 1.96.1 and commits Cargo/npm lockfiles.
+Install Rust using rustup and Node.js 24, plus the [native Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) for your operating system. The repository pins Rust 1.96.1 and commits Cargo/npm lockfiles. Python 3.11+ is required for preview packaging and repository checks. Use an installed Claude CLI with its default OAuth store; custom credential-store overrides fail closed until qualified.
 
 ```sh
 npm --prefix apps/desktop ci
 npm --prefix apps/desktop run tauri -- dev
 ```
 
-Build a Windows installer:
+Build a Windows preview installer with dependency notices:
 
 ```sh
-npm --prefix apps/desktop run tauri -- build --bundles nsis
+python -B scripts/package_preview.py --bundle nsis
 ```
+
+Run the same command with `--bundle dmg` on a Mac. Packages are unsigned previews. The command records rendered frontend dependencies, checks locked native dependencies and original source hashes, bundles license texts, and writes artifact SHA256 sums. See [packaging attribution](docs/legal/README.md).
 
 The native executable accepts `--demo` for a read-only fixture view that does not inspect real credentials or make provider requests. Closing the application stops its automation. There is no background tray service or launch-on-login requirement in this first version.
 

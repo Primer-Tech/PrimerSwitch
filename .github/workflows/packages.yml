@@ -26,14 +26,23 @@ jobs:
         run: npm ci
       - name: Fixture tests
         run: cargo test --locked
-      - name: Preview installer
-        working-directory: apps/desktop
-        run: npm run tauri -- build --bundles ${{ matrix.bundle }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+      - name: Preview installer with dependency notices
+        run: python -B scripts/package_preview.py --bundle ${{ matrix.bundle }}
       - uses: actions/upload-artifact@v4
         with:
           name: PrimerSwitch-${{ runner.os }}-unsigned-preview
           path: |
             target/release/bundle/nsis/*.exe
             target/release/bundle/dmg/*.dmg
+            .artifacts/SHA256SUMS.txt
+            .artifacts/package-manifest.json
+            .artifacts/THIRD_PARTY_NOTICES.txt
+            .artifacts/THIRD_PARTY_REPORT.json
+            .artifacts/THIRD_PARTY_METADATA.json
+            .artifacts/frontend-bundle-inventory.json
           if-no-files-found: error
+          include-hidden-files: true
           retention-days: 14

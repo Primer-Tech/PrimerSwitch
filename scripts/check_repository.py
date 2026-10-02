@@ -53,6 +53,14 @@ SAFE_EMAIL_DOMAINS = {"example.com", "example.org", "example.net", "example.inva
 PUBLIC_CONTACTS = {"support@anthropic.com", "support@openai.com", "security@github.com"}
 PLACEHOLDER_USERS = {"fixture", "fixture-user", "test", "test-user", "user", "username", "yourname"}
 APP_ID = "com.primertech.primerswitch"
+# A public upstream copyright contact is attribution, not a real account marker.
+# Exception applies only to the exact reviewed immutable license bytes/address.
+REVIEWED_ATTRIBUTION_EMAILS = {
+    "docs/legal/packaging/NSIS-COPYING.txt": (
+        "e7dd514003ab96cb3ddccbc028fe5c795fccf57dc41f21cfb9d4dd16ead23bf5",
+        {"jseward" + "@" + "acm.org"},
+    ),
+}
 
 
 class Checks:
@@ -132,7 +140,34 @@ def inventory(root: Path) -> tuple[list[str], str]:
     return sorted(set(files)), "pruned working-tree traversal"
 
 
+def verified_legal_files(checks: Checks) -> set[str]:
+    """Only exact hash-pinned attribution files may use the upstream directory."""
+    manifest = "docs/legal/upstream/manifest.json"
+    path = checks.root / manifest
+    if not path.is_file() or not checks.inside(path) or path.is_symlink():
+        return set()
+    allowed = {manifest}
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8-sig"))
+        if parsed.get("formatVersion") != 1 or not isinstance(parsed.get("licenses"), list):
+            raise ValueError
+        for entry in parsed["licenses"]:
+            relative = entry["file"]
+            parts = PurePosixPath(relative).parts
+            if len(parts) != 4 or parts[:3] != ("docs", "legal", "upstream") or not re.fullmatch(r"rust-[a-z0-9-]+-[0-9]+(?:\.[0-9]+)*-LICENSE(?:-[A-Z0-9.-]+)?", parts[3]):
+                raise ValueError
+            candidate = checks.root / relative
+            if not checks.inside(candidate) or candidate.is_symlink() or hashlib.sha256(candidate.read_bytes()).hexdigest() != entry["sha256"]:
+                raise ValueError
+            allowed.add(relative)
+    except (OSError, ValueError, TypeError, KeyError):
+        checks.fail(manifest, 1, "invalid-upstream-attribution-manifest")
+        return {manifest}
+    return allowed
+
+
 def check_layout(checks: Checks, files: list[str]) -> None:
+    legal_files = verified_legal_files(checks)
     for relative in files:
         parts = PurePosixPath(relative).parts
         if not parts or ".." in parts or PurePosixPath(relative).is_absolute():
@@ -143,7 +178,7 @@ def check_layout(checks: Checks, files: list[str]) -> None:
         ):
             checks.fail(relative, 1, "public-root-allowlist")
         folded = [part.casefold() for part in parts]
-        if any(part in PRIVATE_COMPONENTS for part in folded) or folded[-1] in PRIVATE_FILENAMES or folded[-1].endswith(".swift"):
+        if any(part in PRIVATE_COMPONENTS for part in folded if not (part == "upstream" and relative in legal_files)) or folded[-1] in PRIVATE_FILENAMES or folded[-1].endswith(".swift"):
             checks.fail(relative, 1, "private-source-or-research-file")
         if any(part in GENERATED_DIRECTORIES for part in parts):
             checks.fail(relative, 1, "generated-file-in-public-inventory")
@@ -162,6 +197,15 @@ def check_layout(checks: Checks, files: list[str]) -> None:
 
 
 def check_markers(checks: Checks, relative: str, text: str) -> None:
+    attribution_emails: set[str] = set()
+    reviewed = REVIEWED_ATTRIBUTION_EMAILS.get(relative)
+    if reviewed:
+        try:
+            path = checks.root / relative
+            if checks.inside(path) and not path.is_symlink() and hashlib.sha256(path.read_bytes()).hexdigest() == reviewed[0]:
+                attribution_emails = reviewed[1]
+        except OSError:
+            pass
     email = re.compile(r"(?<![\w.-])([A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,})")
     owner_path = re.compile(r"(?:[A-Za-z]:[\\/]+Users[\\/]+|/(?:Users|home)/)([A-Za-z0-9_.-]+)", re.IGNORECASE)
     private_source = re.compile(r"(?:Primer[/\\]+ClaudeSwitch[/\\]+legacy|legacy[/\\]+macos[/\\]+Sources[/\\]+ClaudeSwitch)", re.IGNORECASE)
@@ -175,7 +219,7 @@ def check_markers(checks: Checks, relative: str, text: str) -> None:
             address = match.group(1).casefold()
             if re.fullmatch(r"[^@]+@[1-9]x\.(?:png|jpg|jpeg|webp|svg)", address):
                 continue  # Conventional retina image filenames are not emails.
-            if address.split("@", 1)[1] not in SAFE_EMAIL_DOMAINS and address not in PUBLIC_CONTACTS:
+            if address.split("@", 1)[1] not in SAFE_EMAIL_DOMAINS and address not in PUBLIC_CONTACTS and address not in attribution_emails:
                 checks.fail(relative, number, "nonfixture-email-marker")
         # Explicit synthetic sentinels are legitimate fixture inputs. This narrow
         # exception is another reason the check is not a complete secret scanner.

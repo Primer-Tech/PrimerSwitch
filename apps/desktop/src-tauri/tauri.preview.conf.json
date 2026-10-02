@@ -1,0 +1,22 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "build": {
+    "beforeBuildCommand": "node scripts/build-inventory.mjs"
+  },
+  "bundle": {
+    "resources": {
+      "../../../.artifacts/THIRD_PARTY_NOTICES.txt": "THIRD_PARTY_NOTICES.txt",
+      "../../../.artifacts/THIRD_PARTY_REPORT.json": "THIRD_PARTY_REPORT.json",
+      "../../../.artifacts/THIRD_PARTY_METADATA.json": "THIRD_PARTY_METADATA.json",
+      "../../../docs/legal/packaging/NSIS-COPYING.txt": "installer-notices/NSIS-COPYING.txt",
+      "../../../docs/legal/packaging/NSIS-TAURI-UTILS-LICENSE_APACHE-2.0": "installer-notices/NSIS-TAURI-UTILS-LICENSE_APACHE-2.0",
+      "../../../docs/legal/packaging/NSIS-TAURI-UTILS-LICENSE_MIT": "installer-notices/NSIS-TAURI-UTILS-LICENSE_MIT",
+      "../../../docs/legal/packaging/manifest.json": "installer-notices/manifest.json"
+    },
+    "windows": {
+      "nsis": {
+        "compression": "zlib"
+      }
+    }
+  }
+}

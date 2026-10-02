@@ -14,6 +14,55 @@ const MARKER: &str = "master-key.secret-service";
 #[cfg(target_os = "linux")]
 const CONTENT_TYPE: &str = "application/octet-stream";
 
+fn diagnostic_stage(stage: &'static str) {
+    #[cfg(test)]
+    if std::env::var("PRIMERSWITCH_ISOLATED_KEYRING_TEST").as_deref() == Ok("1") {
+        eprintln!("PRIMERSWITCH_STORAGE_STAGE={stage}");
+    }
+    #[cfg(not(test))]
+    let _ = stage;
+}
+
+#[cfg(target_os = "linux")]
+fn native_result<T>(
+    result: std::result::Result<T, secret_service::Error>,
+    stage: &'static str,
+) -> Result<T> {
+    result.map_err(|error| {
+        diagnostic_stage(stage);
+        #[cfg(test)]
+        if std::env::var("PRIMERSWITCH_ISOLATED_KEYRING_TEST").as_deref() == Ok("1") {
+            let category = match &error {
+                secret_service::Error::Crypto(_) => "Crypto",
+                secret_service::Error::Zbus(zbus::Error::MethodError(name, _, _)) => {
+                    match name.as_str() {
+                        "org.freedesktop.DBus.Error.AccessDenied" => "dbus_access_denied",
+                        "org.freedesktop.DBus.Error.UnknownMethod" => "dbus_unknown_method",
+                        "org.freedesktop.DBus.Error.UnknownObject" => "dbus_unknown_object",
+                        "org.freedesktop.DBus.Error.ServiceUnknown" => "dbus_service_unknown",
+                        "org.freedesktop.Secret.Error.NoSession" => "secret_no_session",
+                        "org.freedesktop.Secret.Error.IsLocked" => "secret_locked",
+                        _ => "other_dbus_error",
+                    }
+                }
+                secret_service::Error::Zbus(_) => "Zbus",
+                secret_service::Error::ZbusFdo(_) => "ZbusFdo",
+                secret_service::Error::Zvariant(_) => "Zvariant",
+                secret_service::Error::Locked => "Locked",
+                secret_service::Error::NoResult => "NoResult",
+                secret_service::Error::Prompt => "Prompt",
+                secret_service::Error::PromptDisconnected => "PromptDisconnected",
+                secret_service::Error::Unavailable => "Unavailable",
+                _ => "Other",
+            };
+            eprintln!("PRIMERSWITCH_STORAGE_ERROR_CATEGORY={category}");
+        }
+        #[cfg(not(test))]
+        let _ = error;
+        PlatformError::KeyUnavailable
+    })
+}
+
 fn namespace(directory: &Path) -> Result<String> {
     files::check_path(directory)?;
     let canonical = directory.canonicalize()?;
@@ -72,6 +121,7 @@ fn load_key(directory: &Path, encrypted_files: bool, store: &impl KeyStore) -> R
             .map_err(|_| PlatformError::KeyUnavailable)?;
         if let Some(marker) = marker {
             if marker != fingerprint(&key) {
+                diagnostic_stage("key_marker_mismatch");
                 return Err(PlatformError::KeyUnavailable);
             }
         } else {
@@ -92,10 +142,12 @@ fn load_key(directory: &Path, encrypted_files: bool, store: &impl KeyStore) -> R
     // unknown, reopen either adopts this exact key or fails without minting one.
     files::atomic_write(&marker_path, &fingerprint(key.as_ref()))?;
     store.create(&namespace, key.as_ref())?;
-    let confirmed = store
-        .read(&namespace)?
-        .ok_or(PlatformError::KeyUnavailable)?;
+    let confirmed = store.read(&namespace)?.ok_or_else(|| {
+        diagnostic_stage("key_confirmation_missing");
+        PlatformError::KeyUnavailable
+    })?;
     if confirmed.as_slice() != key.as_ref() {
+        diagnostic_stage("key_confirmation_mismatch");
         return Err(PlatformError::KeyUnavailable);
     }
     Ok(*key)
@@ -138,9 +190,10 @@ fn bounded_operation<T: Send + 'static>(
     let worker = std::thread::spawn(move || {
         let _ = sender.send(operation());
     });
-    let result = receiver
-        .recv_timeout(timeout)
-        .unwrap_or(Err(PlatformError::KeyUnavailable));
+    let result = receiver.recv_timeout(timeout).unwrap_or_else(|_| {
+        diagnostic_stage("operation_timeout");
+        Err(PlatformError::KeyUnavailable)
+    });
     // Closing the shared D-Bus connection also ends a Prompt.Completed signal
     // iterator. Upstream maps that termination to PromptDisconnected. Join the
     // worker before returning so a timed-out key mutation cannot run detached.
@@ -156,18 +209,26 @@ pub(crate) fn load_native_key(directory: &Path, encrypted_files: bool) -> Result
     use secret_service::{EncryptionType, blocking::SecretService};
     use std::time::Duration;
     let connection = zbus::blocking::connection::Builder::session()
-        .map_err(|_| PlatformError::KeyUnavailable)?
+        .map_err(|_| {
+            diagnostic_stage("bus_builder");
+            PlatformError::KeyUnavailable
+        })?
         .method_timeout(Duration::from_secs(10))
         .build()
-        .map_err(|_| PlatformError::KeyUnavailable)?;
+        .map_err(|_| {
+            diagnostic_stage("bus_connect");
+            PlatformError::KeyUnavailable
+        })?;
     let cancellation = connection.clone();
     let directory = directory.to_path_buf();
     let key = bounded_operation(
         Duration::from_secs(20),
         move || {
             // DH is mandatory. A rejected encrypted session fails; no plain retry.
-            let service = SecretService::connect_with_existing(EncryptionType::Dh, connection)
-                .map_err(|_| PlatformError::KeyUnavailable)?;
+            let service = native_result(
+                SecretService::connect_with_existing(EncryptionType::Dh, connection),
+                "encrypted_session",
+            )?;
             load_key(&directory, encrypted_files, &NativeStore(&service)).map(Zeroizing::new)
         },
         move || {
@@ -183,22 +244,18 @@ struct NativeStore<'a>(&'a secret_service::blocking::SecretService<'a>);
 #[cfg(target_os = "linux")]
 impl<'a> NativeStore<'a> {
     fn persistent_default(&self) -> Result<secret_service::blocking::Collection<'a>> {
-        let collection = self
-            .0
-            .get_default_collection()
-            .map_err(|_| PlatformError::KeyUnavailable)?;
+        let collection = native_result(self.0.get_default_collection(), "default_alias")?;
         let session = match self.0.get_collection_by_alias("session") {
             Ok(session) => Some(session),
             Err(secret_service::Error::NoResult) => None,
-            Err(_) => return Err(PlatformError::KeyUnavailable),
+            Err(error) => return native_result(Err(error), "session_alias"),
         };
         check_persistent_default(
             collection.collection_path.as_str(),
             session.as_ref().map(|value| value.collection_path.as_str()),
-        )?;
-        collection
-            .ensure_unlocked()
-            .map_err(|_| PlatformError::KeyUnavailable)?;
+        )
+        .inspect_err(|_| diagnostic_stage("default_persistence"))?;
+        native_result(collection.ensure_unlocked(), "default_unlock")?;
         Ok(collection)
     }
 }
@@ -206,50 +263,39 @@ impl<'a> NativeStore<'a> {
 #[cfg(target_os = "linux")]
 impl KeyStore for NativeStore<'_> {
     fn read(&self, namespace: &str) -> Result<Option<Zeroizing<Vec<u8>>>> {
-        let found = self
-            .0
-            .search_items(attributes(namespace))
-            .map_err(|_| PlatformError::KeyUnavailable)?;
-        check_search_result(found.unlocked.len(), found.locked.len())?;
+        let found = native_result(self.0.search_items(attributes(namespace)), "key_search")?;
+        check_search_result(found.unlocked.len(), found.locked.len())
+            .inspect_err(|_| diagnostic_stage("key_search_ambiguous"))?;
         let Some(item) = found.unlocked.first() else {
             return Ok(None);
         };
         // SearchItems spans every collection. Prove membership in the current
         // persistent default through Items, not implementation-specific paths.
         let collection = self.persistent_default()?;
-        let members = collection
-            .get_all_items()
-            .map_err(|_| PlatformError::KeyUnavailable)?;
+        let members = native_result(collection.get_all_items(), "key_membership_list")?;
         if members
             .iter()
             .filter(|member| member.item_path == item.item_path)
             .count()
             != 1
         {
+            diagnostic_stage("key_membership");
             return Err(PlatformError::KeyUnavailable);
         }
-        let actual = item
-            .get_attributes()
-            .map_err(|_| PlatformError::KeyUnavailable)?;
+        let actual = native_result(item.get_attributes(), "key_attributes")?;
         if actual.len() != 2
             || !attributes(namespace)
                 .into_iter()
                 .all(|(key, value)| actual.get(key).is_some_and(|v| v == value))
-            || item
-                .is_locked()
-                .map_err(|_| PlatformError::KeyUnavailable)?
-            || item
-                .get_secret_content_type()
-                .map_err(|_| PlatformError::KeyUnavailable)?
-                != CONTENT_TYPE
+            || native_result(item.is_locked(), "key_locked")?
+            || native_result(item.get_secret_content_type(), "key_content_type")? != CONTENT_TYPE
         {
+            diagnostic_stage("key_metadata");
             return Err(PlatformError::KeyUnavailable);
         }
-        let value = Zeroizing::new(
-            item.get_secret()
-                .map_err(|_| PlatformError::KeyUnavailable)?,
-        );
+        let value = Zeroizing::new(native_result(item.get_secret(), "key_secret")?);
         if value.len() != 32 {
+            diagnostic_stage("key_length");
             return Err(PlatformError::KeyUnavailable);
         }
         Ok(Some(value))
@@ -266,15 +312,16 @@ impl KeyStore for NativeStore<'_> {
         // Persistent default collection only. A session collection would lose
         // the key on logout and must never be used as an automatic fallback.
         let collection = self.persistent_default()?;
-        collection
-            .create_item(
+        native_result(
+            collection.create_item(
                 "PrimerSwitch vault master key",
                 attributes(namespace),
                 key,
                 false,
                 CONTENT_TYPE,
-            )
-            .map_err(|_| PlatformError::KeyUnavailable)?;
+            ),
+            "key_create_item",
+        )?;
         Ok(())
     }
 }

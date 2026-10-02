@@ -66,6 +66,18 @@ SAFE_PLATFORM_ERRORS = {
     "UnsupportedSecretService", "UnsupportedContext", "Busy", "Conflict",
     "UnsafePath", "InvalidPayload",
 }
+SAFE_STORAGE_STAGES = {
+    "bus_builder", "bus_connect", "encrypted_session", "key_search", "key_search_ambiguous",
+    "default_alias", "session_alias", "default_persistence", "default_unlock",
+    "key_membership_list", "key_membership", "key_attributes", "key_locked", "key_content_type",
+    "key_metadata", "key_secret", "key_length", "key_create_item", "key_marker_mismatch",
+    "key_confirmation_missing", "key_confirmation_mismatch", "operation_timeout",
+}
+SAFE_NATIVE_ERROR_CATEGORIES = {
+    "Crypto", "Zbus", "ZbusFdo", "Zvariant", "Locked", "NoResult", "Prompt",
+    "PromptDisconnected", "Unavailable", "Other", "dbus_access_denied", "dbus_unknown_method",
+    "dbus_unknown_object", "dbus_service_unknown", "secret_no_session", "secret_locked", "other_dbus_error",
+}
 SAFE_RUST_FILES = {"active.rs", "files.rs", "paths.rs", "protection.rs", "vault.rs", "lib.rs", "linux_vault.rs"}
 
 
@@ -80,9 +92,14 @@ def safe_failure_metadata(output: bytes = b"", exit_code: int | None = None) -> 
             if location not in locations:
                 locations.append(location)
     errors = sorted({match.group(1).decode("ascii") for match in re.finditer(
-        rb"Err value: ([A-Za-z]+)(?:\W|$)", output)
+        rb"`?Err`? value: ([A-Za-z]+)(?:\W|$)", output)
         if match.group(1).decode("ascii") in SAFE_PLATFORM_ERRORS})
-    metadata: dict[str, object] = {"panicLocations": locations, "platformErrors": errors}
+    stages = sorted({match.group(1).decode("ascii") for match in re.finditer(rb"^PRIMERSWITCH_STORAGE_STAGE=([a-z_]+)$", output, re.MULTILINE)
+        if match.group(1).decode("ascii") in SAFE_STORAGE_STAGES})
+    categories = sorted({match.group(1).decode("ascii") for match in re.finditer(rb"^PRIMERSWITCH_STORAGE_ERROR_CATEGORY=([A-Za-z_]+)$", output, re.MULTILINE)
+        if match.group(1).decode("ascii") in SAFE_NATIVE_ERROR_CATEGORIES})
+    metadata: dict[str, object] = {"panicLocations": locations, "platformErrors": errors,
+                                 "storageStages": stages, "nativeErrorCategories": categories}
     if exit_code is not None:
         metadata["exitCode"] = exit_code
     return metadata
@@ -98,6 +115,8 @@ def validate_failure_metadata(value: object) -> dict[str, object]:
         result["exitCode"] = code
     result["platformErrors"] = sorted({error for error in value.get("platformErrors", [])
         if isinstance(error, str) and error in SAFE_PLATFORM_ERRORS})
+    result["storageStages"] = sorted({stage for stage in value.get("storageStages", []) if isinstance(stage, str) and stage in SAFE_STORAGE_STAGES})
+    result["nativeErrorCategories"] = sorted({category for category in value.get("nativeErrorCategories", []) if isinstance(category, str) and category in SAFE_NATIVE_ERROR_CATEGORIES})
     locations = []
     for item in value.get("panicLocations", []):
         if not isinstance(item, dict):

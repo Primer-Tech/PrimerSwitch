@@ -1,0 +1,30 @@
+name: Linux storage acceptance
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-storage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+      - name: Isolated keyring test dependencies
+        run: sudo apt-get update && sudo apt-get install -y dbus-x11 gnome-keyring
+      - name: Rust toolchain
+        run: rustup show active-toolchain
+      - name: Platform fixtures
+        run: cargo test --locked -p switcher-platform
+      - name: Native isolated Secret Service acceptance
+        run: python -B scripts/linux_keyring_fixture.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: PrimerSwitch-Linux-native-storage-evidence
+          path: .artifacts/linux-native-storage-report.json
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 14

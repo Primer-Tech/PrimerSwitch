@@ -303,6 +303,26 @@ def wait_for_provider(pyatspi, glib, application, provider: str, *, timeout: flo
     raise QualificationError("provider-keyboard-navigation-timeout")
 
 
+def click_provider_tab(pyatspi, glib, application, current: str, target: str) -> list[dict]:
+    """Use the installed tab's native click action when X11 key focus is stale."""
+    current_rows = wait_for_provider(pyatspi, glib, application, current, timeout=5)
+    target_tab = provider_tab(current_rows, target, selected=False)
+    action = target_tab["accessible"].queryAction()
+    if action.nActions:
+        action.doAction(0)
+    try:
+        return wait_for_provider(pyatspi, glib, application, target, timeout=3)
+    except QualificationError:
+        if not shutil.which("xdotool"):
+            raise
+        extents = target_tab["accessible"].queryComponent().getExtents(getattr(pyatspi, "DESKTOP_COORDS", 0))
+        x = int(extents.x + extents.width / 2)
+        y = int(extents.y + extents.height / 2)
+        output(["xdotool", "mousemove", "--sync", str(x), str(y)], timeout=5)
+        output(["xdotool", "click", "1"], timeout=5)
+        return wait_for_provider(pyatspi, glib, application, target)
+
+
 def navigate_provider(pyatspi, glib, application, rows: list[dict], current: str, target: str,
                       *, window_id: str | None = None) -> tuple[list[dict], str]:
     """Navigate with keyboard transports, retrying only while target is not selected."""
@@ -331,10 +351,7 @@ def navigate_provider(pyatspi, glib, application, rows: list[dict], current: str
     # The tab's native action is the same user-visible selection, and gives the
     # installed-package check a deterministic recovery without touching state.
     try:
-        current_rows = wait_for_provider(pyatspi, glib, application, current, timeout=5)
-        target_tab = provider_tab(current_rows, target, selected=False)
-        require(target_tab["accessible"].queryAction().doAction(0), "provider-tab-action-failed")
-        return wait_for_provider(pyatspi, glib, application, target), "native-click"
+        return click_provider_tab(pyatspi, glib, application, current, target), "native-click"
     except Exception as error:
         if isinstance(error, QualificationError):
             raise error

@@ -376,7 +376,7 @@ def worker(directory: Path) -> int:
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             rows = observe_accessibility_desktop(pyatspi, GLib)
-            deletes = [row for row in rows if row["role"] in {"push button", "button"} and row["name"] == "Delete Personal Codex"]
+            deletes = [row for row in rows if row["role"] in {"push button", "button"} and row["name"] == "Delete account Personal Codex"]
             closes = [row for row in rows if row["role"] in {"push button", "button"} and row["name"] == "Close"]
             if deletes and closes:
                 require(len(deletes) == 1 and not deletes[0]["enabled"], "native-codex-demo-delete-not-disabled")

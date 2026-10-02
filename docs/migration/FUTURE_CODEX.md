@@ -1,6 +1,6 @@
 # PrimerSwitch future Codex / OpenAI provider
 
-Status: planned extension, not implemented. Requested by the user on 2026-10-02. Claude feature parity remains the first milestone; the [main architecture](IMPLEMENTATION_PLAN.md) must provide provider seams now so adding Codex does not require another rewrite.
+Status: implementation authorized after the branded 0.1.1 release; see [active work packages](CODEX_IMPLEMENTATION.md) and [pinned source findings](CODEX_RESEARCH.md). Not yet implemented. Requested by the user on 2026-10-02. Claude feature parity remains the first milestone; the [main architecture](IMPLEMENTATION_PLAN.md) must provide provider seams now so adding Codex does not require another rewrite.
 
 The user currently uses a “codex switcher.” Its exact name/repository has not been supplied. Its name and version are prerequisites for any future compatibility importer. Do not assume a particular competitor, claim superiority, or write a format importer without inspecting the actual tool and its version. The improvements below are proposed acceptance criteria for this application.
 

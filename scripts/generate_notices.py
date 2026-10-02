@@ -33,6 +33,8 @@ TEXT_NAME = re.compile(r'^(?:licen[cs]e|copying|copyright|notice|unlicense|ofl|t
 PRIVATE_PATH = re.compile(r'(?:[A-Za-z]:[\\/]Users[\\/]|/(?:Users|home)/|\\\\[^\s\\]+\\Users\\)', re.I)
 RECOGNIZED = {'MIT', 'MIT-0', 'Apache-2.0', 'BSD-2-Clause', 'BSD-3-Clause', 'ISC', 'Zlib', 'CC0-1.0', 'BSL-1.0', 'Unicode-3.0', 'Unicode-DFS-2016', 'MPL-2.0', 'OpenSSL', 'Unlicense', '0BSD', 'NCSA', 'BlueOak-1.0.0', 'CDLA-Permissive-2.0'}
 REVIEW_LICENSES = {'MPL-2.0', 'OpenSSL'}
+RECOGNIZED_EXCEPTIONS = {'LLVM-exception'}
+RUSTIX_REVIEW_EXPRESSION = 'Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT'
 
 class GenerationError(Exception):
     pass
@@ -105,7 +107,8 @@ def record(ecosystem: str, name: str, version: str, directory: Path, license_val
         issue(issues, **identity, code='missing-license-expression')
     else:
         tokens = set(re.findall(r'[A-Za-z0-9][A-Za-z0-9.+-]*', expression)) - {'AND', 'OR', 'WITH'}
-        if tokens - RECOGNIZED:
+        exceptions = set(re.findall(r'\bWITH\s+([A-Za-z0-9][A-Za-z0-9.+-]*)', expression))
+        if tokens - RECOGNIZED - (exceptions & RECOGNIZED_EXCEPTIONS) or exceptions - RECOGNIZED_EXCEPTIONS:
             issue(issues, **identity, code='unrecognized-license-expression')
         if tokens & REVIEW_LICENSES or 'WITH' in expression:
             issue(issues, **identity, code='license-expression-review')
@@ -123,11 +126,12 @@ def source_provenance(package: dict, checksums: dict, issues: list[dict]) -> dic
         if isinstance(commit, str) and re.fullmatch(r'[0-9a-f]{40}', commit):
             details['pinnedCommit'] = commit
             details['sourcePathInRepository'] = vcs.get('path_in_vcs', '')
-    if 'MPL-2.0' not in (package.get('license') or ''):
+    exact_rustix_review = name == 'rustix' and version == '1.1.5' and package.get('license') == RUSTIX_REVIEW_EXPRESSION
+    if 'MPL-2.0' not in (package.get('license') or '') and not exact_rustix_review:
         return details
     archive = directory.parents[2] / 'cache' / directory.parent.name / f'{name}-{version}.crate'
     if not archive.is_file():
-        issue(issues, 'cargo', name, version, 'mpl-source-archive-not-cached')
+        issue(issues, 'cargo', name, version, 'review-source-archive-not-cached')
         return details
     if hashlib.sha256(archive.read_bytes()).hexdigest() != details['sourceArchiveSha256']:
         raise GenerationError('cargo-source-archive-checksum-mismatch')

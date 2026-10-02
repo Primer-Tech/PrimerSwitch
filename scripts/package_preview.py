@@ -21,6 +21,8 @@ MPL_VERSIONS = {
     "selectors": "0.38.0",
 }
 
+REVIEWED_EXPRESSIONS = {name: (version, "MPL-2.0") for name, version in MPL_VERSIONS.items()}
+REVIEWED_EXPRESSIONS["rustix"] = ("1.1.5", "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT")
 EVIDENCE_FILES = ("frontend-bundle-inventory.json", "THIRD_PARTY_NOTICES.txt", "THIRD_PARTY_METADATA.json", "THIRD_PARTY_REPORT.json")
 
 
@@ -65,13 +67,12 @@ def verify_attribution(target: str) -> dict:
     for finding in report.get("findings", []):
         name = finding.get("name")
         proof = finding.get("sourceIntegrity", {})
-        # Exact unmodified MPL dependencies have full texts and checksum-
-        # verified original source links in the shipped notices.
+        # Exact reviewed dependencies have full license/exception texts and
+        # checksum-verified original source links in the shipped notices.
         if (
             finding.get("check") != "license-expression-review"
             or finding.get("ecosystem") != "cargo"
-            or MPL_VERSIONS.get(name) != finding.get("version")
-            or finding.get("declaredLicense") != "MPL-2.0"
+            or REVIEWED_EXPRESSIONS.get(name) != (finding.get("version"), finding.get("declaredLicense"))
             or proof.get("status") != "verified"
             or not re.fullmatch(r"[a-f0-9]{64}", proof.get("archiveSha256", ""))
             or not proof.get("archiveUrl", "").startswith("https://static.crates.io/crates/")

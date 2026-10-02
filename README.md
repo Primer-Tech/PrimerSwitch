@@ -4,6 +4,8 @@ A Rust desktop account switcher for AI coding assistants. Claude is the first pr
 
 The desktop app uses Tauri 2 and Svelte 5. Authentication, encrypted storage, quota policy, switching and scheduling live in Rust. New installations start in dark mode and English, with Romanian and light/system appearance available in settings.
 
+Download the unsigned [0.1.0 preview](https://github.com/Primer-Tech/PrimerSwitch/releases/tag/v0.1.0-preview.1): [Windows x64 installer](https://github.com/Primer-Tech/PrimerSwitch/releases/download/v0.1.0-preview.1/PrimerSwitch_0.1.0_x64-setup.exe) or [macOS ARM64 disk image](https://github.com/Primer-Tech/PrimerSwitch/releases/download/v0.1.0-preview.1/PrimerSwitch_0.1.0_aarch64.dmg). The release includes dependency notices, SHA256 sums and build provenance.
+
 This is an implementation preview. Windows is the first qualification target. The replacement Mac adapter is implemented, with native qualification still required; the original Swift application remains preserved separately. Linux builds and fixture tests are included in CI, but the production Linux vault is unavailable until its Secret Service backend is qualified. See the [evidence and remaining work](docs/migration/PROGRESS.md).
 
 ![Implemented dark dashboard with fictional fixture accounts](docs/design/screenshots/dashboard-dark.png)

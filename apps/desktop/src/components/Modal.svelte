@@ -16,6 +16,12 @@
   } = $props();
   let dialog: HTMLDialogElement;
   const uid = $props.id();
+  function close() {
+    // Close the native dialog before Svelte removes it. WebKitGTK otherwise
+    // can retain the document's modal inert state for the next keyboard event.
+    if (dialog?.open) dialog.close();
+    onclose();
+  }
   $effect(() => {
     const previous = untrack(() => returnFocus) ?? document.activeElement;
     dialog.showModal();
@@ -35,7 +41,7 @@
   aria-labelledby={uid}
   oncancel={(event) => {
     event.preventDefault();
-    onclose();
+    close();
   }}
 >
   <div class="modal-header">
@@ -43,7 +49,7 @@
     <button
       class="icon-button"
       aria-label={t(locale ?? $language, 'close')}
-      onclick={onclose}>×</button
+      onclick={close}>×</button
     >
   </div>
   {@render children()}

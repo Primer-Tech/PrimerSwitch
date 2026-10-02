@@ -582,6 +582,8 @@ def build_native_rpm(config: dict, dependencies: list[str], binary: Path) -> dic
         if len(outputs) != 1 or outputs[0].is_symlink() or not outputs[0].is_file():
             raise PackagingError("native-rpm-output-missing-or-ambiguous")
         destination = output_directory("rpm") / f"PrimerSwitch-{config['version']}-1.x86_64.rpm"
+        # --no-bundle leaves this directory absent on a fresh native runner.
+        destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(outputs[0], destination)
     if sources != hashes(tuple(sources), ROOT):
         raise PackagingError("native-rpm-source-changed-during-build")

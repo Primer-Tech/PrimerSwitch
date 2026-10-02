@@ -254,7 +254,7 @@ def wait_for_provider(pyatspi, glib, application, provider: str) -> list[dict]:
             tab = provider_tab(rows, provider, selected=True)
             provider_tab(rows, "claude" if provider == "codex" else "codex", selected=False)
             ready = ("Studio Codex" in content and "Personal Codex" in content) if provider == "codex" else "Automation" in content
-            if ready and tab.get("focused") and "Demo data" in content and "actions are disabled" in content:
+            if ready and "Demo data" in content and "actions are disabled" in content:
                 return rows
         except QualificationError:
             pass

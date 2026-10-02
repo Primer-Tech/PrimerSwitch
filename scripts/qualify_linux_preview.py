@@ -233,7 +233,7 @@ def arrow_provider(tab: dict, direction: str, pyatspi, *, window_id: str | None 
     if window_id and shutil.which("xdotool"):
         # Bring the native window forward before AT-SPI assigns focus to the
         # tab; doing this afterwards can reset WebKit's active DOM element.
-        output(["xdotool", "windowactivate", "--sync", window_id], timeout=5)
+        output(["xdotool", "windowfocus", window_id], timeout=5)
     require(tab["accessible"].queryComponent().grabFocus(), "provider-tab-focus-failed")
     # Modal teardown restores focus in a microtask. Re-assert it briefly so
     # that the Arrow event reaches the provider tab rather than the old trigger.

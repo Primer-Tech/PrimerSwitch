@@ -49,9 +49,13 @@ class GuardTests(unittest.TestCase):
         evidence = root / ".artifacts/evidence.json"
         evidence.parent.mkdir()
         evidence.write_bytes(b"fixture evidence")
+        lock = root / "apps/desktop/package-lock.json"
+        lock.write_text(json.dumps({"packages": {"node_modules/@tauri-apps/cli": {"version": qualification.BUNDLER_VERSION}}}), encoding="utf8")
+        inventory = root / ".artifacts/frontend-bundle-inventory.json"
+        inventory.write_text(json.dumps({"packageLockSha256": qualification.sha256(lock.read_bytes())}), encoding="utf8")
         manifest = {"formatVersion": 2, "bundle": "nsis", "target": "x86_64-pc-windows-msvc", "unsignedPreview": True, "sourceCommit": "a" * 40,
                     "packages": [{"path": package.relative_to(root).as_posix(), "bytes": package.stat().st_size, "sha256": qualification.sha256(package.read_bytes())}],
-                    "evidenceSha256": {"evidence.json": qualification.sha256(evidence.read_bytes())},
+                    "evidenceSha256": {"evidence.json": qualification.sha256(evidence.read_bytes()), "frontend-bundle-inventory.json": qualification.sha256(inventory.read_bytes())},
                     "packagingInputSha256": {config.relative_to(root).as_posix(): qualification.sha256(config.read_bytes())}}
         return manifest, package, binary, evidence
 
@@ -126,7 +130,7 @@ class GuardTests(unittest.TestCase):
             for name, body in qualification.SENTINELS.items():
                 (install / name).write_bytes(body)
             state = {qualification.REGISTRY_KEYS[0]: {"DisplayVersion": "0.1.1"}}
-            evidence = qualification.installation_evidence(install, state, qualification.sha256(old_body), expected)
+            evidence = qualification.installation_evidence(install, state, qualification.sha256(old_body), expected.read_bytes())
             self.assertEqual(evidence["registeredVersion"], "0.1.1")
             self.assertTrue(evidence["matchesOldApplication"])
             self.assertFalse(evidence["matchesExpectedNewApplication"])
@@ -135,6 +139,49 @@ class GuardTests(unittest.TestCase):
             self.assertNotIn(str(root), json.dumps(evidence))
             with self.assertRaisesRegex(qualification.QualificationError, "installed-application-hash-mismatch"):
                 qualification.verify_retention(install, qualification.sha256(expected.read_bytes()))
+
+    def test_exact_reviewed_bundle_transform_protects_every_other_byte(self):
+        compiled = b"MZ synthetic header and code" + qualification.COMPILED_BUNDLE_MARKER + b"unchanged tail"
+        expected, record = qualification.expected_packaged_application(compiled)
+        self.assertEqual(expected, compiled.replace(qualification.COMPILED_BUNDLE_MARKER, qualification.NSIS_BUNDLE_MARKER))
+        self.assertEqual(record["markerOffset"], compiled.index(qualification.COMPILED_BUNDLE_MARKER))
+        self.assertEqual(sum(a != b for a, b in zip(compiled, expected)), 3)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            application = root / "primerswitch.exe"
+            for name, body in qualification.SENTINELS.items():
+                (root / name).write_bytes(body)
+            application.write_bytes(expected)
+            qualification.verify_retention(root, qualification.sha256(expected))
+            for changed in (compiled, b"X" + expected[1:], expected[:-1] + b"X", expected + b"X"):
+                application.write_bytes(changed)
+                with self.assertRaisesRegex(qualification.QualificationError, "installed-application-hash-mismatch"):
+                    qualification.verify_retention(root, qualification.sha256(expected))
+
+    def test_missing_duplicate_and_wrong_bundle_markers_fail_closed(self):
+        for body in (b"MZ no marker", qualification.COMPILED_BUNDLE_MARKER * 2,
+                     qualification.NSIS_BUNDLE_MARKER, qualification.BUNDLE_MARKER_PREFIX + b"MSI",
+                     qualification.COMPILED_BUNDLE_MARKER + qualification.NSIS_BUNDLE_MARKER):
+            with self.subTest(body=body), self.assertRaises(qualification.QualificationError):
+                qualification.expected_packaged_application(body)
+
+    def test_unreviewed_cli_and_changed_lockfile_fail_closed(self):
+        for mutate in ("version", "hash", "missing"):
+            with self.subTest(mutate=mutate), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                manifest, _, _, _ = self.fixture_package(root)
+                lock = root / "apps/desktop/package-lock.json"
+                if mutate == "version":
+                    lock.write_text(json.dumps({"packages": {"node_modules/@tauri-apps/cli": {"version": "2.99.0"}}}), encoding="utf8")
+                    inventory = root / ".artifacts/frontend-bundle-inventory.json"
+                    inventory.write_text(json.dumps({"packageLockSha256": qualification.sha256(lock.read_bytes())}), encoding="utf8")
+                    manifest["evidenceSha256"]["frontend-bundle-inventory.json"] = qualification.sha256(inventory.read_bytes())
+                elif mutate == "hash":
+                    lock.write_bytes(b"changed lock input")
+                else:
+                    del manifest["evidenceSha256"]["frontend-bundle-inventory.json"]
+                with self.assertRaises(qualification.QualificationError):
+                    qualification.verify_package_manifest(manifest, root, "a" * 40)
 
     def test_registry_paths_must_belong_to_the_fixture(self):
         with tempfile.TemporaryDirectory() as directory:

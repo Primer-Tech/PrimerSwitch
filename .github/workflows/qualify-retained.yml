@@ -1,0 +1,61 @@
+name: Qualify retained native packages
+on:
+  workflow_dispatch:
+    inputs:
+      packageRun:
+        description: Original same-repository package workflow run
+        type: string
+        required: true
+        default: '37030874578'
+      packageCommit:
+        description: Exact original package source commit
+        type: string
+        required: true
+        default: 77ffa1cfa2a6482dee5cd0aaec608de123fda9de
+permissions:
+  contents: read
+  actions: read
+jobs:
+  qualify:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            bundle: nsis
+          - os: ubuntu-24.04
+            bundle: deb
+    runs-on: ${{ matrix.os }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PACKAGE_RUN: ${{ inputs.packageRun }}
+      PACKAGE_COMMIT: ${{ inputs.packageCommit }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: qualification
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.packageCommit }}
+          path: package-source
+      - name: Linux native qualification tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb x11-utils imagemagick python3-pyatspi at-spi2-core dbus-x11 gnome-keyring
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+      - name: Replay retained source-bound installer
+        run: python -B qualification/scripts/replay_retained_package.py --bundle ${{ matrix.bundle }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: PrimerSwitch-${{ runner.os }}-retained-package-qualification
+          path: |
+            package-source/.artifacts/windows-update-preservation-report.json
+            package-source/.artifacts/linux-installed-demo-report.json
+            package-source/.artifacts/linux-installed-demo.png
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 14

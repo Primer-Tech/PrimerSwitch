@@ -23,6 +23,15 @@ ROOT = Path(__file__).resolve().parent.parent
 ARTIFACTS = ROOT / ".artifacts"
 REPORT = ARTIFACTS / "windows-update-preservation-report.json"
 OLD_URL = "https://github.com/Primer-Tech/PrimerSwitch/releases/download/v0.1.0-preview.1/PrimerSwitch_0.1.0_x64-setup.exe"
+# Exact producer transform in tauri-cli v2.12.1 (commit below), bundle.rs:
+# patch_binary() lines40-96 writes UNK -> NSS for NSIS; bundle_project()
+# lines134-145 and212-218 restores the original after packaging. No other
+# changed byte is accepted. A CLI update requires reviewing this contract.
+BUNDLER_VERSION = "2.12.1"
+BUNDLER_SOURCE = "https://github.com/tauri-apps/tauri/blob/30da1fd6e17de6107ecc850c95dfb16b5729f2dd/crates/tauri-bundler/src/bundle.rs"
+BUNDLE_MARKER_PREFIX = b"__TAURI_BUNDLE_TYPE_VAR_"
+COMPILED_BUNDLE_MARKER = BUNDLE_MARKER_PREFIX + b"UNK"
+NSIS_BUNDLE_MARKER = BUNDLE_MARKER_PREFIX + b"NSS"
 OLD_BYTES = 5085753
 OLD_SHA256 = "752841fbee0eff3a992766aae2600b67dd57b084122c601e49a558b64058684b"
 MARKER = "PrimerSwitch hosted Windows installer fixture v1\n"
@@ -85,9 +94,30 @@ def verify_package_manifest(manifest: dict, root: Path, commit: str) -> tuple[Pa
     require(config.get("productName") == "PrimerSwitch" and config.get("identifier") == "com.primertech.primerswitch" and config.get("bundle", {}).get("publisher") == "Primer-Tech" and config["bundle"].get("windows", {}).get("nsis", {}).get("installMode") == "currentUser", "preview-install-identity-changed")
     version = config.get("version", "")
     require(isinstance(version, str) and re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version) is not None and tuple(map(int, version.split("."))) > (0, 1, 0), "qualification-requires-new-preview-version")
+    # The manifest binds the renderer inventory, which binds the exact npm
+    # lockfile containing the CLI producer version. Do not trust a free label.
+    inventory_name = "frontend-bundle-inventory.json"
+    require(inventory_name in manifest["evidenceSha256"], "missing-bundler-lock-evidence")
+    inventory = json.loads(safe_file(root / ".artifacts", inventory_name).read_text(encoding="utf8"))
+    lock = safe_file(root, "apps/desktop/package-lock.json")
+    require(sha256(lock.read_bytes()) == inventory.get("packageLockSha256"), "bundler-lock-input-changed")
+    lock_data = json.loads(lock.read_text(encoding="utf8"))
+    require(lock_data.get("packages", {}).get("node_modules/@tauri-apps/cli", {}).get("version") == BUNDLER_VERSION, "unreviewed-bundler-producer-version")
     binary = safe_file(root, "target/release/primerswitch.exe")
     return package, binary
 
+
+
+def expected_packaged_application(compiled: bytes) -> tuple[bytes, dict]:
+    """Derive the exact unsigned NSIS payload, never mask changed bytes."""
+    require(compiled.count(BUNDLE_MARKER_PREFIX) == 1 and compiled.count(COMPILED_BUNDLE_MARKER) == 1, "compiled-bundle-marker-not-unique-unknown")
+    offset = compiled.index(COMPILED_BUNDLE_MARKER)
+    expected = compiled[:offset] + NSIS_BUNDLE_MARKER + compiled[offset + len(COMPILED_BUNDLE_MARKER):]
+    return expected, {"producer": "@tauri-apps/cli", "producerVersion": BUNDLER_VERSION,
+                      "producerSource": BUNDLER_SOURCE, "markerOffset": offset,
+                      "compiledMarker": COMPILED_BUNDLE_MARKER.decode("ascii"),
+                      "packagedMarker": NSIS_BUNDLE_MARKER.decode("ascii"),
+                      "changedByteCount": 3, "comparison": "exact-whole-file-sha256"}
 
 def registry_state() -> dict:
     import winreg
@@ -153,11 +183,10 @@ def run_silent(executable: Path, arguments: list[str], directory: Path | None = 
     require(completed.returncode == 0, "silent-installer-nonzero-exit")
 
 
-def installation_evidence(directory: Path, state: dict, old_hash: str, expected_binary: Path) -> dict:
+def installation_evidence(directory: Path, state: dict, old_hash: str, expected: bytes) -> dict:
     """Capture only own fixture names/hashes and sanitized registry identity."""
     executable = directory / "primerswitch.exe"
     actual = executable.read_bytes() if executable.is_file() and not executable.is_symlink() else b""
-    expected = expected_binary.read_bytes()
     actual_hash, expected_hash = sha256(actual), sha256(expected)
     first_difference = last_difference = None
     different_count = 0
@@ -234,7 +263,10 @@ def cleanup_fixture(directory: Path, base: Path, install: Path) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--validate", action="store_true", help="read-only safety/manifest validation; never install, download, seed or clean up")
+    parser.add_argument("--qualification-source-commit", help="workflow-declared qualification code revision for retained artifact replay")
     args = parser.parse_args()
+    if args.qualification_source_commit and re.fullmatch(r"[0-9a-f]{40}", args.qualification_source_commit) is None:
+        parser.error("qualification source commit must be a full lowercase Git revision")
     if not args.validate:
         try:
             validate_ci_host(platform.system(), platform.machine(), dict(os.environ))
@@ -260,7 +292,13 @@ def main() -> int:
         commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, check=True, capture_output=True, encoding="ascii").stdout.strip()
         manifest = json.loads((ARTIFACTS / "package-manifest.json").read_text(encoding="utf8"))
         package, binary = verify_package_manifest(manifest, ROOT, commit)
-        report.update({"sourceCommit": commit, "newInstallerSha256": sha256(package.read_bytes()), "newApplicationSha256": sha256(binary.read_bytes())})
+        compiled_body = binary.read_bytes()
+        expected_body, transformation = expected_packaged_application(compiled_body)
+        compiled_hash, packaged_hash = sha256(compiled_body), sha256(expected_body)
+        report.update({"sourceCommit": commit, "qualificationSourceCommit": args.qualification_source_commit or commit,
+                       "qualificationScriptSha256": sha256(Path(__file__).read_bytes()),
+                       "newInstallerSha256": sha256(package.read_bytes()), "newApplicationSha256": compiled_hash,
+                       "expectedPackagedApplicationSha256": packaged_hash, "applicationProducerTransform": transformation})
         if args.validate:
             print(json.dumps({"packageInputsVerified": True, "installerExecution": False}, sort_keys=True))
             return 0
@@ -283,7 +321,7 @@ def main() -> int:
         require((install / "primerswitch.exe").is_file(), "old-application-not-installed")
         old_binary_hash = sha256((install / "primerswitch.exe").read_bytes())
         report["oldApplicationSha256"] = old_binary_hash
-        require(old_binary_hash != report["newApplicationSha256"], "new-preview-binary-not-distinct")
+        require(old_binary_hash != packaged_hash, "new-preview-binary-not-distinct")
         for name, body in SENTINELS.items():
             (install / name).write_bytes(body)
         config = json.loads((ROOT / "apps/desktop/src-tauri/tauri.conf.json").read_text(encoding="utf8"))
@@ -297,10 +335,10 @@ def main() -> int:
             run_silent(package, ["/S", "/UPDATE"], install)
             validate_fixture(fixture, base)
             state = registry_state()
-            phases[name] = installation_evidence(install, state, old_binary_hash, binary)
+            phases[name] = installation_evidence(install, state, old_binary_hash, expected_body)
             verify_registration(state, install, config["version"])
-            require(phases[name]["expectedApplicationSha256AtPhase"] == report["newApplicationSha256"], "compiled-application-changed-during-qualification")
-            phases[name].update(verify_retention(install, report["newApplicationSha256"]))
+            require(sha256(binary.read_bytes()) == compiled_hash, "compiled-application-changed-during-qualification")
+            phases[name].update(verify_retention(install, packaged_hash))
         report.update({"oldApplicationSha256": old_binary_hash, "phases": phases, "sentinelSha256": {name: sha256(body) for name, body in SENTINELS.items()}, "ok": True})
     except (QualificationError, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
         report["failure"] = str(error) if isinstance(error, QualificationError) else "qualification-tool-or-input-failure"

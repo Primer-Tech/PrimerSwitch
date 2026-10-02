@@ -357,6 +357,38 @@ ${EndIf}
                     packaging.verify_nsis_data_preservation(baseline + "\n" + harmful + "\n", destinations)
         self.rejects("installer-app-data-cleanup-not-update-guarded", lambda: packaging.verify_nsis_data_preservation(baseline.replace('${AndIf} $UpdateMode <> 1', ''), destinations))
 
+    def screenshot_capture_fixture(self, colors):
+        screenshot = self.artifacts / "native-fixture.png"
+        clock = SimpleNamespace(now=0.0)
+        identifiers = []
+        counts = iter(colors)
+        def capture(arguments, **options):
+            if arguments[0] == "import":
+                identifiers.append(arguments[2])
+                screenshot.write_bytes(b"\x89PNG\r\n\x1a\nfixture")
+                return b""
+            return str(next(counts, 1)).encode("ascii")
+        def advance(duration): clock.now += duration
+        return screenshot, clock, identifiers, capture, advance
+
+    def test_first_paint_capture_retries_gray_frame_on_same_owned_window(self):
+        screenshot, clock, identifiers, capture, advance = self.screenshot_capture_fixture([1, 257])
+        with patch.object(qualification, "output", side_effect=capture), patch.object(qualification.time, "monotonic", side_effect=lambda: clock.now), patch.object(qualification.time, "sleep", side_effect=advance):
+            evidence = qualification.capture_painted_window("0x123", screenshot)
+        self.assertEqual(identifiers, ["0x123", "0x123"])
+        self.assertEqual(evidence["uniqueColors"], 257)
+        self.assertEqual(evidence["captureAttempts"], 2)
+        self.assertLess(clock.now, 8)
+
+    def test_accessible_but_unpainted_window_cannot_pass_screenshot_gate(self):
+        screenshot, clock, identifiers, capture, advance = self.screenshot_capture_fixture([1])
+        with patch.object(qualification, "output", side_effect=capture), patch.object(qualification.time, "monotonic", side_effect=lambda: clock.now), patch.object(qualification.time, "sleep", side_effect=advance):
+            with self.assertRaisesRegex(qualification.QualificationError, "^native-window-first-paint-timeout$"):
+                qualification.capture_painted_window("0x123", screenshot)
+        self.assertTrue(screenshot.is_file())
+        self.assertEqual(set(identifiers), {"0x123"})
+        self.assertEqual(clock.now, 8)
+
     def test_native_rpm_rejects_spec_macro_and_requirement_injection(self):
         files = {"usr/bin/primerswitch": b"\x7fELFfixture"}
         dependencies = ["libc.so.6(GLIBC_2.39)(64bit)", "libgtk-3.so.0()(64bit)",

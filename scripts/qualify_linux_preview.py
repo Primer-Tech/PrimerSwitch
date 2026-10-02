@@ -170,6 +170,39 @@ def window_details() -> dict | None:
     return None
 
 
+
+def capture_painted_window(window_id: str, screenshot: Path, *, duration: float = 8.0) -> dict:
+    """Capture only the observed fixture window; AT-SPI can precede first paint."""
+    require(bool(re.fullmatch(r"0x[0-9a-fA-F]+", window_id)), "invalid-fixture-window-id")
+    deadline = time.monotonic() + duration
+    attempts = 0
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        attempts += 1
+        try:
+            output(["import", "-window", window_id, str(screenshot)], timeout=min(2.0, remaining))
+            require(screenshot.is_file() and screenshot.read_bytes().startswith(b"\x89PNG\r\n\x1a\n"), "native-demo-screenshot-missing")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            count = output(["identify", "-format", "%k", str(screenshot)], timeout=min(2.0, remaining)).decode("ascii").strip()
+            # The branded dashboard contains antialiased text and the Primer
+            # image. A flat gray/white frame has only a handful of colors.
+            if re.fullmatch(r"[0-9]+", count) and int(count) > 64:
+                return {"uniqueColors": int(count), "captureAttempts": attempts,
+                        "firstPaintTimeoutSeconds": duration, "minimumUniqueColorsExclusive": 64}
+        except (QualificationError, OSError, UnicodeError, subprocess.SubprocessError):
+            # A newly mapped window can briefly be unavailable to X11 capture.
+            # Retrying remains bounded and never changes renderer/sandbox flags.
+            pass
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.25, remaining))
+    raise QualificationError("native-window-first-paint-timeout")
+
 def worker(directory: Path) -> int:
     report = {"formatVersion": 1, "status": "failed", "scope": "Installed Ubuntu 24.04 x86_64 demo accessibility and native window; no provider/live account qualification", "checks": {}}
     application = None
@@ -211,12 +244,11 @@ def worker(directory: Path) -> int:
         refresh = [row for row in rows if row["role"] in {"push button", "button"} and (row["name"] == "Refresh all" or row["name"].startswith("Refresh account "))]
         switches = [row for row in rows if row["role"] in {"push button", "button"} and row["name"] == "Switch"]
         require(bool(refresh) and bool(switches) and all(not row["enabled"] for row in refresh + switches), "demo-mutation-controls-not-disabled")
-        output(["import", "-window", window["id"], str(SCREENSHOT)], timeout=15)
-        require(SCREENSHOT.is_file() and SCREENSHOT.read_bytes().startswith(b"\x89PNG\r\n\x1a\n"), "native-demo-screenshot-missing")
+        report["screenshotVerification"] = capture_painted_window(window["id"], SCREENSHOT)
         report["window"] = {key: value for key, value in window.items() if key != "id"}
         report["screenshotSha256"] = sha256(SCREENSHOT.read_bytes())
         report["checks"].update({"visibleNativeWindow": True, "englishAccountsAndSettings": True,
-                                 "nativeDemoSnapshotRendered": True, "duplicateAutomationNavigationAbsent": True,
+                                 "nativeDemoSnapshotRendered": True, "nonblankNativeScreenshot": True, "duplicateAutomationNavigationAbsent": True,
                                  "automationPanelPresent": True, "demoMutationButtonsDisabled": True})
         require(settings[0]["accessible"].queryAction().doAction(0), "settings-navigation-action-failed")
         deadline = time.monotonic() + 15

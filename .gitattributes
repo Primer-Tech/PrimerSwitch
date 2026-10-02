@@ -8,3 +8,5 @@
 
 # Preserve the exact upstream NSIS copyright/license bytes and pinned checksum.
 docs/legal/packaging/NSIS-COPYING.txt -text
+# Preserve the exact upstream OFL bytes used by the provenance gate.
+docs/legal/brand/Comfortaa-OFL.txt -text

@@ -317,20 +317,28 @@ def click_provider_tab(pyatspi, glib, application, current: str, target: str,
         if not shutil.which("xdotool"):
             raise
         extents = target_tab["accessible"].queryComponent().getExtents(getattr(pyatspi, "DESKTOP_COORDS", 0))
-        candidates = [(int(extents.x + extents.width / 2), int(extents.y + extents.height / 2))]
+        candidates = []
+        if extents.width > 0 and extents.height > 0:
+            candidates.append((int(extents.x + extents.width / 2), int(extents.y + extents.height / 2)))
         if window_id:
             details = output(["xwininfo", "-id", window_id], timeout=8).decode("utf8", errors="replace")
             absolute_x = re.search(r"Absolute upper-left X:\s*(-?\d+)", details)
             absolute_y = re.search(r"Absolute upper-left Y:\s*(-?\d+)", details)
             origin = (int(absolute_x.group(1)) if absolute_x else 0, int(absolute_y.group(1)) if absolute_y else 0)
-            candidates.append((candidates[0][0] + origin[0], candidates[0][1] + origin[1]))
+            if candidates:
+                candidates.append((candidates[0][0] + origin[0], candidates[0][1] + origin[1]))
             # WebKitGTK occasionally reports zero/parent-relative extents for
             # a tab after dialog teardown. The installed demo layout is fixed
             # by the accepted 1160x820 window, so use its visible tab centers.
             candidates.append((origin[0] + (1095 if target == "codex" else 1000), origin[1] + 58))
         for x, y in dict.fromkeys(candidates):
-            output(["xdotool", "mousemove", "--sync", str(x), str(y)], timeout=5)
-            output(["xdotool", "click", "1"], timeout=5)
+            if x < 0 or y < 0:
+                continue
+            try:
+                output(["xdotool", "mousemove", "--sync", str(x), str(y)], timeout=5)
+                output(["xdotool", "click", "1"], timeout=5)
+            except (OSError, subprocess.SubprocessError):
+                continue
             try:
                 return wait_for_provider(pyatspi, glib, application, target, timeout=3)
             except QualificationError:

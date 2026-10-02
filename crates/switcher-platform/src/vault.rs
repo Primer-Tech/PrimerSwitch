@@ -5,7 +5,7 @@ use chacha20poly1305::{
 };
 use rand::{RngCore, rngs::OsRng};
 use serde::{Serialize, de::DeserializeOwned};
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 use std::path::Path;
 use std::{fmt, path::PathBuf};
 use zeroize::{Zeroize, Zeroizing};
@@ -24,14 +24,18 @@ impl fmt::Debug for Vault {
 
 impl Vault {
     pub fn open(directory: PathBuf) -> Result<Self> {
-        #[cfg(not(any(windows, target_os = "macos")))]
+        #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
         {
             let _ = directory;
             Err(PlatformError::UnsupportedSecretService)
         }
-        #[cfg(any(windows, target_os = "macos"))]
+        #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
         {
+            #[cfg(target_os = "linux")]
+            crate::linux_vault::check_directory(&directory)?;
             files::private_dir(&directory)?;
+            #[cfg(target_os = "linux")]
+            let directory = directory.canonicalize()?;
             let _lock = files::Lock::acquire(&directory.join(".vault.lock"))?;
             let encrypted_files =
                 std::fs::read_dir(&directory)?.try_fold(false, |found, entry| {
@@ -202,6 +206,11 @@ fn load_native_key(directory: &Path, encrypted_files: bool) -> Result<[u8; 32]> 
             Ok(*key)
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn load_native_key(directory: &Path, encrypted_files: bool) -> Result<[u8; 32]> {
+    crate::linux_vault::load_native_key(directory, encrypted_files)
 }
 
 #[cfg(target_os = "macos")]

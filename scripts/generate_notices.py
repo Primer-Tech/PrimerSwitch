@@ -31,10 +31,17 @@ from urllib.parse import urlsplit
 ROOT = Path(__file__).resolve().parent.parent
 TEXT_NAME = re.compile(r'^(?:licen[cs]e|copying|copyright|notice|unlicense|ofl|third[-_ ]party)(?:[._ -].*)?$', re.I)
 PRIVATE_PATH = re.compile(r'(?:[A-Za-z]:[\\/]Users[\\/]|/(?:Users|home)/|\\\\[^\s\\]+\\Users\\)', re.I)
-RECOGNIZED = {'MIT', 'MIT-0', 'Apache-2.0', 'BSD-2-Clause', 'BSD-3-Clause', 'ISC', 'Zlib', 'CC0-1.0', 'BSL-1.0', 'Unicode-3.0', 'Unicode-DFS-2016', 'MPL-2.0', 'OpenSSL', 'Unlicense', '0BSD', 'NCSA', 'BlueOak-1.0.0', 'CDLA-Permissive-2.0'}
+RECOGNIZED = {'MIT', 'MIT-0', 'Apache-2.0', 'BSD-2-Clause', 'BSD-3-Clause', 'ISC', 'Zlib', 'CC0-1.0', 'BSL-1.0', 'Unicode-3.0', 'Unicode-DFS-2016', 'MPL-2.0', 'OpenSSL', 'Unlicense', '0BSD', 'NCSA', 'BlueOak-1.0.0', 'CDLA-Permissive-2.0', 'OFL-1.1'}
 REVIEW_LICENSES = {'MPL-2.0', 'OpenSSL'}
 RECOGNIZED_EXCEPTIONS = {'LLVM-exception'}
 RUSTIX_REVIEW_EXPRESSION = 'Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT'
+# Review remains bound to exact locked versions and declarations. Each selected
+# original archive is compared byte-for-byte with the cached source below.
+UNCHANGED_SOURCE_REVIEW_EXPRESSIONS = {
+    ('rustix', '1.1.5'): RUSTIX_REVIEW_EXPRESSION,
+    ('linux-raw-sys', '0.12.1'): RUSTIX_REVIEW_EXPRESSION,
+    ('target-lexicon', '0.12.16'): 'Apache-2.0 WITH LLVM-exception',
+}
 
 class GenerationError(Exception):
     pass
@@ -126,8 +133,8 @@ def source_provenance(package: dict, checksums: dict, issues: list[dict]) -> dic
         if isinstance(commit, str) and re.fullmatch(r'[0-9a-f]{40}', commit):
             details['pinnedCommit'] = commit
             details['sourcePathInRepository'] = vcs.get('path_in_vcs', '')
-    exact_rustix_review = name == 'rustix' and version == '1.1.5' and package.get('license') == RUSTIX_REVIEW_EXPRESSION
-    if 'MPL-2.0' not in (package.get('license') or '') and not exact_rustix_review:
+    exact_review = UNCHANGED_SOURCE_REVIEW_EXPRESSIONS.get((name, version)) == package.get('license') and (name, version) in UNCHANGED_SOURCE_REVIEW_EXPRESSIONS
+    if 'MPL-2.0' not in (package.get('license') or '') and not exact_review:
         return details
     archive = directory.parents[2] / 'cache' / directory.parent.name / f'{name}-{version}.crate'
     if not archive.is_file():
@@ -269,6 +276,33 @@ def npm_records(issues: list[dict], inventory_path: Path | None = None) -> list[
     return list(unique.values())
 
 
+def brand_records() -> tuple[list[dict], set[str]]:
+    """Attribute the unchanged public Primer wordmark font, when configured."""
+    label = 'docs/legal/brand/manifest.json'
+    path = ROOT / label
+    if not path.is_file():
+        return [], set()
+    manifest = read_manifest(path)
+    if manifest.get('formatVersion') != 1:
+        raise GenerationError('brand-attribution-shape-invalid')
+    font, license_info = manifest['font'], manifest['license']
+    if license_info.get('spdx') != 'OFL-1.1':
+        raise GenerationError('brand-attribution-license-unreviewed')
+    _, font_label = verified_file(font.get('file'), font.get('sha256'))
+    raw, license_label = verified_file(license_info.get('file'), license_info.get('sha256'))
+    source, url = font.get('sourceUrl'), license_info.get('url')
+    commit = license_info.get('pinnedCommit')
+    if safe_url(source) != source or safe_url(url) != url or not isinstance(commit, str) or not re.fullmatch(r'[0-9a-f]{40}', commit) or commit not in url:
+        raise GenerationError('brand-attribution-provenance-invalid')
+    body = raw.decode('utf-8-sig').replace('\r\n', '\n').replace('\r', '\n')
+    if len(body) < 100 or not body.startswith(font.get('embeddedCopyright', '\x00')) or PRIVATE_PATH.search(body) or '\x00' in body:
+        raise GenerationError('brand-attribution-text-invalid')
+    provenance = {key: license_info[key] for key in ('url', 'repository', 'pinnedCommit', 'sha256', 'spdx', 'copyrightAttribution')}
+    provenance.update({'file': license_label, 'attributionKind': 'license-text'})
+    record = {'ecosystem': 'asset', 'name': font['name'], 'version': font['version'], 'license': 'OFL-1.1', 'repository': safe_url(license_info.get('repository')), 'source': source, 'assetFile': font_label, 'assetSha256': font['sha256'], 'texts': [{'file': license_label, 'sha256': hashlib.sha256(body.encode('utf8')).hexdigest(), 'sourceSha256': license_info['sha256'], 'provenance': provenance, 'text': body}]}
+    return [record], {label, font_label, license_label}
+
+
 def read_manifest(path: Path) -> object:
     try:
         return json.loads(path.read_text(encoding='utf-8-sig'))
@@ -387,7 +421,7 @@ def render(records: list[dict], target: str, complete: bool, bundled: bool) -> s
               f'Target: {target}\n',
               f'Attribution review status: {"no scoped findings" if complete else "REVIEW REQUIRED; see THIRD_PARTY_REPORT.json"}\n',
               'Scope: locked native desktop non-dev dependency closure, conservatively including build/proc-macro dependencies; ' + ('frontend packages contributing to the verified production bundle module inventory.' if bundled else 'declared frontend production closure, including compiler and installed peer dependencies.') + ' Native inventory is not proof of binary reachability or a legal conclusion. System-provided runtimes and installer/bootstrapper redistribution terms require separate packaging review.\n',
-              'License expressions are package-declared metadata. All discovered package license and notice files follow in full. No alternative license has been selected or invented.\n']
+              'Brand fonts are listed separately as hash-verified public assets. License expressions are package-declared metadata. All discovered package license and notice files follow in full. No alternative license has been selected or invented.\n']
     for r in records:
         chunks.append('\n' + '=' * 78 + '\n')
         chunks.append(f"{r['ecosystem']}: {r['name']} {r['version']}\nDeclared license: {r['license'] or 'NOT DECLARED'}\n")
@@ -439,7 +473,8 @@ def main() -> int:
         for label in (args.overrides, args.frontend_inventory):
             if label and (Path(label).is_absolute() or not (ROOT / label).resolve().is_relative_to(ROOT) or (ROOT / label).is_symlink()):
                 raise GenerationError('attribution-input-outside-project')
-        records = cargo_records(args.target, issues) + npm_records(issues, ROOT / args.frontend_inventory if args.frontend_inventory else None)
+        brand, brand_inputs = brand_records()
+        records = cargo_records(args.target, issues) + npm_records(issues, ROOT / args.frontend_inventory if args.frontend_inventory else None) + brand
         imported = import_overrides(records, issues, ROOT / args.overrides if args.overrides else None)
         records, frontend_scope, excluded_findings = select_frontend(records, issues, ROOT / args.frontend_inventory if args.frontend_inventory else None)
         records.sort(key=lambda r: (r['ecosystem'], r['name'], r['version'], encoded_json(r)))
@@ -451,7 +486,7 @@ def main() -> int:
                 finding['sourceIntegrity'] = r.get('sourceIntegrity', {'status': 'not-verified'})
         issues.sort(key=encoded_json)
         text = render(records, args.target, not issues, frontend_scope is not None)
-        input_names = {'Cargo.toml', 'Cargo.lock', 'apps/desktop/package.json', 'apps/desktop/package-lock.json'}
+        input_names = {'Cargo.toml', 'Cargo.lock', 'apps/desktop/package.json', 'apps/desktop/package-lock.json'} | brand_inputs
         workspace = tomllib.loads((ROOT / 'Cargo.toml').read_text(encoding='utf8'))['workspace']
         for member in workspace['members']:
             for manifest in ROOT.glob(member.rstrip('/') + '/Cargo.toml'):
@@ -460,7 +495,7 @@ def main() -> int:
                 input_names.add(manifest.relative_to(ROOT).as_posix())
         inputs = {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in sorted(input_names)}
         metadata = {'formatVersion': 1, 'target': args.target, 'nativeFeatures': ['custom-protocol'], 'inputSha256': inputs, 'upstreamOverrides': imported, 'frontendBundleInventory': frontend_scope, 'dependencies': [{k: v for k, v in r.items() if k != 'texts'} | {'texts': [{k: v for k, v in t.items() if k != 'text'} for t in r['texts']]} for r in records]}
-        report = {'formatVersion': 1, 'target': args.target, 'dependencyCount': len(records), 'licenseTextCount': sum(len(r['texts']) for r in records), 'cargoDependencyCount': sum(r['ecosystem'] == 'cargo' for r in records), 'npmDependencyCount': sum(r['ecosystem'] == 'npm' for r in records), 'reviewRequired': bool(issues), 'findings': issues, 'excludedCompilerFindings': excluded_findings, 'missingLicenseTextCount': sum(i['check'] == 'missing-full-license-text' for i in issues), 'missingLicenseTexts': [{k: i[k] for k in ('ecosystem', 'name', 'version')} for i in issues if i['check'] == 'missing-full-license-text'], 'excludedScope': ['OS-provided runtimes', 'installer/bootstrapper redistribution terms', 'binary reachability determination', 'legal conclusions']}
+        report = {'formatVersion': 1, 'target': args.target, 'dependencyCount': len(records), 'licenseTextCount': sum(len(r['texts']) for r in records), 'cargoDependencyCount': sum(r['ecosystem'] == 'cargo' for r in records), 'npmDependencyCount': sum(r['ecosystem'] == 'npm' for r in records), 'reviewRequired': bool(issues), 'findings': issues, 'excludedCompilerFindings': excluded_findings, 'missingLicenseTextCount': sum(i['check'] == 'missing-full-license-text' for i in issues), 'missingLicenseTexts': [{k: i[k] for k in ('ecosystem', 'name', 'version')} for i in issues if i['check'] == 'missing-full-license-text'], 'assetDependencyCount': sum(r['ecosystem'] == 'asset' for r in records), 'excludedScope': ['OS-provided runtimes', 'installer/bootstrapper redistribution terms', 'binary reachability determination', 'legal conclusions']}
         if any(PRIVATE_PATH.search(content) for content in (text, encoded_json(metadata), encoded_json(report))):
             raise GenerationError('unsafe-output-local-path')
         output.mkdir(parents=True, exist_ok=True)

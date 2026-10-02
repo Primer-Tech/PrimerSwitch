@@ -43,7 +43,7 @@ PRIVATE_COMPONENTS = {
 PRIVATE_FILENAMES = {"research.md", "preservation_manifest.json", "baseline_manifest.json"}
 SECRET_FILENAMES = {"auth.json", ".credentials.json", "master-key.dpapi", "master-key.keychain"}
 SECRET_SUFFIXES = {".vault", ".key", ".pfx", ".p12", ".dpapi"}
-ARCHIVE_SUFFIXES = {".bundle", ".zip", ".7z", ".rar", ".tar", ".gz", ".exe", ".msi", ".dmg"}
+ARCHIVE_SUFFIXES = {".bundle", ".zip", ".7z", ".rar", ".tar", ".gz", ".exe", ".msi", ".dmg", ".deb", ".rpm", ".AppImage"}
 TEXT_SUFFIXES = {
     ".md", ".rs", ".py", ".toml", ".json", ".ts", ".js", ".mjs", ".cjs",
     ".svelte", ".html", ".css", ".yaml", ".yml", ".svg", ".xml", ".txt",
@@ -154,7 +154,7 @@ def verified_legal_files(checks: Checks) -> set[str]:
         for entry in parsed["licenses"]:
             relative = entry["file"]
             parts = PurePosixPath(relative).parts
-            if len(parts) != 4 or parts[:3] != ("docs", "legal", "upstream") or not re.fullmatch(r"rust-[a-z0-9-]+-[0-9]+(?:\.[0-9]+)*-LICENSE(?:-[A-Z0-9.-]+)?", parts[3]):
+            if len(parts) != 4 or parts[:3] != ("docs", "legal", "upstream") or not re.fullmatch(r"rust-[a-z0-9_-]+-[0-9]+(?:\.[0-9]+)*-LICENSE(?:-[A-Z0-9.-]+)?", parts[3]):
                 raise ValueError
             candidate = checks.root / relative
             if not checks.inside(candidate) or candidate.is_symlink() or hashlib.sha256(candidate.read_bytes()).hexdigest() != entry["sha256"]:

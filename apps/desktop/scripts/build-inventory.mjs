@@ -5,6 +5,7 @@ import {
   mkdir,
   readdir,
   stat,
+  lstat,
   rm,
 } from 'node:fs/promises';
 import path from 'node:path';
@@ -50,6 +51,50 @@ const inputs = new Set([
   path.join(desktop, 'package.json'),
   fileURLToPath(import.meta.url),
 ]);
+const brandManifestPath = path.join(
+  repository,
+  'docs/legal/brand/manifest.json',
+);
+const brandManifest = JSON.parse(await readFile(brandManifestPath, 'utf8'));
+if (
+  brandManifest.formatVersion !== 1 ||
+  brandManifest.license.spdx !== 'OFL-1.1' ||
+  brandManifest.logo.attributionKind !== 'project-owner-branding'
+)
+  throw new Error('Unreviewed brand asset manifest');
+inputs.add(brandManifestPath);
+const brandAssets = [];
+for (const [identity, item, expectedPath] of [
+  [
+    'Primer official logo',
+    brandManifest.logo,
+    'apps/desktop/src/assets/primer-logo.png',
+  ],
+  [
+    'Comfortaa SemiBold',
+    brandManifest.font,
+    'apps/desktop/src/assets/fonts/comfortaa-600.subset.woff2',
+  ],
+]) {
+  if (item.file !== expectedPath || !/^[a-f0-9]{64}$/.test(item.sha256))
+    throw new Error('Unexpected brand asset identity');
+  const source = path.join(repository, item.file);
+  if (
+    !(await lstat(source)).isFile() ||
+    sha256(await readFile(source)) !== item.sha256
+  )
+    throw new Error(`Brand source differs from pinned manifest: ${identity}`);
+  inputs.add(source);
+  brandAssets.push({ identity, ...item });
+}
+const fontLicensePath = path.join(repository, brandManifest.license.file);
+relative(fontLicensePath);
+if (
+  !(await lstat(fontLicensePath)).isFile() ||
+  sha256(await readFile(fontLicensePath)) !== brandManifest.license.sha256
+)
+  throw new Error('Brand font license differs from pinned manifest');
+inputs.add(fontLicensePath);
 const packages = new Map();
 let resolved;
 let moduleIds = [];
@@ -134,6 +179,26 @@ relative(outDir);
 const outputNames = new Set(outputs.map((output) => output.fileName));
 const chunks = [];
 const assets = [];
+const brandOutputs = new Map();
+for (const output of outputs.filter((item) => item.type === 'asset')) {
+  const item = brandAssets.find(
+    (asset) => sha256(output.source) === asset.sha256,
+  );
+  if (!item) continue;
+  const extension = path.extname(item.file);
+  const basename = path.basename(item.file, extension);
+  if (
+    !output.fileName.startsWith(`assets/${basename}-`) ||
+    !output.fileName.endsWith(extension) ||
+    [...brandOutputs.values()].some((asset) => asset.file === item.file)
+  )
+    throw new Error('Unexpected or duplicate brand asset output');
+  brandOutputs.set(output.fileName, item);
+}
+if (brandOutputs.size !== brandAssets.length)
+  throw new Error(
+    'Brand assets must be emitted unchanged; inlined or missing assets are not accepted',
+  );
 const cssInputs = moduleIds
   .filter((id) => /\.css(?:\?|$)|[?&]type=style(?:&|$)/.test(id))
   .map(safeId)
@@ -210,10 +275,29 @@ for (const output of outputs) {
   } else if (output.fileName.endsWith('.css')) {
     if (!cssInputs.length)
       throw new Error('CSS emitted without identifiable source inputs');
-    if (/@import\b|url\s*\(/i.test(bytes.toString('utf8')))
-      throw new Error(
-        'Unexpected CSS asset reference; explicit attribution is required',
-      );
+    const css = bytes.toString('utf8');
+    if (/@import\b/i.test(css)) throw new Error('Unexpected CSS import');
+    const cssReferences = [];
+    const remainder = css.replace(
+      /url\s*\(\s*(?:"([^"]*)"|'([^']*)'|([^)]*))\s*\)/gi,
+      (_match, quoted, single, bare) => {
+        const value = (quoted ?? single ?? bare).trim();
+        if (/^(?:[a-z]+:|\/\/)/i.test(value) || /[?#\\]/.test(value))
+          throw new Error('Unexpected CSS asset reference');
+        const reference = value.startsWith('/')
+          ? value.slice(1)
+          : path.posix.join(path.posix.dirname(output.fileName), value);
+        const asset = brandOutputs.get(reference);
+        if (!asset || asset.file !== brandManifest.font.file)
+          throw new Error(
+            'CSS reference requires exact known font attribution',
+          );
+        cssReferences.push(reference);
+        return '';
+      },
+    );
+    if (/url\s*\(/i.test(remainder))
+      throw new Error('Unparsed CSS asset reference');
     // Vite extracts CSS separately: its contributing inputs are not rendered JS modules.
     for (const id of moduleIds.filter((id) =>
       /\.css(?:\?|$)|[?&]type=style(?:&|$)/.test(id),
@@ -226,9 +310,27 @@ for (const output of outputs) {
     assets.push({
       ...common,
       kind: 'css',
+      referencedAssets: [...new Set(cssReferences)].sort(),
       sourceInputs: cssInputs,
       provenance:
         'aggregate CSS inputs from this build; not rendered JavaScript modules',
+    });
+  } else if (brandOutputs.has(output.fileName)) {
+    const asset = brandOutputs.get(output.fileName);
+    if (sha256(bytes) !== asset.sha256)
+      throw new Error('Brand emitted bytes differ from pinned source');
+    assets.push({
+      ...common,
+      kind:
+        asset.file === brandManifest.font.file ? 'font' : 'project-branding',
+      identity: asset.identity,
+      sourceInputs: [asset.file],
+      sourceSha256: asset.sha256,
+      provenance: asset.sourceUrl,
+      attributionManifest: relative(brandManifestPath),
+      ...(asset.file === brandManifest.font.file
+        ? { license: 'OFL-1.1', licenseFile: brandManifest.license.file }
+        : { rightsStatement: asset.rightsStatement }),
     });
   } else
     throw new Error(
@@ -257,6 +359,12 @@ for (const file of [...inputs].sort()) {
     path: relative(file),
     sha256: sha256(await readFile(file)),
   });
+}
+for (const asset of brandAssets) {
+  if (
+    sha256(await readFile(path.join(repository, asset.file))) !== asset.sha256
+  )
+    throw new Error('Brand source changed during production build');
 }
 const npmPackages = [...packages.values()].sort((a, b) =>
   a.lockPath.localeCompare(b.lockPath),

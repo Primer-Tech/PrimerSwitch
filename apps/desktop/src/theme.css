@@ -1,50 +1,60 @@
+@font-face {
+  font-family: 'Primer Comfortaa';
+  src: url('./assets/fonts/comfortaa-600.subset.woff2?no-inline')
+    format('woff2');
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+}
 :root {
-  --bg: #12171e;
-  --surface: #1b222c;
-  --surface-raised: #222b37;
-  --surface-hover: #293443;
-  --text: #f1f4f9;
-  --subtle: #a7b5c9;
-  --line: #344051;
-  --accent: #4396ff;
-  --accent-dark: #162e4d;
+  --brand: #9370db;
+  --brand-solid: #7952b6;
+  --bg: #0f0e14;
+  --surface: #19171f;
+  --surface-raised: #211e2a;
+  --surface-hover: #2c2637;
+  --text: #f5f1fc;
+  --subtle: #b5adbf;
+  --line: #3b3447;
+  --accent: #b697ec;
+  --accent-dark: #2a203d;
   --danger: #f6ac96;
-  --track: #303b4a;
+  --track: #35303e;
   --green: #54dc8b;
-  --violet: #a78aff;
+  --violet: #8bb7ed;
   --shadow: 0 18px 60px #0003;
 }
 :root[data-theme='light'] {
-  --bg: #f4f7fc;
+  --bg: #f8f6fb;
   --surface: #fff;
-  --surface-raised: #f1f5fc;
-  --surface-hover: #e8eef9;
-  --text: #172337;
-  --subtle: #596b84;
-  --line: #d8e1ee;
-  --accent: #1766ce;
-  --accent-dark: #e3efff;
+  --surface-raised: #f3eff8;
+  --surface-hover: #ede7f5;
+  --text: #261f32;
+  --subtle: #6e617e;
+  --line: #ded5e9;
+  --accent: #7250a9;
+  --accent-dark: #eee5f8;
   --danger: #a23d27;
-  --track: #e0e8f3;
+  --track: #e8e0ef;
   --green: #178a4b;
-  --violet: #7050ce;
+  --violet: #356bb0;
   --shadow: 0 18px 60px #24365b12;
 }
 @media (prefers-color-scheme: light) {
   :root:not([data-theme='dark']) {
-    --bg: #f4f7fc;
+    --bg: #f8f6fb;
     --surface: #fff;
-    --surface-raised: #f1f5fc;
-    --surface-hover: #e8eef9;
-    --text: #172337;
-    --subtle: #596b84;
-    --line: #d8e1ee;
-    --accent: #1766ce;
-    --accent-dark: #e3efff;
+    --surface-raised: #f3eff8;
+    --surface-hover: #ede7f5;
+    --text: #261f32;
+    --subtle: #6e617e;
+    --line: #ded5e9;
+    --accent: #7250a9;
+    --accent-dark: #eee5f8;
     --danger: #a23d27;
-    --track: #e0e8f3;
+    --track: #e8e0ef;
     --green: #178a4b;
-    --violet: #7050ce;
+    --violet: #356bb0;
     --shadow: 0 18px 60px #24365b12;
   }
 }
@@ -54,9 +64,9 @@ button {
   min-height: 34px;
 }
 button.primary {
-  background: var(--accent);
+  background: var(--brand-solid);
   color: #fff;
-  border-color: var(--accent);
+  border-color: var(--brand-solid);
   font-weight: 600;
 }
 button:focus-visible,
@@ -88,20 +98,32 @@ button.text-button {
   font-size: 0.94rem;
   letter-spacing: -0.04em;
 }
-.switch-mark {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  color: #fff;
-  background: var(--accent);
-  border-radius: 8px;
-  padding: 6px;
-  width: 31px;
-  height: 31px;
+.primer-mark {
+  width: 42px;
+  height: 42px;
+  border-radius: 11px;
   flex: none;
+  box-shadow: 0 0 0 1px #e6e6fa12;
 }
-.switch-mark svg {
-  width: 24px;
+.primer-wordmark {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.primer-wordmark strong {
+  font-family: 'Primer Comfortaa', sans-serif;
+  font-weight: 600;
+  font-size: 1.22rem;
+  letter-spacing: 0.04em;
+  line-height: 1;
+}
+.primer-wordmark > span {
+  font-size: 0.59rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.21em;
+  color: var(--subtle);
+  line-height: 1;
 }
 .sidebar nav {
   display: flex;
@@ -806,7 +828,7 @@ button.text-button {
     padding: 24px 10px;
     align-items: center;
   }
-  .sidebar-brand > strong,
+  .sidebar-brand > .primer-wordmark,
   .sidebar nav button > span,
   .sidebar-bottom > span:last-child {
     display: none;
@@ -851,8 +873,8 @@ button.text-button {
     border-bottom: 1px solid var(--line);
     gap: 14px;
   }
-  .sidebar-brand > strong {
-    display: block;
+  .sidebar-brand > .primer-wordmark {
+    display: flex;
     font-size: 0.8rem;
   }
   .sidebar nav {
@@ -868,10 +890,15 @@ button.text-button {
   .sidebar-bottom {
     display: none;
   }
-  .switch-mark {
-    width: 27px;
-    height: 27px;
-    padding: 4px;
+  .primer-mark {
+    width: 34px;
+    height: 34px;
+  }
+  .primer-wordmark strong {
+    font-size: 1.05rem;
+  }
+  .primer-wordmark > span {
+    font-size: 0.5rem;
   }
   .workspace {
     padding: 20px 14px;

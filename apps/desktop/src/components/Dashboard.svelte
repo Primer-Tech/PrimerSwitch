@@ -6,6 +6,7 @@
   import Icon from './Icon.svelte';
   import QuotaBar from './QuotaBar.svelte';
   import meta from '../../package.json';
+  import primerLogo from '../assets/primer-logo.png';
   let {
     snapshot,
     now,
@@ -67,18 +68,11 @@
 <svelte:window onkeydown={closeAdd} />
 <div class="desktop-shell">
   <aside class="sidebar" aria-label={t($language, 'navigation')}>
-    <div class="sidebar-brand">
-      <span class="switch-mark" aria-hidden="true"
-        ><svg viewBox="0 0 24 24" fill="none"
-          ><path
-            d="M4 8h15m-4-4 4 4-4 4M20 16H5m4-4-4 4 4 4"
-            stroke="currentColor"
-            stroke-width="2"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-          /></svg
-        ></span
-      ><strong>PrimerSwitch</strong>
+    <div class="sidebar-brand" role="img" aria-label="PrimerSwitch">
+      <img class="primer-mark" src={primerLogo} alt="" aria-hidden="true" />
+      <span class="primer-wordmark" aria-hidden="true">
+        <strong>primer</strong><span>Switch</span>
+      </span>
     </div>
     <nav>
       <button
@@ -89,9 +83,6 @@
             .getElementById('accounts-heading')
             ?.scrollIntoView({ behavior: 'smooth' })}
         ><Icon name="accounts" /><span>{t($language, 'accounts')}</span></button
-      ><button disabled={!snapshot} onclick={onsettings}
-        ><Icon name="automation" /><span>{t($language, 'automation')}</span
-        ></button
       ><button
         aria-label={t($language, 'openSettings')}
         disabled={!snapshot}

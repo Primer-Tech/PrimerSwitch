@@ -1,6 +1,8 @@
 //! Native storage and recoverable Claude CLI switching. No provider requests occur here.
 mod active;
 mod files;
+#[cfg(any(target_os = "linux", test))]
+mod linux_vault;
 mod paths;
 mod protection;
 mod vault;

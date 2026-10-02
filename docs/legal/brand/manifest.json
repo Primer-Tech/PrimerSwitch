@@ -1,0 +1,39 @@
+{
+  "font": {
+    "characters": "EIMPR eimpr",
+    "embeddedCopyright": "Copyright 2011 The Comfortaa Project Authors (https://github.com/alexeiva/comfortaa), with Reserved Font Name \"Comfortaa\".",
+    "file": "apps/desktop/src/assets/fonts/comfortaa-600.subset.woff2",
+    "modifications": "None. The exact site-served subset bytes are redistributed unchanged.",
+    "name": "Comfortaa SemiBold",
+    "retrievedOn": "2026-10-02",
+    "sha256": "b64671ce165c26e223dbd246f451fb4097c46529b1ebc9f44551e44e07f26a0e",
+    "sourceReference": "Official page preload and @font-face select the identical public WOFF2 asset.",
+    "sourceReferenceUrl": "https://primer.tech/en",
+    "sourceUrl": "https://primer.tech/fonts/comfortaa-600.subset.woff2",
+    "usage": "Primer wordmark only; source subset supplies only Primer letters.",
+    "version": "3.105",
+    "weight": 600
+  },
+  "formatVersion": 1,
+  "license": {
+    "copyrightAttribution": "The exact official Comfortaa copyright and Reserved Font Name notice match the site font embedded name table. Full upstream OFL text is retained unchanged.",
+    "file": "docs/legal/brand/Comfortaa-OFL.txt",
+    "pinnedCommit": "d76415e6d10823546b8d0029bef09921eed0cbce",
+    "repository": "https://github.com/google/fonts",
+    "sha256": "bc85bae0b512b799bbfb2b916e4d0a34cfd963d09778cd783e248b479e67760a",
+    "spdx": "OFL-1.1",
+    "url": "https://raw.githubusercontent.com/google/fonts/d76415e6d10823546b8d0029bef09921eed0cbce/ofl/comfortaa/OFL.txt"
+  },
+  "logo": {
+    "attributionKind": "project-owner-branding",
+    "file": "apps/desktop/src/assets/primer-logo.png",
+    "modifications": "None. Exact public site PNG bytes are used for the renderer asset.",
+    "name": "Primer official logo",
+    "retrievedOn": "2026-10-02",
+    "rightsStatement": "Primer branding is included at the project owner request. Project source code MIT licensing is separate from brand and trademark rights; no third-party logo or trademark license is asserted.",
+    "sha256": "420c32e097db47df368fcc6b12aea5fdfe94a188ad071adf6b303d9694136c16",
+    "sourceReferenceUrl": "https://primer.tech/en",
+    "sourceUrl": "https://primer.tech/icons/icon-512x512.png"
+  },
+  "scope": "Exact public Primer branding assets and the separately licensed Comfortaa wordmark font. No logo or trademark license is invented."
+}

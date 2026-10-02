@@ -208,7 +208,10 @@ impl RuntimeHandle {
     /// only on the serialized scheduler or an explicitly requested mutation.
     pub async fn open() -> Result<Self, RuntimeError> {
         let paths = CliPaths::discover()?;
-        let vault = Vault::open(app_data_dir()?)?;
+        let vault_directory = app_data_dir()?;
+        let vault = tokio::task::spawn_blocking(move || Vault::open(vault_directory))
+            .await
+            .map_err(|_| RuntimeError::UnavailableStorage)??;
         let active = ActiveStore::new(paths);
         let version = provider_claude::detect_cli_version()
             .unwrap_or_else(|| provider_claude::FALLBACK_CLI_VERSION.into());

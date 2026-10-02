@@ -5,8 +5,8 @@ on:
       platform:
         description: Native preview target
         type: choice
-        default: both
-        options: [both, windows, macos]
+        default: all
+        options: [all, both, windows, macos, linux]
 permissions:
   contents: read
 jobs:
@@ -14,10 +14,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(inputs.platform == 'windows' && '[{"os":"windows-latest","bundle":"nsis"}]' || inputs.platform == 'macos' && '[{"os":"macos-latest","bundle":"dmg"}]' || '[{"os":"windows-latest","bundle":"nsis"},{"os":"macos-latest","bundle":"dmg"}]') }}
+        # "both" preserves the original Windows/macOS selection.
+        include: ${{ fromJSON(inputs.platform == 'windows' && '[{"os":"windows-latest","bundle":"nsis"}]' || inputs.platform == 'macos' && '[{"os":"macos-latest","bundle":"dmg"}]' || inputs.platform == 'linux' && '[{"os":"ubuntu-24.04","bundle":"deb"},{"os":"ubuntu-24.04","bundle":"rpm"}]' || inputs.platform == 'both' && '[{"os":"windows-latest","bundle":"nsis"},{"os":"macos-latest","bundle":"dmg"}]' || '[{"os":"windows-latest","bundle":"nsis"},{"os":"macos-latest","bundle":"dmg"},{"os":"ubuntu-24.04","bundle":"deb"},{"os":"ubuntu-24.04","bundle":"rpm"}]') }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
+      - name: Linux native build and package tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev build-essential curl wget file libssl-dev libdbus-1-dev libayatana-appindicator3-dev librsvg2-dev patchelf rpm xvfb x11-utils imagemagick python3-pyatspi at-spi2-core dbus-x11 gnome-keyring
       - uses: actions/setup-node@v7
         with:
           node-version: '24'
@@ -31,26 +37,35 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: '3.14'
+      - name: Packaging gate fixtures
+        run: python -B scripts/test_package_preview.py
       - name: Preview installer with dependency notices
         run: python -B scripts/package_preview.py --bundle ${{ matrix.bundle }}
+      - name: Installed Linux demo qualification
+        if: runner.os == 'Linux' && matrix.bundle == 'deb'
+        run: python -B scripts/qualify_linux_preview.py --bundle deb
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: PrimerSwitch-${{ runner.os }}-build-evidence
+          name: PrimerSwitch-${{ runner.os }}-${{ matrix.bundle }}-build-evidence
           path: |
             .artifacts/THIRD_PARTY_NOTICES.txt
             .artifacts/THIRD_PARTY_REPORT.json
             .artifacts/THIRD_PARTY_METADATA.json
             .artifacts/frontend-bundle-inventory.json
+            .artifacts/linux-installed-demo-report.json
+            .artifacts/linux-installed-demo.png
           if-no-files-found: warn
           include-hidden-files: true
           retention-days: 14
       - uses: actions/upload-artifact@v4
         with:
-          name: PrimerSwitch-${{ runner.os }}-unsigned-preview
+          name: PrimerSwitch-${{ runner.os }}-${{ matrix.bundle }}-unsigned-preview
           path: |
             target/release/bundle/nsis/*.exe
             target/release/bundle/dmg/*.dmg
+            target/release/bundle/deb/*.deb
+            target/release/bundle/rpm/*.rpm
             .artifacts/SHA256SUMS.txt
             .artifacts/package-manifest.json
             .artifacts/THIRD_PARTY_NOTICES.txt

@@ -1,5 +1,5 @@
 //! Native key protection; never invokes a credential-bearing child process.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 use crate::PlatformError;
 use crate::Result;
 use std::path::Path;
@@ -82,6 +82,18 @@ pub(crate) fn protect_file(path: &Path, directory: bool) -> Result<()> {
 #[cfg(unix)]
 pub(crate) fn protect_file(path: &Path, directory: bool) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.file_type().is_symlink()
+            || (directory && !metadata.is_dir())
+            || (!directory && (!metadata.is_file() || metadata.nlink() != 1))
+        {
+            return Err(PlatformError::UnsafePath);
+        }
+    }
     std::fs::set_permissions(
         path,
         std::fs::Permissions::from_mode(if directory { 0o700 } else { 0o600 }),

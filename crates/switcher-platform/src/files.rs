@@ -61,11 +61,26 @@ pub(crate) fn private_dir(path: &Path) -> Result<()> {
 
 pub(crate) fn read_optional(path: &Path) -> Result<Option<Vec<u8>>> {
     check_path(path)?;
-    let file = match File::open(path) {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = match options.open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err(PlatformError::Io),
     };
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = file.metadata()?;
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.nlink() != 1 {
+            return Err(PlatformError::UnsafePath);
+        }
+    }
     if !file.metadata()?.is_file() {
         return Err(PlatformError::UnsafePath);
     }
@@ -145,6 +160,8 @@ impl Lock {
         {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
+            #[cfg(target_os = "linux")]
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
         }
         let file = options.open(path)?;
         protection::protect_file(path, false)?;
@@ -234,6 +251,37 @@ mod tests {
             ));
         }
         assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn hardlinked_credential_files_and_fifo_locks_are_rejected() {
+        use std::os::unix::ffi::OsStrExt;
+        let root = crate::files::test_root();
+        let target = root.path().join("credential.json");
+        atomic_write(&target, b"fixture-secret").unwrap();
+        let alias = root.path().join("hardlink.json");
+        fs::hard_link(&target, &alias).unwrap();
+        assert!(matches!(
+            read_optional(&alias),
+            Err(PlatformError::UnsafePath)
+        ));
+        assert!(matches!(
+            protection::protect_file(&alias, false),
+            Err(PlatformError::UnsafePath)
+        ));
+        assert_eq!(fs::read(&target).unwrap(), b"fixture-secret");
+        let fifo = root.path().join("fifo.lock");
+        let path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        assert!(matches!(
+            Lock::acquire(&fifo),
+            Err(PlatformError::UnsafePath)
+        ));
+        assert!(matches!(
+            read_optional(&fifo),
+            Err(PlatformError::UnsafePath)
+        ));
     }
 
     #[cfg(unix)]

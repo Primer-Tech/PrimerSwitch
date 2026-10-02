@@ -314,7 +314,7 @@ class PackagingFixtures(unittest.TestCase):
         self.assertTrue(context.assertNonBlocking)
 
     def stable_identity(self):
-        return {"productName": "PrimerSwitch", "identifier": "com.primertech.primerswitch", "version": "0.1.1",
+        return {"productName": "PrimerSwitch", "identifier": "com.primertech.primerswitch", "version": "0.2.0",
                 "bundle": {"publisher": "Primer-Tech", "windows": {"allowDowngrades": False, "nsis": {"installMode": "currentUser"}},
                            "resources": {"source-license.txt": "installer-notices/LICENSE.txt"}}}
 
@@ -322,7 +322,7 @@ class PackagingFixtures(unittest.TestCase):
         config = self.stable_identity()
         cargo = {"package": {"default-run": "primerswitch"}, "bin": [{"name": "primerswitch"}]}
         packaging.verify_preview_identity(config, cargo)
-        config["version"] = "0.1.2"
+        config["version"] = "0.2.1"
         packaging.verify_preview_identity(config, cargo)
         config["bundle"]["windows"]["nsis"]["installerHooks"] = "custom-hooks.nsh"
         self.rejects("unreviewed-nsis-template-or-hooks", lambda: packaging.verify_preview_identity(config, cargo))
@@ -426,12 +426,12 @@ ${EndIf}
         files = {"usr/bin/primerswitch": b"\x7fELFfixture"}
         dependencies = ["libc.so.6(GLIBC_2.39)(64bit)", "libgtk-3.so.0()(64bit)",
                         "/usr/share/dbus-1/services/org.freedesktop.secrets.service"]
-        spec = packaging.native_rpm_spec("0.1.1", dependencies, files)
-        self.assertIn("Version: 0.1.1", spec)
+        spec = packaging.native_rpm_spec("0.2.0", dependencies, files)
+        self.assertIn("Version: 0.2.0", spec)
         for dependency in ("%{lua:os.execute('id')}", "libc.so.6()\n%post\necho injected", "glibc >= 2.39"):
-            self.rejects("unsafe-native-rpm-requirement", lambda: packaging.native_rpm_spec("0.1.1", [dependency], files))
-        self.rejects("unreviewed-native-rpm-version", lambda: packaging.native_rpm_spec("0.1.1\n%post", dependencies, files))
-        self.rejects("unsafe-native-rpm-destination", lambda: packaging.native_rpm_spec("0.1.1", dependencies, {"usr/bin/../../escape/runtime-state.vault": b"bad"}))
+            self.rejects("unsafe-native-rpm-requirement", lambda: packaging.native_rpm_spec("0.2.0", [dependency], files))
+        self.rejects("unreviewed-native-rpm-version", lambda: packaging.native_rpm_spec("0.2.0\n%post", dependencies, files))
+        self.rejects("unsafe-native-rpm-destination", lambda: packaging.native_rpm_spec("0.2.0", dependencies, {"usr/bin/../../escape/runtime-state.vault": b"bad"}))
 
     def test_native_rpm_final_payload_must_equal_all_staged_bytes(self):
         files = {"usr/bin/primerswitch": b"\x7fELFfresh native binary", "usr/lib/PrimerSwitch/THIRD_PARTY_NOTICES.txt": b"full license"}

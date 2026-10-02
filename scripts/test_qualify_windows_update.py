@@ -38,14 +38,14 @@ class GuardTests(unittest.TestCase):
                 qualification.require_clean_registration({name: {}})
 
     def fixture_package(self, root):
-        package = root / "target/release/bundle/nsis/PrimerSwitch_0.1.1_x64-setup.exe"
+        package = root / "target/release/bundle/nsis/PrimerSwitch_0.2.0_x64-setup.exe"
         package.parent.mkdir(parents=True)
         package.write_bytes(b"MZ hermetic fixture installer never executed")
         binary = root / "target/release/primerswitch.exe"
         binary.write_bytes(b"MZ hermetic fixture application never executed")
         config = root / "apps/desktop/src-tauri/tauri.conf.json"
         config.parent.mkdir(parents=True)
-        config.write_text(json.dumps({"productName": "PrimerSwitch", "identifier": "com.primertech.primerswitch", "version": "0.1.1", "bundle": {"publisher": "Primer-Tech", "windows": {"nsis": {"installMode": "currentUser"}}}}), encoding="utf8")
+        config.write_text(json.dumps({"productName": "PrimerSwitch", "identifier": "com.primertech.primerswitch", "version": "0.2.0", "bundle": {"publisher": "Primer-Tech", "windows": {"nsis": {"installMode": "currentUser"}}}}), encoding="utf8")
         evidence = root / ".artifacts/evidence.json"
         evidence.parent.mkdir()
         evidence.write_bytes(b"fixture evidence")
@@ -129,9 +129,9 @@ class GuardTests(unittest.TestCase):
             expected.write_bytes(b"MZ updated compiled application")
             for name, body in qualification.SENTINELS.items():
                 (install / name).write_bytes(body)
-            state = {qualification.REGISTRY_KEYS[0]: {"DisplayVersion": "0.1.1"}}
+            state = {qualification.REGISTRY_KEYS[0]: {"DisplayVersion": "0.2.0"}}
             evidence = qualification.installation_evidence(install, state, qualification.sha256(old_body), expected.read_bytes())
-            self.assertEqual(evidence["registeredVersion"], "0.1.1")
+            self.assertEqual(evidence["registeredVersion"], "0.2.0")
             self.assertTrue(evidence["matchesOldApplication"])
             self.assertFalse(evidence["matchesExpectedNewApplication"])
             self.assertTrue(all(evidence["sentinelBytesPreserved"].values()))
@@ -186,11 +186,11 @@ class GuardTests(unittest.TestCase):
     def test_registry_paths_must_belong_to_the_fixture(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
-            state = {qualification.REGISTRY_KEYS[0]: {"DisplayName": "PrimerSwitch", "Publisher": "Primer-Tech", "DisplayVersion": "0.1.1", "UninstallString": '"' + str(root / "uninstall.exe") + '"'}, qualification.REGISTRY_KEYS[1]: {"": str(root)}}
-            qualification.verify_registration(state, root, "0.1.1")
+            state = {qualification.REGISTRY_KEYS[0]: {"DisplayName": "PrimerSwitch", "Publisher": "Primer-Tech", "DisplayVersion": "0.2.0", "UninstallString": '"' + str(root / "uninstall.exe") + '"'}, qualification.REGISTRY_KEYS[1]: {"": str(root)}}
+            qualification.verify_registration(state, root, "0.2.0")
             state[qualification.REGISTRY_KEYS[1]][""] = str(root.parent)
             with self.assertRaises(qualification.QualificationError):
-                qualification.verify_registration(state, root, "0.1.1")
+                qualification.verify_registration(state, root, "0.2.0")
 
 
 if __name__ == "__main__":

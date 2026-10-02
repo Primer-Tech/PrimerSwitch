@@ -29,6 +29,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Rust fixture suite
         run: cargo test --locked
+      - name: Isolated Codex native subprocess fixtures
+        run: cargo test --locked -p provider-codex --features fixture-process
       - name: Isolated Linux Secret Service fixtures
         if: runner.os == 'Linux'
         run: python -B scripts/linux_keyring_fixture.py

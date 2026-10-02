@@ -22,7 +22,7 @@ import urllib.request
 ROOT = Path(__file__).resolve().parent.parent
 ARTIFACTS = ROOT / ".artifacts"
 REPORT = ARTIFACTS / "windows-update-preservation-report.json"
-OLD_URL = "https://github.com/Primer-Tech/PrimerSwitch/releases/download/v0.1.0-preview.1/PrimerSwitch_0.1.0_x64-setup.exe"
+OLD_URL = "https://github.com/Primer-Tech/PrimerSwitch/releases/download/v0.1.1-preview.1/PrimerSwitch_0.1.1_x64-setup.exe"
 # Exact producer transform in tauri-cli v2.12.1 (commit below), bundle.rs:
 # patch_binary() lines40-96 writes UNK -> NSS for NSIS; bundle_project()
 # lines134-145 and212-218 restores the original after packaging. No other
@@ -32,14 +32,16 @@ BUNDLER_SOURCE = "https://github.com/tauri-apps/tauri/blob/30da1fd6e17de6107ecc8
 BUNDLE_MARKER_PREFIX = b"__TAURI_BUNDLE_TYPE_VAR_"
 COMPILED_BUNDLE_MARKER = BUNDLE_MARKER_PREFIX + b"UNK"
 NSIS_BUNDLE_MARKER = BUNDLE_MARKER_PREFIX + b"NSS"
-OLD_BYTES = 5085753
-OLD_SHA256 = "752841fbee0eff3a992766aae2600b67dd57b084122c601e49a558b64058684b"
+OLD_BYTES = 5127746
+OLD_SHA256 = "45112bdf625b90253f009efdc6f0d522646bec49bb4dbfa95bc98b67a118d590"
 MARKER = "PrimerSwitch hosted Windows installer fixture v1\n"
 REGISTRY_KEYS = (
     r"Software\Microsoft\Windows\CurrentVersion\Uninstall\PrimerSwitch",
     r"Software\Primer-Tech\PrimerSwitch",
 )
 SENTINELS = {
+    "codex-state.vault": b"PRMSV001\x00\xffSYNTHETIC_INSTALLER_RETENTION_ONLY_CODEX\x00",
+    "codex-journal-fixture.vault": b"PRMSV001\x00\xffSYNTHETIC_INSTALLER_RETENTION_ONLY_CODEX_JOURNAL\x00",
     "runtime-state.vault": b"PRMSV001\x00\xffSYNTHETIC_INSTALLER_RETENTION_ONLY_STATE\x00",
     "master-key.dpapi": b"\x00\xffSYNTHETIC_INSTALLER_RETENTION_ONLY_KEY\x00",
     "settings.json": b'{"appearance":"light","language":"ro","opaque":{"keep":[1,2]}}\n',
@@ -93,7 +95,7 @@ def verify_package_manifest(manifest: dict, root: Path, commit: str) -> tuple[Pa
     config = json.loads(safe_file(root, config_label).read_text(encoding="utf8"))
     require(config.get("productName") == "PrimerSwitch" and config.get("identifier") == "com.primertech.primerswitch" and config.get("bundle", {}).get("publisher") == "Primer-Tech" and config["bundle"].get("windows", {}).get("nsis", {}).get("installMode") == "currentUser", "preview-install-identity-changed")
     version = config.get("version", "")
-    require(isinstance(version, str) and re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version) is not None and tuple(map(int, version.split("."))) > (0, 1, 0), "qualification-requires-new-preview-version")
+    require(isinstance(version, str) and re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version) is not None and tuple(map(int, version.split("."))) > (0, 1, 1), "qualification-requires-new-preview-version")
     # The manifest binds the renderer inventory, which binds the exact npm
     # lockfile containing the CLI producer version. Do not trust a free label.
     inventory_name = "frontend-bundle-inventory.json"
@@ -317,7 +319,7 @@ def main() -> int:
         stage = "old-isolated-install"
         # /UPDATE avoids WebView2 bootstrap/download and still creates registration.
         run_silent(old, ["/S", "/UPDATE"], install)
-        verify_registration(registry_state(), install, "0.1.0")
+        verify_registration(registry_state(), install, "0.1.1")
         require((install / "primerswitch.exe").is_file(), "old-application-not-installed")
         old_binary_hash = sha256((install / "primerswitch.exe").read_bytes())
         report["oldApplicationSha256"] = old_binary_hash

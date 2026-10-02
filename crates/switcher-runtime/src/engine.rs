@@ -1,4 +1,9 @@
 use crate::views::*;
+use crate::{
+    CodexLoginLaunch,
+    codex_engine::{CodexCommand, CodexEngine, CodexOutput},
+    codex_views::*,
+};
 use provider_claude::{ClaudeClient, ClientError, PendingLogin};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -147,6 +152,7 @@ struct Preview {
     files: Vec<PreviewFile>,
 }
 struct Engine {
+    codex: CodexEngine,
     saved: Persisted,
     vault: Option<Vault>,
     active: Option<ActiveStore>,
@@ -170,6 +176,9 @@ struct Engine {
 struct Inner {
     owner: Mutex<Engine>,
     cache: RwLock<Snapshot>,
+    codex_cache: RwLock<CodexSnapshot>,
+    codex_snapshots: broadcast::Sender<CodexSnapshot>,
+    codex_intent: Arc<AtomicU64>,
     snapshots: broadcast::Sender<Snapshot>,
     notifications: broadcast::Sender<Notification>,
     refresh_generation: AtomicU64,
@@ -253,7 +262,12 @@ impl RuntimeHandle {
         let login_intent = Arc::new(AtomicU64::new(0));
         let (notifications, _) = broadcast::channel(64);
         let (snapshots, _) = broadcast::channel(64);
+        let codex = CodexEngine::load(&vault);
+        let codex_intent = codex.intent.clone();
+        let (codex_snapshots, _) = broadcast::channel(64);
+        let codex_snapshot = codex.snapshot(false, clock.now());
         let mut engine = Engine {
+            codex,
             saved,
             vault: Some(vault),
             active: Some(active),
@@ -280,6 +294,9 @@ impl RuntimeHandle {
             inner: Arc::new(Inner {
                 owner: Mutex::new(engine),
                 cache: RwLock::new(snapshot),
+                codex_cache: RwLock::new(codex_snapshot),
+                codex_snapshots,
+                codex_intent,
                 snapshots,
                 notifications,
                 refresh_generation: AtomicU64::new(0),
@@ -331,7 +348,12 @@ impl RuntimeHandle {
                 },
             );
         }
+        let codex = CodexEngine::demo(now);
+        let codex_intent = codex.intent.clone();
+        let (codex_snapshots, _) = broadcast::channel(64);
+        let codex_snapshot = codex.snapshot(false, now);
         let engine = Engine {
+            codex,
             saved,
             vault: None,
             active: None,
@@ -357,6 +379,9 @@ impl RuntimeHandle {
             inner: Arc::new(Inner {
                 owner: Mutex::new(engine),
                 cache: RwLock::new(snapshot),
+                codex_cache: RwLock::new(codex_snapshot),
+                codex_snapshots,
+                codex_intent,
                 snapshots,
                 notifications,
                 refresh_generation: AtomicU64::new(0),
@@ -392,6 +417,7 @@ impl RuntimeHandle {
             engine.active_id = None;
             engine.active_model = None;
             engine.demo = false;
+            engine.codex.unavailable();
             engine.error = Some(error.message(&engine.saved.settings.language));
             handle.publish(&mut engine, false);
         }
@@ -444,6 +470,124 @@ impl RuntimeHandle {
         let snapshot = engine.snapshot(busy);
         *self.inner.cache.write().unwrap_or_else(|p| p.into_inner()) = snapshot.clone();
         let _ = self.inner.snapshots.send(snapshot);
+        self.publish_codex(engine, busy);
+    }
+    fn publish_codex(&self, engine: &mut Engine, busy: bool) {
+        engine.codex.revision = engine.codex.revision.saturating_add(1);
+        let snapshot = engine.codex.snapshot(busy, engine.clock.now());
+        *self
+            .inner
+            .codex_cache
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = snapshot.clone();
+        let _ = self.inner.codex_snapshots.send(snapshot);
+    }
+    pub fn get_codex_snapshot(&self) -> CodexSnapshot {
+        self.inner
+            .codex_cache
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+    pub fn subscribe_codex(&self) -> broadcast::Receiver<CodexSnapshot> {
+        self.inner.codex_snapshots.subscribe()
+    }
+    async fn run_codex(&self, command: CodexCommand) -> Result<CodexOutput, CodexReason> {
+        let mut engine = if matches!(&command, CodexCommand::PollLogin(_)) {
+            self.inner.owner.try_lock().map_err(|_| CodexReason::Busy)?
+        } else {
+            self.inner.owner.lock().await
+        };
+        if engine.demo || engine.vault.is_none() {
+            return Err(CodexReason::VaultUnavailable);
+        }
+        self.publish(&mut engine, true);
+        let now = engine.clock.now();
+        let result = {
+            let Engine { codex, vault, .. } = &mut *engine;
+            codex
+                .command(
+                    command,
+                    vault.as_ref().ok_or(CodexReason::VaultUnavailable)?,
+                    now,
+                )
+                .await
+        };
+        if let Err(error) = &result {
+            engine.codex.error = Some(*error);
+        }
+        self.publish(&mut engine, false);
+        result
+    }
+    async fn codex_snapshot_command(
+        &self,
+        command: CodexCommand,
+    ) -> Result<CodexSnapshot, CodexReason> {
+        self.run_codex(command).await?;
+        Ok(self.get_codex_snapshot())
+    }
+    pub async fn shutdown_codex(&self) {
+        self.inner.codex_intent.fetch_add(1, Ordering::AcqRel);
+        let mut engine = self.inner.owner.lock().await;
+        engine.codex.shutdown_owned().await;
+    }
+    pub async fn codex_discover(&self) -> Result<CodexSnapshot, CodexReason> {
+        self.codex_snapshot_command(CodexCommand::Discover).await
+    }
+    pub async fn codex_begin_login(&self) -> Result<CodexLoginLaunch, CodexReason> {
+        let intent = self.inner.codex_intent.fetch_add(1, Ordering::AcqRel) + 1;
+        match self.run_codex(CodexCommand::BeginLogin(intent)).await? {
+            CodexOutput::Login(value) => Ok(value),
+            _ => Err(CodexReason::ProviderUnavailable),
+        }
+    }
+    pub async fn codex_poll_login(&self, id: &str) -> Result<CodexSnapshot, CodexReason> {
+        self.codex_snapshot_command(CodexCommand::PollLogin(id.into()))
+            .await
+    }
+    pub async fn codex_cancel_login(&self, id: &str) -> Result<CodexSnapshot, CodexReason> {
+        let current = self.get_codex_snapshot().login;
+        if current.is_some_and(|p| p.id == id) {
+            self.inner.codex_intent.fetch_add(1, Ordering::AcqRel);
+        }
+        self.codex_snapshot_command(CodexCommand::CancelLogin(id.into()))
+            .await
+    }
+    pub async fn codex_import_current(&self) -> Result<CodexSnapshot, CodexReason> {
+        self.codex_snapshot_command(CodexCommand::ImportCurrent)
+            .await
+    }
+    pub async fn codex_refresh_account(&self, id: &str) -> Result<CodexSnapshot, CodexReason> {
+        self.codex_snapshot_command(CodexCommand::Refresh(id.into()))
+            .await
+    }
+    pub async fn codex_delete_account(&self, id: &str) -> Result<CodexSnapshot, CodexReason> {
+        self.codex_snapshot_command(CodexCommand::Delete(id.into()))
+            .await
+    }
+    pub async fn codex_prepare_switch(
+        &self,
+        id: &str,
+    ) -> Result<CodexPreparationView, CodexReason> {
+        match self.run_codex(CodexCommand::Prepare(id.into())).await? {
+            CodexOutput::Preparation(value) => Ok(value),
+            _ => Err(CodexReason::InvalidPreparation),
+        }
+    }
+    pub async fn codex_cancel_preparation(&self, id: &str) -> Result<CodexSnapshot, CodexReason> {
+        self.codex_snapshot_command(CodexCommand::CancelPreparation(id.into()))
+            .await
+    }
+    pub async fn codex_apply_switch(
+        &self,
+        preparation_id: &str,
+        clients_closed_acknowledged: bool,
+    ) -> Result<CodexSnapshot, CodexReason> {
+        self.codex_snapshot_command(CodexCommand::Apply(
+            preparation_id.into(),
+            clients_closed_acknowledged,
+        ))
+        .await
     }
     async fn run(&self, command: Command, coalesce: Option<u64>) -> Result<Output, RuntimeError> {
         let mut engine = self.inner.owner.lock().await;
@@ -3026,5 +3170,75 @@ mod tests {
             RuntimeError::Storage.message("en"),
             RuntimeError::Storage.to_string()
         );
+    }
+
+    #[tokio::test]
+    async fn codex_cache_and_mutations_preserve_claude_ciphertext_and_use_one_owner() {
+        let fake = Arc::new(Fake::default());
+        let (temp, handle, _, paths) =
+            fixture(vec![account("a", 1000)], Some("a"), 1000, fake.clone());
+        let state = temp.path().join("vault/runtime-state.vault");
+        let before = std::fs::read(&state).unwrap();
+        let codex_before = serde_json::to_value(handle.get_codex_snapshot()).unwrap();
+        // A corrupt unrelated store after startup must never be opened by cached polling.
+        std::fs::write(paths.config_dir.join("unrelated-fixture"), b"opaque").unwrap();
+        for _ in 0..10 {
+            assert_eq!(
+                serde_json::to_value(handle.get_codex_snapshot()).unwrap(),
+                codex_before
+            );
+        }
+        assert!(!temp.path().join("vault/codex-state.vault").exists());
+        let owner = handle.inner.owner.lock().await;
+        let denied = tokio::time::timeout(
+            Duration::from_millis(100),
+            handle.codex_poll_login("fixture-only"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(denied.err(), Some(CodexReason::Busy));
+        assert_eq!(std::fs::read(&state).unwrap(), before);
+        drop(owner);
+        let mut changes = handle.subscribe_codex();
+        assert_eq!(
+            handle.codex_delete_account("missing").await.err(),
+            Some(CodexReason::IdentityUnverified)
+        );
+        assert!(changes.try_recv().unwrap().busy);
+        assert!(!changes.try_recv().unwrap().busy);
+        assert_eq!(std::fs::read(&state).unwrap(), before);
+        assert!(fake.calls.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn damaged_codex_record_preserves_claude_settings_and_original_envelope() {
+        let fake = Arc::new(Fake::default());
+        let (temp, handle, clock, paths) =
+            fixture(vec![account("a", 1000)], Some("a"), 1000, fake.clone());
+        drop(handle);
+        let directory = temp.path().join("vault");
+        let damaged = b"deliberate-fixture-codex-damaged-envelope";
+        let codex_file = directory.join("codex-state.vault");
+        std::fs::write(&codex_file, damaged).unwrap();
+        let handle = RuntimeHandle::from_parts(
+            Vault::with_key(directory, [7; 32]).unwrap(),
+            ActiveStore::file(paths),
+            ClaudeClient::with_transport("2.1.287", fake.clone()).unwrap(),
+            clock,
+        )
+        .unwrap();
+        let snapshot = handle.get_codex_snapshot();
+        assert_eq!(snapshot.blocked_reason, Some(CodexReason::VaultUnavailable));
+        assert!(!snapshot.capabilities.login_browser.enabled);
+        assert!(!snapshot.capabilities.delete_saved.enabled);
+        let mut settings = handle.get_snapshot().settings;
+        settings.language = "ro".into();
+        handle.update_settings(settings).await.unwrap();
+        assert_eq!(handle.get_snapshot().settings.language, "ro");
+        assert_eq!(std::fs::read(codex_file).unwrap(), damaged);
+        assert_eq!(
+            handle.codex_import_current().await.err(),
+            Some(CodexReason::VaultUnavailable)
+        );
+        assert!(fake.calls.lock().unwrap().is_empty());
     }
 }

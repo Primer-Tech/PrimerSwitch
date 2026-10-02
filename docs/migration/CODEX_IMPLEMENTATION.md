@@ -1,6 +1,6 @@
 # Codex integration implementation contract
 
-Status: authorized by the owner, follows the branded 0.1.1 release. Research is complete; implementation starts next. Resume with AGENTS.md, DEVELOPMENT_CONTRACT.md, PROGRESS.md and CODEX_RESEARCH.md. Original Claude records, settings, polling and provider behavior remain compatible.
+Status: authorized by the owner, follows the branded 0.1.1 release. Source implementation is complete; final native CI and preview packaging are in progress. Practical workflow and scope: [CODEX_USAGE.md](CODEX_USAGE.md). Resume with AGENTS.md, DEVELOPMENT_CONTRACT.md, PROGRESS.md and CODEX_RESEARCH.md. Original Claude records, settings, polling and provider behavior remain compatible.
 
 ## Supported first delivery
 

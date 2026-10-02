@@ -1,7 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use switcher_runtime::{
-    ImportPreview, LoginSession, RuntimeError, RuntimeHandle, SettingsView, Snapshot,
+    CodexLoginView, CodexPreparationView, CodexReason, CodexSnapshot, ImportPreview, LoginSession,
+    RuntimeError, RuntimeHandle, SettingsView, Snapshot,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
@@ -172,8 +173,124 @@ async fn apply_legacy_import(
         .map_err(|e| local_error(&runtime, e))
 }
 
+// Separate redacted Codex contract; the authorization URL stays in native Rust.
+#[tauri::command]
+fn get_codex_snapshot(runtime: State<'_, RuntimeHandle>) -> CodexSnapshot {
+    runtime.get_codex_snapshot()
+}
+#[tauri::command]
+async fn codex_discover(runtime: State<'_, RuntimeHandle>) -> Reply<CodexSnapshot> {
+    runtime.codex_discover().await.map_err(|e| e.to_string())
+}
+#[tauri::command]
+async fn codex_begin_login(
+    app: AppHandle,
+    runtime: State<'_, RuntimeHandle>,
+) -> Reply<CodexLoginView> {
+    let launch = runtime
+        .codex_begin_login()
+        .await
+        .map_err(|e| e.to_string())?;
+    if app
+        .opener()
+        .open_url(launch.authorization_url(), None::<&str>)
+        .is_err()
+    {
+        let _ = runtime.codex_cancel_login(&launch.session.id).await;
+        return Err(CodexReason::ProviderUnavailable.to_string());
+    }
+    Ok(launch.session)
+}
+#[tauri::command]
+async fn codex_poll_login(runtime: State<'_, RuntimeHandle>, id: String) -> Reply<CodexSnapshot> {
+    codex_id(&id)?;
+    runtime
+        .codex_poll_login(&id)
+        .await
+        .map_err(|e| e.to_string())
+}
+#[tauri::command]
+async fn codex_cancel_login(runtime: State<'_, RuntimeHandle>, id: String) -> Reply<CodexSnapshot> {
+    codex_id(&id)?;
+    runtime
+        .codex_cancel_login(&id)
+        .await
+        .map_err(|e| e.to_string())
+}
+#[tauri::command]
+async fn codex_import_current(runtime: State<'_, RuntimeHandle>) -> Reply<CodexSnapshot> {
+    runtime
+        .codex_import_current()
+        .await
+        .map_err(|e| e.to_string())
+}
+#[tauri::command]
+async fn codex_refresh_account(
+    runtime: State<'_, RuntimeHandle>,
+    id: String,
+) -> Reply<CodexSnapshot> {
+    codex_id(&id)?;
+    runtime
+        .codex_refresh_account(&id)
+        .await
+        .map_err(|e| e.to_string())
+}
+#[tauri::command]
+async fn codex_delete_account(
+    runtime: State<'_, RuntimeHandle>,
+    id: String,
+) -> Reply<CodexSnapshot> {
+    codex_id(&id)?;
+    runtime
+        .codex_delete_account(&id)
+        .await
+        .map_err(|e| e.to_string())
+}
+#[tauri::command]
+async fn codex_prepare_switch(
+    runtime: State<'_, RuntimeHandle>,
+    id: String,
+) -> Reply<CodexPreparationView> {
+    codex_id(&id)?;
+    runtime
+        .codex_prepare_switch(&id)
+        .await
+        .map_err(|e| e.to_string())
+}
+#[tauri::command]
+async fn codex_cancel_preparation(
+    runtime: State<'_, RuntimeHandle>,
+    id: String,
+) -> Reply<CodexSnapshot> {
+    codex_id(&id)?;
+    runtime
+        .codex_cancel_preparation(&id)
+        .await
+        .map_err(|e| e.to_string())
+}
+#[tauri::command]
+async fn codex_apply_switch(
+    runtime: State<'_, RuntimeHandle>,
+    preparation_id: String,
+    clients_closed_acknowledged: bool,
+) -> Reply<CodexSnapshot> {
+    codex_id(&preparation_id)?;
+    runtime
+        .codex_apply_switch(&preparation_id, clients_closed_acknowledged)
+        .await
+        .map_err(|e| e.to_string())
+}
+fn codex_id(id: &str) -> Reply<()> {
+    if id.is_empty() || id.len() > 256 || id.chars().any(char::is_control) {
+        Err(CodexReason::InvalidPreparation.to_string())
+    } else {
+        Ok(())
+    }
+}
+
 fn main() {
     let demo = std::env::args().skip(1).any(|arg| arg == "--demo");
+    let exiting = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
             if let Some(window) = app.get_webview_window("main") {
@@ -198,7 +315,18 @@ fn main() {
             finish_login,
             cancel_login,
             preview_legacy_import,
-            apply_legacy_import
+            apply_legacy_import,
+            get_codex_snapshot,
+            codex_discover,
+            codex_begin_login,
+            codex_poll_login,
+            codex_cancel_login,
+            codex_import_current,
+            codex_refresh_account,
+            codex_delete_account,
+            codex_prepare_switch,
+            codex_cancel_preparation,
+            codex_apply_switch
         ])
         .setup(move |app| {
             let runtime = if demo {
@@ -208,6 +336,8 @@ fn main() {
                     .unwrap_or_else(RuntimeHandle::unavailable)
             };
             let mut changes = runtime.subscribe();
+            let mut codex_changes = runtime.subscribe_codex();
+            let codex_events = app.handle().clone();
             let mut notifications = runtime.notifications();
             let events = app.handle().clone();
             let notice_app = app.handle().clone();
@@ -233,6 +363,23 @@ fn main() {
             });
             tauri::async_runtime::spawn(async move {
                 loop {
+                    match codex_changes.recv().await {
+                        Ok(snapshot) => {
+                            let _ =
+                                codex_events.emit_to("main", "codex_snapshot_changed", snapshot);
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            let snapshot =
+                                codex_events.state::<RuntimeHandle>().get_codex_snapshot();
+                            let _ =
+                                codex_events.emit_to("main", "codex_snapshot_changed", snapshot);
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+            tauri::async_runtime::spawn(async move {
+                loop {
                     match notifications.recv().await {
                         Ok(notice) => {
                             let _ = notice_app
@@ -249,8 +396,21 @@ fn main() {
             });
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("PrimerSwitch could not initialize its native window");
+        .build(tauri::generate_context!())
+        .expect("PrimerSwitch could not initialize its native window")
+        .run(move |app, event| {
+            if let tauri::RunEvent::ExitRequested { api, .. } = event
+                && !exiting.swap(true, std::sync::atomic::Ordering::AcqRel)
+            {
+                api.prevent_exit();
+                let app = app.clone();
+                let runtime = app.state::<RuntimeHandle>().inner().clone();
+                tauri::async_runtime::spawn(async move {
+                    runtime.shutdown_codex().await;
+                    app.exit(0);
+                });
+            }
+        });
 }
 
 fn navigation_allowed(scheme: &str, host: Option<&str>, port: Option<u16>) -> bool {

@@ -181,4 +181,127 @@ export const en = {
   resetIn: 'Resets in {duration}',
   weeklyEffective: 'Weekly · effective',
   weeklyEffectiveHelp: 'Higher of overall and selected-model weekly usage.',
+  providers: 'Account providers',
+  globalPreferences: 'Appearance and language',
+  settingsProviderScope:
+    'Automation applies to Claude. Appearance and language apply to both providers.',
+  claudeAutomation: 'Claude automation',
+  codexDescription: 'Manage saved accounts for newly opened Codex clients.',
+  codexActionFailed:
+    'The Codex action failed. Saved accounts have been retained.',
+  codexPrimaryWindow: 'Primary window',
+  codexSecondaryWindow: 'Secondary window',
+  codexWindowDuration: 'Window: {duration}',
+  codexWindowDays: '{count}-day window',
+  codexWindowHours: '{count}-hour window',
+  codexWindowMinutes: '{count}-minute window',
+  codexQuotaGroup: 'Usage limits',
+  codexUsageAllowed: 'Included usage is available',
+  codexUsageBlocked: 'Included usage is currently blocked',
+  codexUsageUnknown: 'Included usage permission is unknown',
+  codexNoWindows: 'No quota windows were provided.',
+  codexSpendBlocked: 'The workspace spend limit has been reached.',
+  codexLimitReached: 'A provider usage limit has been reached.',
+  codexCredits: 'Credits',
+  codexUnlimited: 'Unlimited',
+  codexCreditsAvailable: 'Available',
+  codexNoCredits: 'No credits available',
+  codexApiQuota:
+    'API-key accounts do not have ChatGPT subscription quota readings.',
+  codexNoQuota: 'No verified quota reading is available yet.',
+  codexWorking: 'Updating Codex accounts…',
+  codexSetup: 'Codex setup',
+  codexCheckSetup: 'Check setup',
+  codexSelectedAccount: 'Selected for new clients',
+  codexRefreshLabel: 'Refresh Codex quota for {name}',
+  codexSelected: 'Selected',
+  codexChatGPT: 'ChatGPT',
+  codexApiKey: 'API key',
+  codexUnsupportedAuth: 'Unsupported sign-in',
+  codexNoSelected: 'No Codex account selected',
+  codexImportOrAdd: 'Sign in with ChatGPT or import the current Codex account.',
+  codexAddAccount: 'Add a Codex account',
+  codexImportCurrent: 'Import current Codex account',
+  codexSavedQuota: 'Saved quota reading',
+  codexNoQuotaShort: 'No reading yet',
+  codexSelect: 'Select account',
+  codexEmptyTitle: 'Your Codex accounts, together',
+  codexManualTitle: 'Manual account selection',
+  codexManualDescription:
+    'Account selection applies to Codex clients opened after the change.',
+  codexCloseClients:
+    'Close Codex apps and terminals using Codex before selecting an account. Reopen them after the change.',
+  codexManualOnly: 'Manual selection only',
+  codexCompatibility: 'Compatibility',
+  codexVersion: 'Codex version',
+  codexBrowserLogin: 'Browser sign-in',
+  codexAvailable: 'Available',
+  codexUnavailable: 'Unavailable',
+  codexSupportScope:
+    'Managed ChatGPT accounts with Codex 0.160.0 and FILE credential storage are supported. Other versions, sign-in types and storage modes remain restricted.',
+  codexResetCredits: 'Reset credits',
+  codexReadOnly: 'Read-only',
+  codexNoCreditActions:
+    'PrimerSwitch does not consume Codex credits or resets automatically.',
+  codexLoginDescription:
+    'Complete sign-in in the browser. This window updates when authorization finishes; no code needs to be pasted.',
+  codexIsolatedLogin:
+    'Adding an account leaves your current Codex sign-in unchanged.',
+  codexVerifyingLogin: 'Verifying the account…',
+  codexWaitingLogin: 'Waiting for browser sign-in…',
+  codexSelectTitle: 'Select a Codex account?',
+  codexSelectDescription: 'Select {name} for newly opened Codex clients.',
+  codexNativeGuard:
+    'PrimerSwitch checks for running clients and changes to the current sign-in before applying the selection.',
+  codexClosedAcknowledgement: 'I have closed Codex clients using this sign-in.',
+  codexCheckAgain: 'Check again',
+  codexAuthKind: 'Sign-in type',
+  codexQuotaVerification: 'Current quota verification',
+  codexQuotaUnverified:
+    'Quota ownership has not been verified in this session.',
+  codexIdentity: 'Identity',
+  codexWorkspace: 'Workspace',
+  codexVerified: 'Verified',
+  codexActiveQuotaOnly:
+    'Only the selected managed ChatGPT account can be refreshed. Other readings remain cached.',
+  codexDeleteDescription:
+    'Remove {name} from PrimerSwitch? The current Codex sign-in remains unchanged.',
+  codexLoginComplete:
+    'The Codex account was added. Your current sign-in is unchanged.',
+  codexSwitchComplete: 'Account selected. Reopen Codex clients to use it.',
+  codexDeleteComplete: 'The saved Codex account was removed.',
+  codexReason_notInstalled: 'Install Codex locally, then check setup again.',
+  codexReason_unsupportedVersion:
+    'This Codex version has not been qualified. Account changes are unavailable.',
+  codexReason_unsupportedStore:
+    'This credential store is not supported yet. Your current setup has been retained.',
+  codexReason_unsupportedAuth:
+    'This sign-in type cannot be used for managed ChatGPT account selection.',
+  codexReason_policyRestricted:
+    'Your managed Codex policy does not allow this account change.',
+  codexReason_externalCredentials:
+    'This setup uses externally managed credentials. Account selection is unavailable.',
+  codexReason_storeConflict:
+    'Conflicting saved sign-ins were found. Resolve the current Codex setup before continuing.',
+  codexReason_vaultUnavailable:
+    'Secure account storage is unavailable. Saved accounts have not been changed.',
+  codexReason_identityUnverified: 'The account identity has not been verified.',
+  codexReason_identityMismatch:
+    'The returned account or workspace does not match. Saved data has been retained.',
+  codexReason_clientsRunning:
+    'Close Codex clients using this sign-in, then check again.',
+  codexReason_processInventoryUnavailable:
+    'Running Codex clients could not be checked. Account selection is blocked.',
+  codexReason_externalChange:
+    'The current Codex sign-in changed. Check again before continuing.',
+  codexReason_reconciliationRequired:
+    'An account change needs reconciliation. Further selection is blocked to preserve the current sign-in.',
+  codexReason_loginExpired:
+    'This sign-in expired. Close the dialog and start again.',
+  codexReason_loginCanceled: 'The sign-in was canceled.',
+  codexReason_providerUnavailable:
+    'Codex could not provide a verified response. Try again later.',
+  codexReason_invalidPreparation:
+    'The selection check expired or is no longer valid. Check again.',
+  codexReason_busy: 'Another account action is still running.',
 } as const;

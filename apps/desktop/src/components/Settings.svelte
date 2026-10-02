@@ -43,9 +43,11 @@
       void save();
     }}
   >
-    <p class="modal-intro">{t(locale, 'settingsDescription')}</p>
+    <p class="modal-intro">
+      {t(locale, 'settingsProviderScope')}
+    </p>
     <fieldset disabled={disabled || saving}>
-      <legend class="sr-only">{t(locale, 'automation')}</legend>
+      <legend class="sr-only">{t(locale, 'claudeAutomation')}</legend>
       <label class="toggle-row"
         ><span
           ><strong>{t(locale, 'automaticSwitch')}</strong><small
@@ -118,6 +120,9 @@
           bind:value={draft.threshold}
         />
       </div>
+    </fieldset>
+    <fieldset disabled={disabled || saving}>
+      <legend class="sr-only">{t(locale, 'globalPreferences')}</legend>
       <div class="settings-control">
         <label for="appearance">{t(locale, 'appearance')}</label><select
           id="appearance"

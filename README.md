@@ -1,6 +1,6 @@
 # PrimerSwitch
 
-A Rust desktop account switcher for AI coding assistants. Claude is the first provider; Codex/OpenAI is planned as a separate adapter.
+A Rust desktop account switcher for AI coding assistants. Claude and Codex use separate Rust adapters, account lists and provider-native quota views.
 
 The desktop app uses Tauri 2 and Svelte 5. Authentication, encrypted storage, quota policy, switching and scheduling live in Rust. New installations start in dark mode and English, with Romanian and light/system appearance available in settings.
 
@@ -13,6 +13,8 @@ This is an implementation preview. Windows is the first qualification target. Th
 The screenshot shows the implemented interface with explicitly marked, read-only fixture data. [Primer branding](docs/design/BRANDING.md) uses the actual logo and wordmark from primer.tech; automation preferences are in Settings. The [design record](docs/design/PROPOSALS.md) preserves the image-model proposals and the approved Direction A.
 
 ## Features
+
+The current source adds the [Codex 0.160.0 adapter](docs/migration/CODEX_USAGE.md): isolated managed browser login, encrypted saved accounts, current-login import, guarded manual selection and native quota windows. The public 0.1.1 installer above contains Claude; the 0.2.0 Codex preview is undergoing native qualification. Codex FILE-mode ChatGPT support has a pinned compatibility gate; API-key selection, other storage modes/versions and Codex automation remain separate work.
 
 - Browser sign-in with PKCE, import of the current Claude CLI login, and previewed legacy account import.
 - Manual switching with token-owner verification and encrypted recovery journals.
@@ -46,6 +48,7 @@ The native executable accepts `--demo` for a read-only fixture view that does no
 
 ```sh
 cargo test --workspace --locked
+cargo test --locked -p provider-codex --features fixture-process
 cargo run --locked -p switcher-diagnostics -- --fixtures
 npm --prefix apps/desktop run check
 npm --prefix apps/desktop test
@@ -59,7 +62,7 @@ The fixture suite uses temporary homes and fake HTTP transports. It does not aut
 
 ## Migration and development
 
-Read the [implementation plan](docs/migration/IMPLEMENTATION_PLAN.md), [Claude behavior contract](docs/migration/BEHAVIOR_SPEC.md), [test inventory](docs/migration/TEST_PLAN.md) and [future Codex plan](docs/migration/FUTURE_CODEX.md). The [shared implementation contract](docs/DEVELOPMENT_CONTRACT.md) and [agent instructions](AGENTS.md) define ownership and safety requirements. [The approved design](docs/design/PROPOSALS.md) was generated with the image model and implemented as a responsive dark dashboard, with a light variant.
+Read the [implementation plan](docs/migration/IMPLEMENTATION_PLAN.md), [Claude behavior contract](docs/migration/BEHAVIOR_SPEC.md), [test inventory](docs/migration/TEST_PLAN.md) and [Codex usage](docs/migration/CODEX_USAGE.md) and [future improvements](docs/migration/FUTURE_CODEX.md). The [shared implementation contract](docs/DEVELOPMENT_CONTRACT.md) and [agent instructions](AGENTS.md) define ownership and safety requirements. [The approved design](docs/design/PROPOSALS.md) was generated with the image model and implemented as a responsive dark dashboard, with a light variant.
 
 The private ClaudeSwitch history, original Swift source and research are kept in a separate checkout and are not part of this repository. A clean public Git history starts with the reviewed Rust implementation. [Repository strategy](docs/migration/REPOSITORY_STRATEGY.md).
 

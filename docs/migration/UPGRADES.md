@@ -1,6 +1,6 @@
 # Updating without resetting your data
 
-PrimerSwitch 0.1.1 keeps the application and storage identity of the 0.1.0 preview. The Primer logo, colors and simplified navigation change the interface; existing saved accounts and settings use the same encrypted record.
+PrimerSwitch 0.1.1 and the 0.2.0 Codex update keep the application and storage identity of the 0.1.0 preview. The Primer logo, colors and simplified navigation change the interface; existing saved accounts and settings use the same encrypted record.
 
 ## Installing the branded update
 
@@ -27,3 +27,9 @@ The Windows default installation folder also contains the saved vault. The gener
 The runtime regression opens a literal synthetic 0.1.0 saved-state document with injected keys and fake transports, checks startup leaves the original ciphertext/key bytes unchanged, changes one setting and reopens the same state. All remaining account and scheduling fields are retained, and no provider request occurs.
 
 Installer identity and cleanup checks are separate from runtime compatibility. Native Windows installer upgrade/reinstall and Linux installed-demo results are recorded in [the evidence ledger](PROGRESS.md). The original ClaudeSwitch import remains a separate operation described in [the migration plan](IMPLEMENTATION_PLAN.md).
+
+## Codex 0.2.0 update
+
+Codex uses the new encrypted codex-state record with the existing master key, vault envelope and application directory. Enabling it does not rewrite runtime-state or change Claude settings. A damaged Codex envelope blocks only Codex while preserving that file and keeping Claude settings usable. Codex records, pending selection journals and unrelated opaque files are included in the new installer retention fixtures.
+
+The 0.1.1-to-0.2.0 hosted installer gate is pinned to the actual published 0.1.1 installer bytes and checks upgrade followed by same-version reinstall. Its completed native evidence will be linked in PROGRESS.md before publishing 0.2.0. The historical 0.1.0 runtime-format fixture remains active.

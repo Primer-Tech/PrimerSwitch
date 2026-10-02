@@ -26,6 +26,7 @@ ROOT = Path(__file__).resolve().parent.parent
 ARTIFACTS = ROOT / ".artifacts"
 REPORT = ARTIFACTS / "linux-installed-demo-report.json"
 SCREENSHOT = ARTIFACTS / "linux-installed-demo.png"
+CODEX_SCREENSHOT = ARTIFACTS / "linux-installed-codex-demo.png"
 MARKER = "PrimerSwitch isolated Linux installed demo v1"
 
 
@@ -132,7 +133,10 @@ def accessible_nodes(node, pyatspi, *, limit: int = 6000) -> list[dict]:
                 pass
             index = len(rows)
             rows.append({"name": name, "role": role, "text": text, "parent": parent,
-                         "enabled": states.contains(pyatspi.STATE_ENABLED), "accessible": current})
+                         "enabled": states.contains(pyatspi.STATE_ENABLED),
+                         "selected": states.contains(pyatspi.STATE_SELECTED) if hasattr(pyatspi, "STATE_SELECTED") else False,
+                         "focused": states.contains(pyatspi.STATE_FOCUSED) if hasattr(pyatspi, "STATE_FOCUSED") else False,
+                         "accessible": current})
             for child_index in reversed(range(min(current.childCount, 1000))):
                 child = current.getChildAtIndex(child_index)
                 if child is not None:
@@ -175,7 +179,7 @@ def window_details() -> dict | None:
 
 
 
-def capture_painted_window(window_id: str, screenshot: Path, *, duration: float = 8.0) -> dict:
+def capture_painted_window(window_id: str, screenshot: Path, *, duration: float = 8.0, previous_frame_sha256: str | None = None) -> dict:
     """Capture only the observed fixture window; AT-SPI can precede first paint."""
     require(bool(re.fullmatch(r"0x[0-9a-fA-F]+", window_id)), "invalid-fixture-window-id")
     deadline = time.monotonic() + duration
@@ -198,10 +202,12 @@ def capture_painted_window(window_id: str, screenshot: Path, *, duration: float 
             match = re.fullmatch(r"([0-9]+) ([0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)", metrics)
             if match:
                 count, mean = int(match.group(1)), float(match.group(2))
-                if count > 64 and 0 <= mean < 0.5:
+                distinct = previous_frame_sha256 is None or sha256(screenshot.read_bytes()) != previous_frame_sha256
+                if count > 64 and 0 <= mean < 0.5 and distinct:
                     return {"uniqueColors": count, "normalizedMean": mean, "captureAttempts": attempts,
                             "firstPaintTimeoutSeconds": duration, "minimumUniqueColorsExclusive": 64,
-                            "maximumNormalizedMeanExclusive": 0.5, "expectedDefaultTheme": "dark"}
+                            "maximumNormalizedMeanExclusive": 0.5, "expectedDefaultTheme": "dark",
+                            "differentFromPreviousProviderFrame": distinct if previous_frame_sha256 else None}
         except (QualificationError, OSError, UnicodeError, subprocess.SubprocessError):
             # A newly mapped window can briefly be unavailable to X11 capture.
             # Retrying remains bounded and never changes renderer/sandbox flags.
@@ -212,11 +218,91 @@ def capture_painted_window(window_id: str, screenshot: Path, *, duration: float 
         time.sleep(min(0.25, remaining))
     raise QualificationError("native-window-first-paint-timeout")
 
+
+def provider_tab(rows: list[dict], provider: str, *, selected: bool) -> dict:
+    tabs = [row for row in rows if row["role"] in {"page tab", "tab"}
+            and (row["name"] == "Codex" if provider == "codex" else row["name"].endswith("Claude"))]
+    require(len(tabs) == 1 and tabs[0]["enabled"] and tabs[0].get("selected") is selected,
+            "provider-tab-state-invalid")
+    return tabs[0]
+
+
+def arrow_provider(tab: dict, direction: str, pyatspi) -> None:
+    require(tab["accessible"].queryComponent().grabFocus(), "provider-tab-focus-failed")
+    # AT-SPI KEY_SYM interprets keyval as an X11 keysym. String injection would
+    # not exercise the real ArrowLeft/ArrowRight DOM keyboard behavior.
+    require(direction in {"left", "right"}, "invalid-provider-arrow")
+    pyatspi.Registry.generateKeyboardEvent(0xff51 if direction == "left" else 0xff53, None, pyatspi.KEY_SYM)
+
+
+def wait_for_provider(pyatspi, glib, application, provider: str) -> list[dict]:
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        require(application.poll() is None, "installed-demo-exited-during-provider-navigation")
+        rows = observe_accessibility_desktop(pyatspi, glib)
+        content = "\n".join(row["name"] + " " + row["text"] for row in rows)
+        try:
+            tab = provider_tab(rows, provider, selected=True)
+            provider_tab(rows, "claude" if provider == "codex" else "codex", selected=False)
+            ready = ("Studio Codex" in content and "Personal Codex" in content) if provider == "codex" else "Automation" in content
+            if ready and tab.get("focused") and "Demo data" in content and "actions are disabled" in content:
+                return rows
+        except QualificationError:
+            pass
+        time.sleep(0.25)
+    raise QualificationError("provider-keyboard-navigation-timeout")
+
+
+def accessible_section_content(rows: list[dict], label: str) -> str:
+    headings = [i for i, row in enumerate(rows) if row["name"] == label and row["role"] == "heading"]
+    require(len(headings) == 1 and rows[headings[0]]["parent"] is not None, "codex-read-only-count-panel-missing")
+    section = rows[headings[0]]["parent"]
+    members = []
+    for index, row in enumerate(rows):
+        ancestor = index
+        for _ in range(46):
+            if ancestor == section:
+                members.append(row["name"] + " " + row["text"])
+                break
+            ancestor = rows[ancestor]["parent"]
+            if ancestor is None:
+                break
+    return "\n".join(members)
+
+
+def verify_codex_demo_rows(rows: list[dict]) -> dict:
+    content = "\n".join(row["name"] + " " + row["text"] for row in rows)
+    expected = ("Studio Codex", "Personal Codex", "codex-demo-0@example.invalid", "codex-demo-1@example.invalid",
+                "Selected for new clients", "ChatGPT", "0.160.0", "Managed ChatGPT accounts",
+                "FILE credential storage", "Close Codex apps and terminals", "Reopen them after the change.",
+                "Code review", "Reset credits", "Read-only", "does not consume Codex credits or resets automatically.",
+                "Demo data", "actions are disabled")
+    require(all(label in content for label in expected), "native-codex-demo-labels-missing")
+    meters = {row["name"] for row in rows if row["role"] in {"meter", "level bar", "progress bar"}}
+    require({"5-hour window", "7-day window", "1-day window"} <= meters, "native-codex-quota-durations-missing")
+    require(not any(row["name"] == "Automation" and row["role"] in {"push button", "button"} for row in rows), "duplicate-automation-navigation-present")
+    buttons = [row for row in rows if row["role"] in {"push button", "button"}]
+    selections = [row for row in buttons if row["name"] in {"Selected", "Select account"}]
+    require(len(selections) == 2 and {row["name"] for row in selections} == {"Selected", "Select account"}, "native-codex-demo-account-count-mismatch")
+    mutations = [row for row in buttons if row["name"] in {"Add account", "Check setup", "Selected", "Select account"}
+                 or row["name"].startswith("Refresh Codex quota for ")]
+    require(all(not row["enabled"] for row in mutations)
+            and any(row["name"] == "Add account" for row in mutations)
+            and any(row["name"] == "Check setup" for row in mutations)
+            and any(row["name"] == "Refresh Codex quota for Studio Codex" for row in mutations), "native-codex-demo-mutation-controls-not-disabled")
+    credits = accessible_section_content(rows, "Reset credits")
+    require("Read-only" in credits and bool(re.search(r"(?<![0-9.])3(?![0-9.])", credits)), "native-codex-reset-count-not-read-only")
+    provider_tab(rows, "codex", selected=True)
+    provider_tab(rows, "claude", selected=False)
+    return {"fictionalAccountCount": 2, "selectedAccount": "Studio Codex", "quotaWindowMinutes": [300, 10080, 1440],
+            "compatibleCodexVersion": "0.160.0", "resetCreditsReadOnly": 3, "mutationControlsDisabled": len(mutations)}
+
 def worker(directory: Path) -> int:
     report = {"formatVersion": 1, "status": "failed", "scope": "Installed Ubuntu 24.04 x86_64 demo accessibility and native window; no provider/live account qualification", "checks": {}}
     application = None
     application_log = None
     rows, window = [], None
+    active_provider = "claude"
     try:
         require((directory / "fixture.marker").read_text() == MARKER, "isolated-fixture-marker-missing")
         for key in ("HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR"):
@@ -259,6 +345,45 @@ def worker(directory: Path) -> int:
         report["checks"].update({"visibleNativeWindow": True, "englishAccountsAndSettings": True,
                                  "nativeDemoSnapshotRendered": True, "nonblankNativeScreenshot": True, "expectedDarkDemoFrameCaptured": True, "duplicateAutomationNavigationAbsent": True,
                                  "automationPanelPresent": True, "demoMutationButtonsDisabled": True})
+        # Switch providers through the real keyboard path, inspect Codex's
+        # native in-memory fixture, then return to retain Claude/Settings checks.
+        claude_tab = provider_tab(rows, "claude", selected=True)
+        provider_tab(rows, "codex", selected=False)
+        arrow_provider(claude_tab, "right", pyatspi)
+        active_provider = "codex"
+        rows = wait_for_provider(pyatspi, GLib, application, "codex")
+        report["codexDemoVerification"] = verify_codex_demo_rows(rows)
+        # Allow the provider replacement to reach a compositor frame; require
+        # its dark PNG to differ from the already accepted Claude PNG as well.
+        time.sleep(0.5)
+        report["codexScreenshotVerification"] = capture_painted_window(window["id"], CODEX_SCREENSHOT,
+                                                                      previous_frame_sha256=report["screenshotSha256"])
+        report["codexScreenshotSha256"] = sha256(CODEX_SCREENSHOT.read_bytes())
+        report["checks"].update({"codexManagedAccountsRendered": True, "codexNativeQuotaWindowsRendered": True,
+                                 "codexCloseAndReopenGuidance": True, "codexResetCreditsReadOnly": True,
+                                 "codexMutationButtonsDisabled": True, "codexDarkScreenshotCaptured": True})
+        details = [row for row in rows if row["name"] == "Account details and actions for Personal Codex" and row["role"] in {"push button", "button"}]
+        require(len(details) == 1 and details[0]["enabled"] and details[0]["accessible"].queryAction().doAction(0), "codex-read-only-details-unavailable")
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            rows = observe_accessibility_desktop(pyatspi, GLib)
+            deletes = [row for row in rows if row["role"] in {"push button", "button"} and row["name"] == "Delete Personal Codex"]
+            closes = [row for row in rows if row["role"] in {"push button", "button"} and row["name"] == "Close"]
+            if deletes and closes:
+                require(len(deletes) == 1 and not deletes[0]["enabled"], "native-codex-demo-delete-not-disabled")
+                require(len(closes) == 1 and closes[0]["enabled"] and closes[0]["accessible"].queryAction().doAction(0), "codex-read-only-details-close-failed")
+                report["checks"]["codexDetailsDeleteDisabled"] = True
+                break
+            time.sleep(0.25)
+        else:
+            raise QualificationError("codex-read-only-details-timeout")
+        rows = wait_for_provider(pyatspi, GLib, application, "codex")
+        arrow_provider(provider_tab(rows, "codex", selected=True), "left", pyatspi)
+        active_provider = "claude"
+        rows = wait_for_provider(pyatspi, GLib, application, "claude")
+        report["checks"]["providerTabsArrowKeyboardRoundTrip"] = True
+        settings = [row for row in rows if row["name"] == "Open settings" and row["role"] in {"push button", "button"}]
+        require(len(settings) == 1 and settings[0]["enabled"], "settings-navigation-unavailable")
         require(settings[0]["accessible"].queryAction().doAction(0), "settings-navigation-action-failed")
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
@@ -272,7 +397,7 @@ def worker(directory: Path) -> int:
         else:
             raise QualificationError("native-settings-dialog-timeout")
         # The in-memory demo must not create CLI credential or encrypted-vault files.
-        forbidden = {".claude", ".claude.json", ".credentials.json", ".vault.lock"}
+        forbidden = {".claude", ".claude.json", ".credentials.json", ".codex", "auth.json", ".vault.lock"}
         require(not any(path.name in forbidden or path.suffix == ".vault" or path.name.startswith("master-key.") for path in directory.rglob("*")), "demo-created-credential-or-vault-file")
         report["checks"]["isolatedHomeNoCredentialWrites"] = True
         report["status"] = "passed"
@@ -296,9 +421,10 @@ def worker(directory: Path) -> int:
             report["windowObserved"] = window is not None
             try:
                 target = window["id"] if window else "root"
-                output(["import", "-window", target, str(SCREENSHOT)], timeout=15)
-                if SCREENSHOT.is_file():
-                    report["screenshotSha256"] = sha256(SCREENSHOT.read_bytes())
+                diagnostic_screenshot = CODEX_SCREENSHOT if active_provider == "codex" else SCREENSHOT
+                output(["import", "-window", target, str(diagnostic_screenshot)], timeout=15)
+                if diagnostic_screenshot.is_file():
+                    report["codexScreenshotSha256" if active_provider == "codex" else "screenshotSha256"] = sha256(diagnostic_screenshot.read_bytes())
                     report["screenshotScope"] = "isolated-native-window" if window else "isolated-xvfb-display"
             except Exception as error:
                 report["screenshotFailureType"] = type(error).__name__
@@ -336,6 +462,7 @@ def main() -> int:
         ARTIFACTS.mkdir(exist_ok=True)
         REPORT.unlink(missing_ok=True)
         SCREENSHOT.unlink(missing_ok=True)
+        CODEX_SCREENSHOT.unlink(missing_ok=True)
         manifest = json.loads((ARTIFACTS / "package-manifest.json").read_text(encoding="utf8"))
         package = verify_package_manifest(manifest, ROOT)
         require(manifest.get("sourceCommit") == output(["git", "rev-parse", "HEAD"]).decode().strip(), "preview-source-commit-mismatch")
@@ -353,7 +480,7 @@ def main() -> int:
                        "/usr/bin/python3", str(Path(__file__).resolve()), "--worker", "--fixture-dir", str(directory)]
             process = subprocess.Popen(command, cwd=ROOT, env=environment, start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             try:
-                code = process.wait(timeout=120)
+                code = process.wait(timeout=180)
             except subprocess.TimeoutExpired:
                 os.killpg(process.pid, signal.SIGTERM)
                 try:

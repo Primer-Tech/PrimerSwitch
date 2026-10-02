@@ -186,4 +186,133 @@ export const ro: Record<keyof typeof en, string> = {
   weeklyEffective: 'Săptămânal · efectiv',
   weeklyEffectiveHelp:
     'Valoarea mai mare dintre utilizarea totală și cea a modelului ales.',
+  providers: 'Furnizori de conturi',
+  globalPreferences: 'Aspect și limbă',
+  settingsProviderScope:
+    'Automatizarea se aplică pentru Claude. Aspectul și limba se aplică ambilor furnizori.',
+  claudeAutomation: 'Automatizare Claude',
+  codexDescription:
+    'Gestionează conturile salvate pentru clienții Codex deschiși ulterior.',
+  codexActionFailed:
+    'Acțiunea Codex nu a reușit. Conturile salvate sunt păstrate.',
+  codexPrimaryWindow: 'Fereastra principală',
+  codexSecondaryWindow: 'Fereastra secundară',
+  codexWindowDuration: 'Fereastră de {duration}',
+  codexWindowDays: 'Fereastră de {count} zile',
+  codexWindowHours: 'Fereastră de {count} ore',
+  codexWindowMinutes: 'Fereastră de {count} minute',
+  codexQuotaGroup: 'Limite de utilizare',
+  codexUsageAllowed: 'Utilizarea inclusă este disponibilă',
+  codexUsageBlocked: 'Utilizarea inclusă este momentan blocată',
+  codexUsageUnknown: 'Permisiunea de utilizare inclusă este necunoscută',
+  codexNoWindows: 'Nu au fost furnizate ferestre de utilizare.',
+  codexSpendBlocked: 'Limita de cheltuieli a spațiului de lucru a fost atinsă.',
+  codexLimitReached: 'O limită de utilizare a furnizorului a fost atinsă.',
+  codexCredits: 'Credite',
+  codexUnlimited: 'Nelimitat',
+  codexCreditsAvailable: 'Disponibile',
+  codexNoCredits: 'Nu sunt disponibile credite',
+  codexApiQuota:
+    'Conturile cu cheie API nu au citiri ale limitelor abonamentului ChatGPT.',
+  codexNoQuota: 'Nu este încă disponibilă o citire verificată a utilizării.',
+  codexWorking: 'Actualizare conturi Codex…',
+  codexSetup: 'Configurare Codex',
+  codexCheckSetup: 'Verifică configurarea',
+  codexSelectedAccount: 'Selectat pentru clienți noi',
+  codexRefreshLabel: 'Actualizează utilizarea Codex pentru {name}',
+  codexSelected: 'Selectat',
+  codexChatGPT: 'ChatGPT',
+  codexApiKey: 'Cheie API',
+  codexUnsupportedAuth: 'Autentificare neacceptată',
+  codexNoSelected: 'Niciun cont Codex selectat',
+  codexImportOrAdd:
+    'Autentifică-te cu ChatGPT sau importă contul Codex curent.',
+  codexAddAccount: 'Adaugă un cont Codex',
+  codexImportCurrent: 'Importă contul Codex curent',
+  codexSavedQuota: 'Ultima citire salvată',
+  codexNoQuotaShort: 'Nicio citire',
+  codexSelect: 'Selectează contul',
+  codexEmptyTitle: 'Conturile tale Codex, împreună',
+  codexManualTitle: 'Selectare manuală a contului',
+  codexManualDescription:
+    'Selectarea se aplică clienților Codex deschiși după schimbare.',
+  codexCloseClients:
+    'Închide aplicațiile Codex și terminalele care folosesc Codex înainte de selectarea contului. Redeschide-le după schimbare.',
+  codexManualOnly: 'Doar selectare manuală',
+  codexCompatibility: 'Compatibilitate',
+  codexVersion: 'Versiune Codex',
+  codexBrowserLogin: 'Autentificare în browser',
+  codexAvailable: 'Disponibilă',
+  codexUnavailable: 'Indisponibilă',
+  codexSupportScope:
+    'Sunt acceptate conturi ChatGPT gestionate cu Codex 0.160.0 și stocarea autentificării FILE. Alte versiuni, tipuri de autentificare și moduri de stocare rămân restricționate.',
+  codexResetCredits: 'Credite de resetare',
+  codexReadOnly: 'Doar citire',
+  codexNoCreditActions:
+    'PrimerSwitch nu consumă automat credite sau resetări Codex.',
+  codexLoginDescription:
+    'Finalizează autentificarea în browser. Fereastra se actualizează când autorizarea se încheie; nu trebuie lipit niciun cod.',
+  codexIsolatedLogin:
+    'Adăugarea unui cont păstrează autentificarea Codex curentă.',
+  codexVerifyingLogin: 'Verificare cont…',
+  codexWaitingLogin: 'Se așteaptă autentificarea în browser…',
+  codexSelectTitle: 'Selectezi un cont Codex?',
+  codexSelectDescription:
+    'Selectează {name} pentru clienții Codex deschiși ulterior.',
+  codexNativeGuard:
+    'PrimerSwitch verifică existența clienților activi și modificările autentificării curente înainte de aplicarea selecției.',
+  codexClosedAcknowledgement:
+    'Am închis clienții Codex care folosesc această autentificare.',
+  codexCheckAgain: 'Verifică din nou',
+  codexAuthKind: 'Tip de autentificare',
+  codexQuotaVerification: 'Verificarea actuală a utilizării',
+  codexQuotaUnverified:
+    'Contul asociat utilizării nu a fost verificat în această sesiune.',
+  codexIdentity: 'Identitate',
+  codexWorkspace: 'Spațiu de lucru',
+  codexVerified: 'Verificată',
+  codexActiveQuotaOnly:
+    'Poate fi actualizat doar contul ChatGPT gestionat și selectat. Alte citiri rămân salvate.',
+  codexDeleteDescription:
+    'Elimini {name} din PrimerSwitch? Autentificarea Codex curentă rămâne neschimbată.',
+  codexLoginComplete:
+    'Contul Codex a fost adăugat. Autentificarea curentă este păstrată.',
+  codexSwitchComplete:
+    'Cont selectat. Redeschide clienții Codex pentru a-l folosi.',
+  codexDeleteComplete: 'Contul Codex salvat a fost eliminat.',
+  codexReason_notInstalled:
+    'Instalează Codex local, apoi verifică din nou configurarea.',
+  codexReason_unsupportedVersion:
+    'Această versiune Codex nu a fost verificată pentru compatibilitate. Modificarea conturilor nu este disponibilă.',
+  codexReason_unsupportedStore:
+    'Acest mod de stocare a autentificării nu este încă acceptat. Configurarea curentă este păstrată.',
+  codexReason_unsupportedAuth:
+    'Acest tip de autentificare nu permite selectarea conturilor ChatGPT gestionate.',
+  codexReason_policyRestricted:
+    'Politica gestionată Codex nu permite această schimbare de cont.',
+  codexReason_externalCredentials:
+    'Această configurare folosește autentificare gestionată extern. Selectarea conturilor nu este disponibilă.',
+  codexReason_storeConflict:
+    'Au fost găsite autentificări salvate în conflict. Clarifică configurarea Codex curentă înainte de a continua.',
+  codexReason_vaultUnavailable:
+    'Stocarea securizată nu este disponibilă. Conturile salvate nu au fost modificate.',
+  codexReason_identityUnverified: 'Identitatea contului nu a fost verificată.',
+  codexReason_identityMismatch:
+    'Contul sau spațiul de lucru returnat nu corespunde. Datele salvate sunt păstrate.',
+  codexReason_clientsRunning:
+    'Închide clienții Codex care folosesc această autentificare, apoi verifică din nou.',
+  codexReason_processInventoryUnavailable:
+    'Clienții Codex activi nu au putut fi verificați. Selectarea contului este blocată.',
+  codexReason_externalChange:
+    'Autentificarea Codex curentă s-a schimbat. Verifică din nou înainte de a continua.',
+  codexReason_reconciliationRequired:
+    'O schimbare de cont trebuie reconciliată. Alte selecții sunt blocate pentru a păstra autentificarea curentă.',
+  codexReason_loginExpired:
+    'Autentificarea a expirat. Închide fereastra și încearcă din nou.',
+  codexReason_loginCanceled: 'Autentificarea a fost anulată.',
+  codexReason_providerUnavailable:
+    'Codex nu a furnizat un răspuns verificat. Încearcă mai târziu.',
+  codexReason_invalidPreparation:
+    'Verificarea selecției a expirat sau nu mai este validă. Verifică din nou.',
+  codexReason_busy: 'O altă acțiune asupra conturilor este în curs.',
 };

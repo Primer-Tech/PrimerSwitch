@@ -2,6 +2,8 @@
 import { mount } from 'svelte';
 import App from './App.svelte';
 import { createController } from './lib/controller';
+import { createCodexController } from './lib/codex-controller';
+import { codexSnapshot } from './test/codex-fixtures';
 import { snapshot, account } from './test/fixtures';
 import './styles.css';
 import './theme.css';
@@ -34,4 +36,14 @@ const controller = createController({
   },
   subscribe: async () => () => {},
 });
-mount(App, { target: document.getElementById('app')!, props: { controller } });
+const codexController = createCodexController({
+  call: async (command) => {
+    if (command === 'get_codex_snapshot') return codexSnapshot({ demo: true });
+    throw new Error('providerUnavailable');
+  },
+  subscribe: async () => () => {},
+});
+mount(App, {
+  target: document.getElementById('app')!,
+  props: { controller, codexController },
+});

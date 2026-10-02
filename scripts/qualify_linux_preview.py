@@ -229,19 +229,18 @@ def provider_tab(rows: list[dict], provider: str, *, selected: bool) -> dict:
 
 
 def arrow_provider(tab: dict, direction: str, pyatspi, *, window_id: str | None = None) -> None:
-    require(tab["accessible"].queryComponent().grabFocus(), "provider-tab-focus-failed")
     require(direction in {"left", "right"}, "invalid-provider-arrow")
+    if window_id and shutil.which("xdotool"):
+        # Bring the native window forward before AT-SPI assigns focus to the
+        # tab; doing this afterwards can reset WebKit's active DOM element.
+        output(["xdotool", "windowfocus", window_id], timeout=5)
+    require(tab["accessible"].queryComponent().grabFocus(), "provider-tab-focus-failed")
     # Let the focus transition reach the WebKit child before sending the key.
     # xdotool uses the XTest path and is reliable with the isolated Xvfb display;
     # AT-SPI remains the hermetic fallback when the helper is unavailable.
     time.sleep(0.15)
     key = "Left" if direction == "left" else "Right"
     if shutil.which("xdotool"):
-        if window_id:
-            # Modal teardown can leave X11 focus on the transient WebKit dialog
-            # even after AT-SPI has restored the tab's accessibility focus.
-            # Re-focus the real native window before sending the DOM key event.
-            output(["xdotool", "windowfocus", window_id], timeout=5)
         output(["xdotool", "key", "--clearmodifiers", key], timeout=5)
     else:
         # KEY_SYM interprets the value as an X11 keysym. This still exercises

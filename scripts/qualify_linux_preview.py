@@ -233,8 +233,18 @@ def arrow_provider(tab: dict, direction: str, pyatspi, *, window_id: str | None 
     if window_id and shutil.which("xdotool"):
         # Bring the native window forward before AT-SPI assigns focus to the
         # tab; doing this afterwards can reset WebKit's active DOM element.
-        output(["xdotool", "windowfocus", window_id], timeout=5)
+        output(["xdotool", "windowactivate", "--sync", window_id], timeout=5)
     require(tab["accessible"].queryComponent().grabFocus(), "provider-tab-focus-failed")
+    # Modal teardown restores focus in a microtask. Re-assert it briefly so
+    # that the Arrow event reaches the provider tab rather than the old trigger.
+    for _ in range(12):
+        try:
+            if tab["accessible"].getState().contains(pyatspi.STATE_FOCUSED):
+                break
+        except Exception:
+            pass
+        tab["accessible"].queryComponent().grabFocus()
+        time.sleep(0.05)
     # Let the focus transition reach the WebKit child before sending the key.
     # xdotool uses the XTest path and is reliable with the isolated Xvfb display;
     # AT-SPI remains the hermetic fallback when the helper is unavailable.
@@ -413,6 +423,9 @@ def worker(directory: Path) -> int:
             raise QualificationError("codex-read-only-details-timeout")
         rows = wait_for_dialog_close(pyatspi, GLib, application)
         require(not any(row["role"] == "dialog" and row["name"] == "Personal Codex" for row in rows), "codex-read-only-details-close-timeout")
+        # Let Modal.svelte's queued return-focus task finish before selecting
+        # the provider tab for the reverse keyboard traversal.
+        time.sleep(0.5)
         rows = wait_for_provider(pyatspi, GLib, application, "codex")
         arrow_provider(provider_tab(rows, "codex", selected=True), "left", pyatspi, window_id=window["id"])
         active_provider = "claude"

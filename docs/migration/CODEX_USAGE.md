@@ -1,6 +1,6 @@
 # Codex accounts in PrimerSwitch
 
-The Codex adapter, native commands and desktop workflow are implemented in source. Final integration/CI/package validation and the public **0.2.0 preview** are pending. This guide describes that source workflow; it is not a claim of authenticated or live compatibility. See the [implementation contract](CODEX_IMPLEMENTATION.md), [pinned research](CODEX_RESEARCH.md) and [evidence ledger](PROGRESS.md).
+The Codex adapter, native commands and desktop workflow are implemented in source. The 0.2.0 candidate passed the hosted integration, native CI and package qualification runs, but the public release is not published and authenticated/live compatibility is not claimed. This guide describes the qualified source workflow and its restrictions. See the [implementation contract](CODEX_IMPLEMENTATION.md), [pinned research](CODEX_RESEARCH.md) and [evidence ledger](PROGRESS.md).
 
 ## Set up a separate Codex installation
 
@@ -47,6 +47,6 @@ Keyring, auto and ephemeral auth stores, unsupported auth types, custom provider
 
 Native process inventory is conservative and can block a change when visibility is incomplete. It cannot identify every arbitrarily renamed/copied/wrapped client, or atomically prevent a new client/concurrent writer from starting between checks. Close all relevant clients yourself; post-write external changes require reconciliation rather than a guarantee of rollback.
 
-Enabling Codex retains the existing application data directory, vault master key, Claude account records and persisted settings. Codex accounts use a separate encrypted **codex-state** record; they are not inserted into Claude policy collections or used to rewrite its saved state. Keep the same OS user and existing vault/key storage when updating; see [upgrade preservation](UPGRADES.md). Final 0.2.0 installer and native CI evidence will be recorded separately.
+Enabling Codex retains the existing application data directory, vault master key, Claude account records and persisted settings. Codex accounts use a separate encrypted **codex-state** record; they are not inserted into Claude policy collections or used to rewrite its saved state. Keep the same OS user and existing vault/key storage when updating; see [upgrade preservation](UPGRADES.md). The 0.2.0 candidate's hosted installer, native CI and installed Ubuntu demo evidence are recorded in [PROGRESS.md](PROGRESS.md).
 
 Importing records from another “Codex switcher” requires its **exact product/repository and version**. Current-account import is not a migration importer for an unnamed tool. Background polling, additional versions/stores, device login, API-key selection/billing and provider-specific automation remain future gates in [the Codex plan](FUTURE_CODEX.md).

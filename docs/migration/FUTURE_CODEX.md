@@ -1,10 +1,10 @@
 # PrimerSwitch future Codex / OpenAI provider
 
-Status: the first Codex delivery is now implemented in Rust/native/frontend source after the branded 0.1.1 release. Final integration, native CI/package qualification and the public **0.2.0 preview** remain pending; authenticated/live support has not been demonstrated. See the [usage guide](CODEX_USAGE.md), [implementation contract](CODEX_IMPLEMENTATION.md), [pinned source findings](CODEX_RESEARCH.md) and [evidence ledger](PROGRESS.md). The wider design and work-package gates below remain forward-looking outside the narrow first-delivery scope.
+Status: the first Codex delivery is implemented in Rust/native/frontend source after the branded 0.1.1 release. The 0.2.0 candidate passed hosted integration, native CI and package qualification; the public preview is not published and authenticated/live support has not been demonstrated. See the [usage guide](CODEX_USAGE.md), [implementation contract](CODEX_IMPLEMENTATION.md), [pinned source findings](CODEX_RESEARCH.md) and [evidence ledger](PROGRESS.md). The wider design and work-package gates below remain forward-looking outside the narrow first-delivery scope.
 
 The user currently uses a “codex switcher.” Its exact name/repository has not been supplied. Its name and version are prerequisites for any future compatibility importer. Do not assume a particular competitor, claim superiority, or write a format importer without inspecting the actual tool and its version. The improvements below are proposed acceptance criteria for this application.
 
-## First delivery: implemented source, qualification pending
+## First delivery: implemented source, candidate qualification complete
 
 - Separate Codex provider/controller and redacted snapshot, using pinned Codex **0.160.0**, managed ChatGPT, a qualified **FILE** store and the default OpenAI provider. Existing Claude records, automation and settings remain compatible; language/appearance are global.
 - Native-managed browser login in an isolated owned context, encrypted saved accounts and current-account import. Imported routing claims require an explicit selected-account quota/backend identity read before they become verified ownership evidence.
@@ -12,7 +12,7 @@ The user currently uses a “codex switcher.” Its exact name/repository has no
 - Explicit selected-account dynamic quotas retain native buckets/windows and supported `ordinaryUsageAllowed` plus account proof. Saved observations are cached; reset credits are read-only. API-key imports are represented, with no API-key selection, billing or ChatGPT quota claim.
 - Unsupported stores/versions, profiles, policy, custom providers and credential overrides are denied. Incomplete process visibility blocks writes; arbitrarily renamed/wrapped clients and new concurrent writers remain limitations. No Codex automatic selection, credit/reset consumption or Claude priming policy is enabled.
 
-This is a source-delivery status, not a completed compatibility matrix or published release. Follow [CODEX_USAGE.md](CODEX_USAGE.md) for the practical workflow and preservation limits. Migration from the owner's existing switcher still needs its exact product and version. Additional stores/versions, device/API-key workflows, background reads and provider-specific policy require their own gates.
+This is a package-qualification result, not authenticated provider parity or a published release. Follow [CODEX_USAGE.md](CODEX_USAGE.md) for the practical workflow and preservation limits. Migration from the owner's existing switcher still needs its exact product and version. Additional stores/versions, device/API-key workflows, background reads and provider-specific policy require their own gates.
 
 ## 1. Intended experience
 

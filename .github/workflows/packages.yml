@@ -38,9 +38,14 @@ jobs:
         with:
           python-version: '3.14'
       - name: Packaging gate fixtures
-        run: python -B scripts/test_package_preview.py
+        run: |
+          python -B scripts/test_package_preview.py
+          python -B scripts/test_qualify_windows_update.py
       - name: Preview installer with dependency notices
         run: python -B scripts/package_preview.py --bundle ${{ matrix.bundle }}
+      - name: Windows update and reinstall preservation
+        if: runner.os == 'Windows' && matrix.bundle == 'nsis'
+        run: python -B scripts/qualify_windows_update.py
       - name: Installed Linux demo qualification
         if: runner.os == 'Linux' && matrix.bundle == 'deb'
         run: python -B scripts/qualify_linux_preview.py --bundle deb
@@ -54,6 +59,7 @@ jobs:
             .artifacts/THIRD_PARTY_METADATA.json
             .artifacts/frontend-bundle-inventory.json
             .artifacts/linux-installed-demo-report.json
+            .artifacts/windows-update-preservation-report.json
             .artifacts/linux-installed-demo.png
             .artifacts/package-failure.json
             .artifacts/package-manifest.json

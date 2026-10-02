@@ -54,7 +54,9 @@ jobs:
         with:
           python-version: '3.14'
       - name: Packaging gate fixtures
-        run: python -B scripts/test_package_preview.py
+        run: |
+          python -B scripts/test_package_preview.py
+          python -B scripts/test_qualify_windows_update.py
       - name: Repository boundary and documentation links
         run: python scripts/check_repository.py
       - uses: actions/upload-artifact@v4

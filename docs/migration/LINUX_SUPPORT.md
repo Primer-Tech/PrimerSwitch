@@ -13,11 +13,11 @@ The .rpm is generated from the same Ubuntu baseline, with SONAME and versioned-s
 Install a released .deb with:
 
 ```sh
-sudo apt install ./PrimerSwitch_0.1.0_amd64.deb
+sudo apt install ./PrimerSwitch_0.1.1_amd64.deb
 primerswitch
 ```
 
-Use the actual downloaded filename if it differs. The application menu opens PrimerSwitch too. English and dark appearance are the default; Romanian and light/system appearance are available in Settings. Automation preferences live in Settings. Closing the app stops automation.
+Use the actual downloaded filename if it differs. The application menu opens PrimerSwitch too. English and dark appearance are the default; Romanian and light/system appearance are available in Settings. Automation preferences live in Settings. Closing the app stops automation. Later package upgrades retain existing settings/accounts; see [updating without a reset](UPGRADES.md).
 
 To inspect the interface without reading credentials or calling providers:
 
@@ -29,7 +29,7 @@ Normal account switching uses the default Claude CLI files. Custom authenticatio
 
 ## Secure storage
 
-Saved accounts, journals and backups remain AEAD-encrypted, with private directories/files. The vault master key is an application-owned Secret Service item sent through an encrypted DH session. It must belong to the persistent default collection; an ephemeral session collection is rejected.
+Saved accounts, journals and backups remain AEAD-encrypted, with private directories/files. The vault master key is an application-owned Secret Service item sent through an encrypted DH session. It must belong to the persistent default collection; an ephemeral session collection is rejected. GNOME Keyring normalizes binary-secret MIME metadata to text/plain and adds its Generic schema after restarting; only these documented metadata forms are accepted, while the original 32-byte key and exact application/vault ownership are still required.
 
 Missing/locked services, ambiguous entries, malformed keys and changed/lost keys preserve existing ciphertext and return a safe vault-unavailable/integrity error. There is no plaintext fallback or silent replacement. A durable creation marker protects uncertain key creation. D-Bus methods and the whole key operation are bounded; a rare service-requested creation prompt can appear after unlocked preflight.
 

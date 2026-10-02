@@ -10,6 +10,7 @@ use zeroize::Zeroizing;
 const SERVICE: &str = "com.primertech.primerswitch.vault.v1";
 const MARKER: &str = "master-key.secret-service";
 const CONTENT_TYPE: &str = "application/octet-stream";
+const GENERIC_SCHEMA: &str = "org.freedesktop.Secret.Generic";
 
 fn diagnostic_stage(stage: &'static str) {
     #[cfg(test)]
@@ -74,8 +75,18 @@ fn attributes(namespace: &str) -> HashMap<&str, &str> {
 }
 
 fn check_attributes(actual: &HashMap<String, String>, namespace: &str) -> Result<()> {
-    if actual.len() != 2 {
+    // GNOME46.1 reloads a schema-less item from its type0 compatibility record
+    // as Generic, then exposes that schema in Attributes. Only this documented
+    // extra metadata is accepted; ownership still requires both exact fields.
+    // Sources: GNOME46.1 pkcs11/secret-store/{gkm-secret-binary.c,
+    // gkm-secret-compat.c,gkm-secret-fields.c} on github.com/GNOME/gnome-keyring.
+    let schema = actual.get("xdg:schema");
+    if actual.len() != 2 + usize::from(schema.is_some()) {
         diagnostic_stage("key_attribute_count");
+        return Err(PlatformError::KeyUnavailable);
+    }
+    if schema.is_some_and(|value| value != GENERIC_SCHEMA) {
+        diagnostic_stage("key_schema_value");
         return Err(PlatformError::KeyUnavailable);
     }
     if !attributes(namespace)
@@ -413,12 +424,23 @@ mod tests {
                 Err(PlatformError::KeyUnavailable)
             ));
         }
-        let mut extra = original.clone();
-        extra.insert("xdg:schema".into(), "unexpected".into());
+        let mut restored = original.clone();
+        restored.insert("xdg:schema".into(), GENERIC_SCHEMA.into());
+        check_attributes(&restored, namespace).unwrap();
+        let mut wrong_schema = restored.clone();
+        wrong_schema.insert("xdg:schema".into(), "unexpected".into());
         assert!(matches!(
-            check_attributes(&extra, namespace),
+            check_attributes(&wrong_schema, namespace),
             Err(PlatformError::KeyUnavailable)
         ));
+        for baseline in [&original, &restored] {
+            let mut extra = baseline.clone();
+            extra.insert("unexpected-attribute".into(), "unexpected".into());
+            assert!(matches!(
+                check_attributes(&extra, namespace),
+                Err(PlatformError::KeyUnavailable)
+            ));
+        }
         for key in ["application", "vault"] {
             let mut wrong = original.clone();
             wrong.insert(key.into(), "different-owner".into());
@@ -781,6 +803,36 @@ mod native_tests {
         item.set_secret(key.as_slice(), "text/plain").unwrap();
         assert!(Vault::open(directory.clone()).is_ok());
         item.set_secret(key.as_slice(), CONTENT_TYPE).unwrap();
+        // Only GNOME's known reload schema is compatible; no other item metadata
+        // may turn a matching search result into a valid application-owned key.
+        item.set_attributes(HashMap::from([
+            ("application", SERVICE),
+            ("vault", namespace.as_str()),
+            ("xdg:schema", "unexpected-fixture-schema"),
+        ]))
+        .unwrap();
+        assert!(matches!(
+            Vault::open(directory.clone()),
+            Err(PlatformError::KeyUnavailable)
+        ));
+        item.set_attributes(HashMap::from([
+            ("application", SERVICE),
+            ("vault", namespace.as_str()),
+            ("xdg:schema", GENERIC_SCHEMA),
+            ("unexpected-attribute", "fixture-only"),
+        ]))
+        .unwrap();
+        assert!(matches!(
+            Vault::open(directory.clone()),
+            Err(PlatformError::KeyUnavailable)
+        ));
+        item.set_attributes(HashMap::from([
+            ("application", SERVICE),
+            ("vault", namespace.as_str()),
+            ("xdg:schema", GENERIC_SCHEMA),
+        ]))
+        .unwrap();
+        assert!(Vault::open(directory.clone()).is_ok());
         item.set_secret(&[23; 32], CONTENT_TYPE).unwrap();
         assert!(matches!(
             Vault::open(directory.clone()),
@@ -956,6 +1008,14 @@ mod native_tests {
                 );
                 let namespace = namespace(&directory).unwrap();
                 let service = SecretService::connect(EncryptionType::Dh).unwrap();
+                let found = service.search_items(attributes(&namespace)).unwrap();
+                assert_eq!(found.unlocked.len(), 1);
+                let reloaded_attributes = found.unlocked[0].get_attributes().unwrap();
+                assert_eq!(
+                    reloaded_attributes.get("xdg:schema").map(String::as_str),
+                    Some(GENERIC_SCHEMA)
+                );
+                check_attributes(&reloaded_attributes, &namespace).unwrap();
                 let cleanup = Cleanup {
                     service: &service,
                     namespace,

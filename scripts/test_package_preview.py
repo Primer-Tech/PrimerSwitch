@@ -22,7 +22,7 @@ def digest(body: bytes) -> str:
 class PackagingFixtures(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="primerswitch-package-fixture-")
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.artifacts = self.root / ".artifacts"
         self.desktop = self.root / "apps/desktop"
         self.artifacts.mkdir()
@@ -61,6 +61,27 @@ class PackagingFixtures(unittest.TestCase):
 
     def test_linux_arm64_is_not_accidentally_claimed_qualified(self):
         self.rejects("linux-preview-requires-x86_64-gnu-host", lambda: packaging.validate_host("deb", "aarch64-unknown-linux-gnu", "Linux"))
+
+    def test_attribution_containment_uses_the_same_canonical_root_as_its_inputs(self):
+        # A non-canonical root models runner temp aliases (/var -> /private/var,
+        # Windows junctions) without depending on privileged symlink creation.
+        root_alias = self.root / "apps" / ".."
+        with patch.object(packaging, "ROOT", root_alias):
+            packaging.verify_attribution(TARGET)
+            self.metadata["inputSha256"] = {"../outside": "a" * 64}
+            self.write_evidence()
+            self.rejects("unsafe-attribution-input", lambda: packaging.verify_attribution(TARGET))
+
+    def test_contained_input_symlinks_are_still_rejected_after_root_normalization(self):
+        link = self.root / "linked-Cargo.lock"
+        try:
+            link.symlink_to(self.root / "Cargo.lock")
+        except (OSError, NotImplementedError):
+            self.skipTest("This host does not permit fixture symlink creation")
+        self.metadata["inputSha256"] = {link.name: digest((self.root / "Cargo.lock").read_bytes())}
+        self.write_evidence()
+        with patch.object(packaging, "ROOT", self.root / "apps" / ".."):
+            self.rejects("unsafe-attribution-input", lambda: packaging.verify_attribution(TARGET))
 
     def test_cross_target_metadata_cannot_be_reused(self):
         self.metadata["target"] = "x86_64-pc-windows-msvc"

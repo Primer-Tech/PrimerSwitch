@@ -67,7 +67,7 @@ def verify_attribution(target: str) -> dict:
     for name, expected in inputs.items():
         original = ROOT / name
         path = original.resolve()
-        if not path.is_relative_to(ROOT) or original.is_symlink() or not re.fullmatch(r"[a-f0-9]{64}", expected):
+        if not path.is_relative_to(ROOT.resolve()) or original.is_symlink() or not re.fullmatch(r"[a-f0-9]{64}", expected):
             raise PackagingError("unsafe-attribution-input")
         if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
             raise PackagingError("dependency-input-changed-after-attribution")

@@ -1,6 +1,12 @@
 name: Build preview packages
 on:
   workflow_dispatch:
+    inputs:
+      platform:
+        description: Native preview target
+        type: choice
+        default: both
+        options: [both, windows, macos]
 permissions:
   contents: read
 jobs:
@@ -8,11 +14,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: windows-latest
-            bundle: nsis
-          - os: macos-latest
-            bundle: dmg
+        include: ${{ fromJSON(inputs.platform == 'windows' && '[{"os":"windows-latest","bundle":"nsis"}]' || inputs.platform == 'macos' && '[{"os":"macos-latest","bundle":"dmg"}]' || '[{"os":"windows-latest","bundle":"nsis"},{"os":"macos-latest","bundle":"dmg"}]') }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -31,6 +33,18 @@ jobs:
           python-version: '3.14'
       - name: Preview installer with dependency notices
         run: python -B scripts/package_preview.py --bundle ${{ matrix.bundle }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: PrimerSwitch-${{ runner.os }}-build-evidence
+          path: |
+            .artifacts/THIRD_PARTY_NOTICES.txt
+            .artifacts/THIRD_PARTY_REPORT.json
+            .artifacts/THIRD_PARTY_METADATA.json
+            .artifacts/frontend-bundle-inventory.json
+          if-no-files-found: warn
+          include-hidden-files: true
+          retention-days: 14
       - uses: actions/upload-artifact@v4
         with:
           name: PrimerSwitch-${{ runner.os }}-unsigned-preview

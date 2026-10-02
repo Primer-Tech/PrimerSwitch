@@ -4,7 +4,7 @@ Updated 2026-10-02. The owner authorized implementation, a public repository and
 
 ## Current state
 
-The implemented Rust/Tauri/Svelte preview is published in [Primer-Tech/PrimerSwitch](https://github.com/Primer-Tech/PrimerSwitch). Core application code at d5107ff60bdec3bca9d95800395c784f454e7f53 passed the complete [native CI matrix](https://github.com/Primer-Tech/PrimerSwitch/actions/runs/37008553363) on Windows, macOS arm64 and Ubuntu. Windows has an optimized executable, an unsigned x64 NSIS installer, and a passing bundled demo IPC smoke. Packaging now includes dependency notices and provenance; its separate workflow builds unsigned Windows/macOS artifacts.
+The implemented Rust/Tauri/Svelte preview is published in [Primer-Tech/PrimerSwitch](https://github.com/Primer-Tech/PrimerSwitch). Application and preview-packaging source at 787089267118cbbb3d18c30411c0f5e132eb8f46 passed the complete [native CI matrix](https://github.com/Primer-Tech/PrimerSwitch/actions/runs/37013036753) on Windows, macOS arm64 and Ubuntu. Windows has an optimized executable, an unsigned x64 NSIS installer, and a passing bundled demo IPC smoke. Packaging now includes dependency notices and provenance; its separate workflow builds unsigned Windows/macOS artifacts.
 
 The original Swift application and private Git history remain in the separate ClaudeSwitch checkout, including its legacy/macos archive. Its 19 canonical source blobs were verified against upstream commit 4b1b441084fccf5f717fcf41d1b5e668f18559a0. The public tree contains new source and sanitized fixtures and does not depend on that archive.
 
@@ -37,7 +37,7 @@ Source starts with a fresh reviewed public history: 4e6a0795108b584ac6ca22b7e640
 
 The preview packaging command generates a production Rollup module inventory, binds source/lock/output hashes, inventories conservative non-dev native build/runtime dependencies, and includes complete discovered license texts plus original source references. Compiler-only missing declarations are reported separately when they contribute no rendered code. The rendered Vite preload helper is attributed to Vite even though it is generated from a development dependency. Known unmodified MPL dependencies have verified original crate archives, license texts and source links. See [attribution and reproducible packaging](../legal/README.md).
 
-Package hashes and inventory counts are recorded in the generated .artifacts/package-manifest.json and SHA256SUMS.txt. These generated files, native smoke harnesses and binaries are local build evidence, excluded from source commits. The packaging workflow uploads them with unsigned artifacts. Stable signing/notarization remains a separate gate.
+Package hashes and inventory counts are recorded in the generated .artifacts/package-manifest.json and SHA256SUMS.txt. These generated files, native smoke harnesses and binaries are local build evidence, excluded from source commits. The packaging workflow uploads them with unsigned artifacts and retains generated evidence even when an installer gate fails. Its native target can be selected independently. The first macOS package gate identified ten missing upstream crate license texts; pinned applicability notices and their explicitly referenced full terms were added without inventing copyright holders. A notice alone does not clear the full-text gate. Stable signing/notarization remains a separate gate.
 
 ## Deliberate changes
 

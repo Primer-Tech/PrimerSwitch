@@ -322,13 +322,18 @@ def import_overrides(records: list[dict], issues: list[dict], manifest: Path | N
             raise GenerationError('attribution-override-not-utf8') from None
         if len(body.strip()) < 100 or PRIVATE_PATH.search(body) or '\x00' in body:
             raise GenerationError('attribution-override-text-invalid')
-        evidence = {key: entry[key] for key in ('url', 'repository', 'pinnedCommit', 'sha256', 'spdx', 'referenceUrl', 'licenseReference') if key in entry}
+        attribution_kind = entry.get('attributionKind', 'license-text')
+        if attribution_kind not in {'license-text', 'upstream-notice', 'referenced-standard-license'}:
+            raise GenerationError('attribution-override-kind-invalid')
+        evidence = {key: entry[key] for key in ('url', 'repository', 'pinnedCommit', 'sha256', 'spdx', 'referenceUrl', 'licenseReference', 'sourceSha256', 'extraction', 'textExtraction', 'copyrightAttribution') if key in entry}
+        evidence['attributionKind'] = attribution_kind
         evidence['file'] = label
         if PRIVATE_PATH.search(encoded_json(evidence)):
             raise GenerationError('attribution-provenance-local-path')
         r['texts'].append({'file': 'upstream/' + Path(label).name, 'sha256': hashlib.sha256(body.encode('utf8')).hexdigest(), 'sourceSha256': entry['sha256'], 'provenance': evidence, 'text': body})
         imported.append({'ecosystem': key[0], 'name': key[1], 'version': key[2], **evidence})
-        issues[:] = [i for i in issues if not (i['ecosystem'] == key[0] and i['name'] == key[1] and i['version'] == key[2] and i['check'] == 'missing-full-license-text')]
+        if attribution_kind != 'upstream-notice':
+            issues[:] = [i for i in issues if not (i['ecosystem'] == key[0] and i['name'] == key[1] and i['version'] == key[2] and i['check'] == 'missing-full-license-text')]
     for r in records:
         r['texts'].sort(key=lambda t: (t['file'], t['sha256']))
     return sorted(imported, key=encoded_json)
@@ -396,7 +401,14 @@ def render(records: list[dict], target: str, complete: bool, bundled: bool) -> s
         for t in r['texts']:
             chunks.append(f"\n--- {t['file']} ---\n")
             if 'provenance' in t:
-                chunks.append(f"Upstream source: {t['provenance']['url']}\nPinned revision: {t['provenance']['pinnedCommit']}\nSource SHA256: {t['sourceSha256']}\n\n")
+                chunks.append(f"Upstream source: {t['provenance']['url']}\nPinned revision: {t['provenance']['pinnedCommit']}\nSource SHA256: {t['sourceSha256']}\n")
+                if t['provenance'].get('attributionKind') == 'referenced-standard-license':
+                    chunks.append('Linked standard license terms; generic placeholders and publisher attribution retained unchanged.\n')
+                if t['provenance'].get('referenceUrl'):
+                    chunks.append(f"Upstream reference: {t['provenance']['referenceUrl']}\n")
+                if t['provenance'].get('copyrightAttribution'):
+                    chunks.append(t['provenance']['copyrightAttribution'] + '\n')
+                chunks.append('\n')
             chunks.append(t['text'])
             if not t['text'].endswith('\n'):
                 chunks.append('\n')
@@ -444,13 +456,13 @@ def main() -> int:
                 input_names.add(manifest.relative_to(ROOT).as_posix())
         inputs = {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in sorted(input_names)}
         metadata = {'formatVersion': 1, 'target': args.target, 'nativeFeatures': ['custom-protocol'], 'inputSha256': inputs, 'upstreamOverrides': imported, 'frontendBundleInventory': frontend_scope, 'dependencies': [{k: v for k, v in r.items() if k != 'texts'} | {'texts': [{k: v for k, v in t.items() if k != 'text'} for t in r['texts']]} for r in records]}
-        report = {'formatVersion': 1, 'target': args.target, 'dependencyCount': len(records), 'licenseTextCount': sum(len(r['texts']) for r in records), 'cargoDependencyCount': sum(r['ecosystem'] == 'cargo' for r in records), 'npmDependencyCount': sum(r['ecosystem'] == 'npm' for r in records), 'reviewRequired': bool(issues), 'findings': issues, 'excludedCompilerFindings': excluded_findings, 'missingLicenseTextCount': sum(i['check'] == 'missing-full-license-text' for i in issues), 'excludedScope': ['OS-provided runtimes', 'installer/bootstrapper redistribution terms', 'binary reachability determination', 'legal conclusions']}
+        report = {'formatVersion': 1, 'target': args.target, 'dependencyCount': len(records), 'licenseTextCount': sum(len(r['texts']) for r in records), 'cargoDependencyCount': sum(r['ecosystem'] == 'cargo' for r in records), 'npmDependencyCount': sum(r['ecosystem'] == 'npm' for r in records), 'reviewRequired': bool(issues), 'findings': issues, 'excludedCompilerFindings': excluded_findings, 'missingLicenseTextCount': sum(i['check'] == 'missing-full-license-text' for i in issues), 'missingLicenseTexts': [{k: i[k] for k in ('ecosystem', 'name', 'version')} for i in issues if i['check'] == 'missing-full-license-text'], 'excludedScope': ['OS-provided runtimes', 'installer/bootstrapper redistribution terms', 'binary reachability determination', 'legal conclusions']}
         if any(PRIVATE_PATH.search(content) for content in (text, encoded_json(metadata), encoded_json(report))):
             raise GenerationError('unsafe-output-local-path')
         output.mkdir(parents=True, exist_ok=True)
         for filename, content in [('THIRD_PARTY_NOTICES.txt', text), ('THIRD_PARTY_METADATA.json', encoded_json(metadata)), ('THIRD_PARTY_REPORT.json', encoded_json(report))]:
             (output / filename).write_text(content, encoding='utf8', newline='\n')
-        print(encoded_json({k: report[k] for k in ('target', 'dependencyCount', 'licenseTextCount', 'cargoDependencyCount', 'npmDependencyCount', 'missingLicenseTextCount', 'reviewRequired')}), end='')
+        print(encoded_json({k: report[k] for k in ('target', 'dependencyCount', 'licenseTextCount', 'cargoDependencyCount', 'npmDependencyCount', 'missingLicenseTextCount', 'missingLicenseTexts', 'reviewRequired')}), end='')
         return 1 if issues else 0
     except (GenerationError, OSError, tarfile.TarError, ValueError, KeyError, TypeError) as exc:
         code = str(exc) if isinstance(exc, GenerationError) else 'attribution-input-or-filesystem-error'

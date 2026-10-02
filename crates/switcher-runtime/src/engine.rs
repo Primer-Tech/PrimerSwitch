@@ -2162,6 +2162,132 @@ mod tests {
             .count()
     }
     #[tokio::test]
+    async fn preview_one_state_survives_branded_reinstall_and_settings_mutation() {
+        // Historical contract: release 7e8411509488a5bf7217f10d7c6cccbf726c4562.
+        // Literal synthetic JSON avoids deriving the old format from new defaults.
+        let historical: Value = serde_json::from_str(r#"{
+          "settings": {"poll_interval":900,"threshold":70.5,"auto_switch_enabled":false,"auto_start_window_enabled":false,"auto_use_resets_enabled":false,"appearance":"light","language":"ro"},
+          "last_refresh_at":997,
+          "readings": {
+            "a":{"scoped_at":995,"complete":true,"error":null,"priming_attempt_at":994},
+            "b":{"scoped_at":993,"complete":false,"error":"Historical fixture error","priming_attempt_at":992}
+          },
+          "accounts": [
+            {
+              "id":"a","provider":"claude","name":"Historical A","saved_at":801,
+              "oauth_account":{"accountUuid":"a","organizationUuid":"org-a","emailAddress":"a@example.invalid","oldIdentityExtension":{"nested":[1,"keep-a"]}},
+              "credentials":{"oldCredentialExtension":["keep-a",{"flag":true}],"claudeAiOauth":{"accessToken":"HISTORICAL_FIXTURE_ACCESS_A","refreshToken":"HISTORICAL_FIXTURE_REFRESH_A","expiresAt":4600000,"oldOauthExtension":{"opaque":"keep-a"}}},
+              "refresh_fail_at":802,"rate_limited_until":1800,"expected_weekly_reset_at":90000,"primed_for_reset_at":86400,"consecutive_rate_limits":3,
+              "last_usage": {
+                "five_hour":{"utilization":21.5,"resets_at":10000},
+                "seven_day":{"utilization":62.5,"resets_at":90000},
+                "seven_day_sonnet":{"utilization":48.5,"resets_at":91000},
+                "extra_usage":{"is_enabled":true,"historicalExtension":["keep-quota"]},
+                "limits":[
+                  {"kind":"weekly_all","group":"weekly","percent":62.5,"resets_at":90000,"scope":{"historicalLimitExtension":"keep-total"}},
+                  {"kind":"weekly_model","group":"weekly","percent":48.5,"resets_at":91000,"scope":{"model":{"display_name":"Sonnet"},"historicalLimitExtension":"keep-model"}}
+                ],
+                "cedar_ember":{"eligible":false,"ineligible_reason":"fixture","grants":[],"next_grant_id":null,"cooldown_until":2000,"weekly_resets_at":90000}
+              },
+              "last_usage_at":991,"last_endpoint_read_at":990,"last_endpoint_attempt_at":989,
+              "subscription_status":"active","subscription_started_at":700,"plan_tier":"max","profile_checked_at":988,"renewal_day":31,
+              "reset_status": {
+                "eligible":true,"ineligible_reason":null,
+                "grants":[{"id":"historical_grant","resets_left":2,"starts_at":800,"ends_at":90000,"clears":["weekly_all"],"paused":false,"usable_now":true,"use_requires_limit":true}],
+                "next_grant_id":"historical_grant","cooldown_until":1900,"weekly_resets_at":90000
+              },
+              "reset_status_at":987,"pending_reset_claim":{"grant_id":"historical_grant","request_id":"historical-request-a","created_at":986},
+              "last_reset_outcome":"transport failure","last_reset_attempt_at":985,"identity_verified":true,"priming_pending_for":92000
+            },
+            {
+              "id":"b","provider":"claude","name":"Historical B","saved_at":701,
+              "oauth_account":{"accountUuid":"b","organizationUuid":"org-b","emailAddress":"b@example.invalid","oldIdentityExtension":{"nested":[2,"keep-b"]}},
+              "credentials":{"oldCredentialExtension":["keep-b",{"flag":false}],"claudeAiOauth":{"accessToken":"HISTORICAL_FIXTURE_ACCESS_B","refreshToken":"HISTORICAL_FIXTURE_REFRESH_B","expiresAt":4700000,"oldOauthExtension":{"opaque":"keep-b"}}},
+              "refresh_fail_at":null,"rate_limited_until":null,"expected_weekly_reset_at":91000,"primed_for_reset_at":87000,"consecutive_rate_limits":1,
+              "last_usage":null,"last_usage_at":981,"last_endpoint_read_at":980,"last_endpoint_attempt_at":979,
+              "subscription_status":"inactive","subscription_started_at":600,"plan_tier":"pro","profile_checked_at":978,"renewal_day":15,
+              "reset_status":{"eligible":false,"ineligible_reason":"fixture-b","grants":[],"next_grant_id":null,"cooldown_until":null,"weekly_resets_at":91000},
+              "reset_status_at":977,"pending_reset_claim":null,"last_reset_outcome":"reset already used","last_reset_attempt_at":976,"identity_verified":true,"priming_pending_for":null
+            }
+          ]
+        }"#).unwrap();
+        let parsed: Persisted = serde_json::from_value(historical.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), historical);
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let temp = tempfile::Builder::new()
+            .prefix("primerswitch-preview-one-compatibility-")
+            .tempdir_in(parent)
+            .unwrap();
+        let paths = CliPaths::for_home(temp.path().join("fixture-home"));
+        std::fs::create_dir_all(&paths.config_dir).unwrap();
+        std::fs::write(&paths.settings_file, b"{}").unwrap();
+        let directory = temp.path().join("fixture-vault");
+        let injected_key = [7; 32];
+        let vault = Vault::with_key(directory.clone(), injected_key).unwrap();
+        // Synthetic persisted key fixture; never touches an OS credential store.
+        let key_file = directory.join("fixture-injected-master-key.bin");
+        std::fs::write(&key_file, injected_key).unwrap();
+        vault.save(RECORD, &historical).unwrap();
+        let state_file = directory.join("runtime-state.vault");
+        let initial_ciphertext = std::fs::read(&state_file).unwrap();
+        let fake = Arc::new(Fake::default());
+        let clock = Arc::new(FakeClock(AtomicI64::new(1000)));
+        let handle = RuntimeHandle::from_parts(
+            vault,
+            ActiveStore::file(paths.clone()),
+            ClaudeClient::with_transport("2.1.287", fake.clone()).unwrap(),
+            clock.clone(),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&state_file).unwrap(), initial_ciphertext);
+        assert_eq!(std::fs::read(&key_file).unwrap(), injected_key);
+        assert!(fake.calls.lock().unwrap().is_empty());
+        let snapshot = handle.get_snapshot();
+        assert_eq!(snapshot.accounts.len(), 2);
+        assert_eq!(snapshot.settings.appearance, "light");
+        assert_eq!(snapshot.settings.language, "ro");
+        assert_eq!(snapshot.settings.poll_interval, 900);
+        assert_eq!(snapshot.settings.threshold, 70.5);
+        assert!(snapshot.accounts.iter().all(|a| !a.identity_verified));
+        let public = serde_json::to_string(&snapshot).unwrap();
+        assert!(!public.contains("HISTORICAL_FIXTURE_ACCESS"));
+        assert!(!public.contains("HISTORICAL_FIXTURE_REFRESH"));
+        let mut expected = historical.clone();
+        // Ownership is intentionally reverified after process restart. All other
+        // account, quota, renewal and pending scheduling/reset fields stay intact.
+        for account in expected["accounts"].as_array_mut().unwrap() {
+            account["identity_verified"] = json!(false);
+        }
+        {
+            let engine = handle.inner.owner.lock().await;
+            assert_eq!(serde_json::to_value(&engine.saved).unwrap(), expected);
+        }
+        let mut settings: Settings = snapshot.settings.into();
+        settings.threshold = 71.5;
+        handle.update_settings(settings).await.unwrap();
+        expected["settings"]["threshold"] = json!(71.5);
+        drop(handle);
+        assert_eq!(std::fs::read(&key_file).unwrap(), injected_key);
+        let vault = Vault::with_key(directory.clone(), injected_key).unwrap();
+        assert_eq!(vault.load::<Value>(RECORD).unwrap().unwrap(), expected);
+        let after_mutation = std::fs::read(&state_file).unwrap();
+        assert_ne!(after_mutation, initial_ciphertext);
+        let reopened = RuntimeHandle::from_parts(
+            vault,
+            ActiveStore::file(paths),
+            ClaudeClient::with_transport("2.1.287", fake.clone()).unwrap(),
+            clock,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&state_file).unwrap(), after_mutation);
+        assert_eq!(std::fs::read(&key_file).unwrap(), injected_key);
+        let engine = reopened.inner.owner.lock().await;
+        assert_eq!(serde_json::to_value(&engine.saved).unwrap(), expected);
+        assert!(fake.calls.lock().unwrap().is_empty());
+        assert_eq!(reopened.get_snapshot().settings.threshold, 71.5);
+    }
+
+    #[tokio::test]
     async fn demo_and_degraded_snapshots_are_read_only_and_redacted() {
         let demo = RuntimeHandle::demo();
         let json = serde_json::to_string(&demo.get_snapshot()).unwrap();

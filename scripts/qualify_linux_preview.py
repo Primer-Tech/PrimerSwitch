@@ -143,6 +143,19 @@ def accessible_nodes(node, pyatspi, *, limit: int = 6000) -> list[dict]:
     return rows
 
 
+def observe_accessibility_desktop(pyatspi, glib) -> list[dict]:
+    desktop = pyatspi.Registry.getDesktop(0)
+    # libatspi registration/cache updates arrive on GLib's main context. Merely
+    # polling cached child counts does not dispatch those pending events.
+    context = glib.MainContext.default()
+    for _ in range(256):
+        if not context.pending():
+            break
+        context.iteration(False)
+    desktop.clearCache()
+    return accessible_nodes(desktop, pyatspi)
+
+
 def window_details() -> dict | None:
     tree = output(["xwininfo", "-root", "-tree"], timeout=8).decode("utf8", errors="replace")
     for line in tree.splitlines():
@@ -160,6 +173,8 @@ def window_details() -> dict | None:
 def worker(directory: Path) -> int:
     report = {"formatVersion": 1, "status": "failed", "scope": "Installed Ubuntu 24.04 x86_64 demo accessibility and native window; no provider/live account qualification", "checks": {}}
     application = None
+    application_log = None
+    rows, window = [], None
     try:
         require((directory / "fixture.marker").read_text() == MARKER, "isolated-fixture-marker-missing")
         for key in ("HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR"):
@@ -170,14 +185,16 @@ def worker(directory: Path) -> int:
         output(["gdbus", "call", "--session", "--dest", "org.a11y.Bus", "--object-path", "/org/a11y/bus",
                 "--method", "org.freedesktop.DBus.Properties.Set", "org.a11y.Status", "IsEnabled", "<true>"])
         import pyatspi
-        application = subprocess.Popen(["/usr/bin/primerswitch", "--demo"], env=os.environ.copy(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        from gi.repository import GLib
+        pyatspi.setTimeout(2000, 10000)
+        application_log = (directory / "native-demo-stderr.log").open("wb")
+        application = subprocess.Popen(["/usr/bin/primerswitch", "--demo"], env=os.environ.copy(), stdout=subprocess.DEVNULL, stderr=application_log)
         report["checks"]["installedDemoLaunched"] = True
         deadline = time.monotonic() + 75
-        rows, window = [], None
         while time.monotonic() < deadline:
             require(application.poll() is None, "installed-demo-exited-before-rendering")
             window = window_details()
-            rows = accessible_nodes(pyatspi.Registry.getDesktop(0), pyatspi)
+            rows = observe_accessibility_desktop(pyatspi, GLib)
             content = "\n".join(row["name"] + " " + row["text"] for row in rows)
             if window and "Demo data" in content and "actions are disabled" in content:
                 break
@@ -187,12 +204,12 @@ def worker(directory: Path) -> int:
         report["accessibilityNodeCount"] = len(rows)
         report["observedLabels"] = sorted({row["name"] for row in rows if row["name"] in {"Accounts", "Open settings", "Automation", "Refresh all", "Switch", "Preview"}})
         require(any(row["name"] == "Accounts" for row in rows), "english-accounts-navigation-missing")
-        settings = [row for row in rows if row["name"] == "Open settings" and row["role"] == "push button"]
+        settings = [row for row in rows if row["name"] == "Open settings" and row["role"] in {"push button", "button"}]
         require(len(settings) == 1 and settings[0]["enabled"], "settings-navigation-unavailable")
-        require(any(row["name"] == "Automation" and row["role"] != "push button" for row in rows), "automation-panel-missing")
-        require(not any(row["name"] == "Automation" and row["role"] == "push button" for row in rows), "duplicate-automation-navigation-present")
-        refresh = [row for row in rows if row["role"] == "push button" and (row["name"] == "Refresh all" or row["name"].startswith("Refresh account "))]
-        switches = [row for row in rows if row["role"] == "push button" and row["name"] == "Switch"]
+        require(any(row["name"] == "Automation" and row["role"] not in {"push button", "button"} for row in rows), "automation-panel-missing")
+        require(not any(row["name"] == "Automation" and row["role"] in {"push button", "button"} for row in rows), "duplicate-automation-navigation-present")
+        refresh = [row for row in rows if row["role"] in {"push button", "button"} and (row["name"] == "Refresh all" or row["name"].startswith("Refresh account "))]
+        switches = [row for row in rows if row["role"] in {"push button", "button"} and row["name"] == "Switch"]
         require(bool(refresh) and bool(switches) and all(not row["enabled"] for row in refresh + switches), "demo-mutation-controls-not-disabled")
         output(["import", "-window", window["id"], str(SCREENSHOT)], timeout=15)
         require(SCREENSHOT.is_file() and SCREENSHOT.read_bytes().startswith(b"\x89PNG\r\n\x1a\n"), "native-demo-screenshot-missing")
@@ -204,8 +221,8 @@ def worker(directory: Path) -> int:
         require(settings[0]["accessible"].queryAction().doAction(0), "settings-navigation-action-failed")
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
-            dialog_rows = accessible_nodes(pyatspi.Registry.getDesktop(0), pyatspi)
-            saves = [row for row in dialog_rows if row["name"] == "Save" and row["role"] == "push button"]
+            dialog_rows = observe_accessibility_desktop(pyatspi, GLib)
+            saves = [row for row in dialog_rows if row["name"] == "Save" and row["role"] in {"push button", "button"}]
             if saves:
                 require(all(not row["enabled"] for row in saves), "demo-settings-save-not-disabled")
                 report["checks"]["settingsDialogReadOnly"] = True
@@ -224,6 +241,26 @@ def worker(directory: Path) -> int:
         report["failureType"] = type(error).__name__
         return 2
     finally:
+        # Capture only this fixture's display/process before termination. A blank
+        # image plus native stderr distinguishes renderer failure from AT-SPI.
+        if report["status"] != "passed":
+            try:
+                diagnostic_tree = output(["xwininfo", "-root", "-tree"], timeout=8).decode("utf8", errors="replace")
+                report["x11WindowTree"] = diagnostic_tree[:4096]
+            except Exception as error:
+                report["x11DiagnosticFailureType"] = type(error).__name__
+            report["accessibilityNodeCount"] = len(rows)
+            report["accessibleNodes"] = [{key: (str(row[key])[:160] if key != "enabled" else row[key])
+                                          for key in ("name", "role", "text", "enabled")} for row in rows[:150]]
+            report["windowObserved"] = window is not None
+            try:
+                target = window["id"] if window else "root"
+                output(["import", "-window", target, str(SCREENSHOT)], timeout=15)
+                if SCREENSHOT.is_file():
+                    report["screenshotSha256"] = sha256(SCREENSHOT.read_bytes())
+                    report["screenshotScope"] = "isolated-native-window" if window else "isolated-xvfb-display"
+            except Exception as error:
+                report["screenshotFailureType"] = type(error).__name__
         if application is not None and application.poll() is None:
             application.terminate()
             try:
@@ -231,6 +268,14 @@ def worker(directory: Path) -> int:
             except subprocess.TimeoutExpired:
                 application.kill()
                 application.wait(timeout=5)
+        if application_log is not None:
+            application_log.close()
+            log = (directory / "native-demo-stderr.log").read_bytes().decode("utf8", errors="replace")
+            # The process receives only a fresh fixture environment and --demo;
+            # remove even its disposable path from bounded diagnostic output.
+            report["nativeStderrTail"] = log[-4096:].replace(str(directory), "<fixture>").replace(str(ROOT), "<workspace>")
+        if application is not None:
+            report["nativeProcessExitCode"] = application.returncode
         write_report(report)
 
 

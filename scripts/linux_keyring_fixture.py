@@ -51,7 +51,7 @@ CASES = [
     "ciphertext_reopen",
     "duplicate_item_rejected",
     "malformed_item_rejected",
-    "wrong_content_type_rejected",
+    "documented_gnome_content_type_normalization",
     "replaced_key_rejected",
     "session_default_alias_rejected",
     "ephemeral_key_not_adopted",
@@ -70,7 +70,7 @@ SAFE_STORAGE_STAGES = {
     "bus_builder", "bus_connect", "encrypted_session", "key_search", "key_search_ambiguous",
     "default_alias", "session_alias", "default_persistence", "default_unlock",
     "key_membership_list", "key_membership", "key_attributes", "key_locked", "key_content_type",
-    "key_metadata", "key_secret", "key_length", "key_create_item", "key_marker_mismatch",
+    "key_metadata", "key_attribute_count", "key_attribute_ownership", "key_item_locked", "key_content_type_mismatch", "key_secret", "key_length", "key_create_item", "key_marker_mismatch",
     "key_confirmation_missing", "key_confirmation_mismatch", "operation_timeout",
 }
 SAFE_NATIVE_ERROR_CATEGORIES = {

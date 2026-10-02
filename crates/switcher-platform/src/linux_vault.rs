@@ -3,15 +3,12 @@
 use crate::{PlatformError, Result, files};
 use rand::{RngCore, rngs::OsRng};
 use sha2::{Digest, Sha256};
-#[cfg(target_os = "linux")]
 use std::collections::HashMap;
 use std::path::Path;
 use zeroize::Zeroizing;
 
-#[cfg(target_os = "linux")]
 const SERVICE: &str = "com.primertech.primerswitch.vault.v1";
 const MARKER: &str = "master-key.secret-service";
-#[cfg(target_os = "linux")]
 const CONTENT_TYPE: &str = "application/octet-stream";
 
 fn diagnostic_stage(stage: &'static str) {
@@ -72,9 +69,35 @@ fn namespace(directory: &Path) -> Result<String> {
     ))
 }
 
-#[cfg(target_os = "linux")]
 fn attributes(namespace: &str) -> HashMap<&str, &str> {
     HashMap::from([("application", SERVICE), ("vault", namespace)])
+}
+
+fn check_attributes(actual: &HashMap<String, String>, namespace: &str) -> Result<()> {
+    if actual.len() != 2 {
+        diagnostic_stage("key_attribute_count");
+        return Err(PlatformError::KeyUnavailable);
+    }
+    if !attributes(namespace)
+        .into_iter()
+        .all(|(key, value)| actual.get(key).is_some_and(|v| v == value))
+    {
+        diagnostic_stage("key_attribute_ownership");
+        return Err(PlatformError::KeyUnavailable);
+    }
+    Ok(())
+}
+
+fn check_content_type(content_type: &str) -> Result<()> {
+    // GNOME Keyring46.1 discards the incoming content type and unconditionally
+    // returns text/plain even for arbitrary binary secret values. This is
+    // transport metadata, not an encoding instruction: never decode the key.
+    // https://raw.githubusercontent.com/GNOME/gnome-keyring/46.1/daemon/dbus/gkd-secret-secret.c
+    if !matches!(content_type, CONTENT_TYPE | "text/plain") {
+        diagnostic_stage("key_content_type_mismatch");
+        return Err(PlatformError::KeyUnavailable);
+    }
+    Ok(())
 }
 
 fn check_search_result(unlocked: usize, locked: usize) -> Result<bool> {
@@ -283,16 +306,13 @@ impl KeyStore for NativeStore<'_> {
             return Err(PlatformError::KeyUnavailable);
         }
         let actual = native_result(item.get_attributes(), "key_attributes")?;
-        if actual.len() != 2
-            || !attributes(namespace)
-                .into_iter()
-                .all(|(key, value)| actual.get(key).is_some_and(|v| v == value))
-            || native_result(item.is_locked(), "key_locked")?
-            || native_result(item.get_secret_content_type(), "key_content_type")? != CONTENT_TYPE
-        {
-            diagnostic_stage("key_metadata");
+        check_attributes(&actual, namespace)?;
+        if native_result(item.is_locked(), "key_locked")? {
+            diagnostic_stage("key_item_locked");
             return Err(PlatformError::KeyUnavailable);
         }
+        let content_type = native_result(item.get_secret_content_type(), "key_content_type")?;
+        check_content_type(&content_type)?;
         let value = Zeroizing::new(native_result(item.get_secret(), "key_secret")?);
         if value.len() != 32 {
             diagnostic_stage("key_length");
@@ -370,6 +390,46 @@ mod tests {
         let directory = root.path().join(name);
         files::private_dir(&directory).unwrap();
         directory
+    }
+
+    #[test]
+    fn linux_fake_metadata_accepts_documented_gnome_normalization_and_keeps_ownership_exact() {
+        let namespace = "isolated-fixture";
+        let original: HashMap<String, String> = attributes(namespace)
+            .into_iter()
+            .map(|(key, value)| (key.into(), value.into()))
+            .collect();
+        check_attributes(&original, namespace).unwrap();
+        check_content_type(CONTENT_TYPE).unwrap();
+        check_content_type("text/plain").unwrap();
+        for content_type in [
+            "",
+            "text/plain; charset=utf-8",
+            "application/json",
+            "malformed",
+        ] {
+            assert!(matches!(
+                check_content_type(content_type),
+                Err(PlatformError::KeyUnavailable)
+            ));
+        }
+        let mut extra = original.clone();
+        extra.insert("xdg:schema".into(), "unexpected".into());
+        assert!(matches!(
+            check_attributes(&extra, namespace),
+            Err(PlatformError::KeyUnavailable)
+        ));
+        for key in ["application", "vault"] {
+            let mut wrong = original.clone();
+            wrong.insert(key.into(), "different-owner".into());
+            assert!(matches!(
+                check_attributes(&wrong, namespace),
+                Err(PlatformError::KeyUnavailable)
+            ));
+            let mut missing = original.clone();
+            missing.remove(key);
+            assert!(check_attributes(&missing, namespace).is_err());
+        }
     }
 
     #[test]
@@ -716,11 +776,10 @@ mod native_tests {
             Err(PlatformError::KeyUnavailable)
         ));
         assert_eq!(item.get_secret().unwrap(), b"malformed-native-fixture");
+        // GNOME returns text/plain for secrets originally written as binary.
+        assert_eq!(item.get_secret_content_type().unwrap(), "text/plain");
         item.set_secret(key.as_slice(), "text/plain").unwrap();
-        assert!(matches!(
-            Vault::open(directory.clone()),
-            Err(PlatformError::KeyUnavailable)
-        ));
+        assert!(Vault::open(directory.clone()).is_ok());
         item.set_secret(key.as_slice(), CONTENT_TYPE).unwrap();
         item.set_secret(&[23; 32], CONTENT_TYPE).unwrap();
         assert!(matches!(

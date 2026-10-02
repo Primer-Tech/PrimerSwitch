@@ -31,7 +31,9 @@ REVIEWED_EXPRESSIONS["rustix"] = ("1.1.5", "Apache-2.0 WITH LLVM-exception OR Ap
 REVIEWED_EXPRESSIONS["linux-raw-sys"] = ("0.12.1", "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT")
 REVIEWED_EXPRESSIONS["target-lexicon"] = ("0.12.16", "Apache-2.0 WITH LLVM-exception")
 BUNDLE_SUFFIXES = {"nsis": "*.exe", "dmg": "*.dmg", "deb": "*.deb", "rpm": "*.rpm"}
-CONFIG_FILES = ("apps/desktop/src-tauri/tauri.conf.json", "apps/desktop/src-tauri/tauri.preview.conf.json", "scripts/package_preview.py", "docs/legal/brand/manifest.json", "docs/legal/brand/Comfortaa-OFL.txt", "apps/desktop/src/assets/fonts/comfortaa-600.subset.woff2")
+CONFIG_FILES = ("apps/desktop/src-tauri/tauri.conf.json", "apps/desktop/src-tauri/tauri.preview.conf.json", "scripts/package_preview.py", "docs/legal/brand/manifest.json", "docs/legal/brand/Comfortaa-OFL.txt", "apps/desktop/src/assets/fonts/comfortaa-600.subset.woff2", "apps/desktop/src-tauri/Cargo.toml")
+CURRENT_STAGE = "argument-or-native-host-validation"
+FAILURE_REPORT = "package-failure.json"
 EVIDENCE_FILES = ("frontend-bundle-inventory.json", "THIRD_PARTY_NOTICES.txt", "THIRD_PARTY_METADATA.json", "THIRD_PARTY_REPORT.json")
 
 
@@ -150,12 +152,89 @@ def verify_brand_notices() -> dict:
     return manifest
 
 
-def verify_nsis_recipe(target: str, notices: dict) -> None:
+def merge_config(base: object, overlay: object) -> object:
+    if not isinstance(overlay, dict):
+        return overlay
+    result = dict(base) if isinstance(base, dict) else {}
+    for key, value in overlay.items():
+        if value is None:
+            result.pop(key, None)
+        else:
+            result[key] = merge_config(result.get(key), value)
+    return result
+
+
+def effective_preview_config(bundle: str, overlay: dict) -> dict:
+    directory = DESKTOP / "src-tauri"
+    config = json.loads((directory / "tauri.conf.json").read_text(encoding="utf8"))
+    platform_name = {"nsis": "windows", "dmg": "macos", "deb": "linux", "rpm": "linux"}[bundle]
+    # Additional platform flavors must be explicitly bound/reviewed first;
+    # silently applying one would defeat stable identity and input provenance.
+    if any((directory / f"tauri.{platform_name}.conf{suffix}").exists() for suffix in (".json", ".json5", ".toml")):
+        raise PackagingError("unreviewed-platform-config")
+    preview = json.loads((directory / "tauri.preview.conf.json").read_text(encoding="utf8"))
+    return merge_config(merge_config(config, preview), overlay)
+
+
+def verify_preview_identity(config: dict, cargo_manifest: dict) -> None:
+    bundle = config.get("bundle", {})
+    nsis = bundle.get("windows", {}).get("nsis", {})
+    package = cargo_manifest.get("package", {})
+    require_binary = package.get("default-run") == "primerswitch" and any(record.get("name") == "primerswitch" for record in cargo_manifest.get("bin", []))
+    if (config.get("productName") != "PrimerSwitch" or config.get("identifier") != "com.primertech.primerswitch"
+            or bundle.get("publisher") != "Primer-Tech" or nsis.get("installMode") != "currentUser"
+            or config.get("mainBinaryName", "primerswitch") != "primerswitch" or not require_binary):
+        raise PackagingError("preview-identity-would-change-existing-installation")
+    if bundle.get("windows", {}).get("allowDowngrades") is not False:
+        raise PackagingError("preview-installer-would-permit-downgrade")
+    if nsis.get("template") or nsis.get("installerHooks"):
+        raise PackagingError("unreviewed-nsis-template-or-hooks")
+    for destination in bundle.get("resources", {}).values():
+        if re.search(r"(?:\.vault|master[-_]key|runtime[-_]state|switch[-_]journal)", destination, re.I):
+            raise PackagingError("resource-would-overwrite-existing-app-data")
+
+
+def verify_nsis_data_preservation(text: str, resource_destinations: list[str]) -> None:
+    identities = {"PRODUCTNAME": "PrimerSwitch", "BUNDLEID": "com.primertech.primerswitch", "MANUFACTURER": "Primer-Tech", "INSTALLMODE": "currentUser", "MAINBINARYNAME": "primerswitch"}
+    for key, expected in identities.items():
+        if not re.search(r'^!define ' + key + r' "' + re.escape(expected) + r'"$', text, re.M):
+            raise PackagingError("generated-installer-identity-changed")
+    allowed_files = {"${MAINBINARYNAME}.exe", "uninstall.exe", "$OldMainBinaryName"}
+    allowed_files.update(destination.replace("/", "\\") for destination in resource_destinations)
+    allowed_directories = {str(Path(destination).parent).replace("/", "\\") for destination in resource_destinations if str(Path(destination).parent) != "."}
+    data_guard = re.search(r'\$\{If\} \$DeleteAppDataCheckboxState = 1\s+\$\{AndIf\} \$UpdateMode <> 1(?P<body>.*?)\$\{EndIf\}', text, re.S)
+    for match in re.finditer(r'^[ \t]*(Delete|RMDir)\b([^\r\n]*)', text, re.M | re.I):
+        operation, arguments = match.group(1).lower(), match.group(2)
+        paths = re.findall(r'"([^"\r\n]+)"', arguments)
+        if len(paths) != 1:
+            raise PackagingError("ambiguous-installer-cleanup")
+        path = paths[0]
+        recursive = bool(re.search(r'(?:^|\s)/r(?:\s|$)', arguments, re.I))
+        if re.search(r'(?:\.vault|master[-_]key|runtime[-_]state|switch[-_]journal|[?*])', path, re.I):
+            raise PackagingError("installer-would-remove-persisted-data")
+        if path == "$INSTDIR":
+            if operation != "rmdir" or recursive:
+                raise PackagingError("installer-would-remove-persisted-data")
+        elif path.startswith("$INSTDIR\\"):
+            relative = path[len("$INSTDIR\\"):]
+            if (operation == "delete" and relative not in allowed_files) or (operation == "rmdir" and relative not in allowed_directories):
+                raise PackagingError("installer-would-remove-persisted-data")
+        elif path in {"$APPDATA\\${BUNDLEID}", "$LOCALAPPDATA\\${BUNDLEID}"}:
+            if operation != "rmdir" or not data_guard or not (data_guard.start() <= match.start() < data_guard.end()):
+                raise PackagingError("installer-app-data-cleanup-not-update-guarded")
+        elif not (path.startswith("$TEMP\\") or path.startswith("$SMPROGRAMS\\") or path.startswith("$DESKTOP\\")):
+            raise PackagingError("unreviewed-installer-cleanup-location")
+
+
+def verify_nsis_recipe(target: str, notices: dict, resource_destinations: list[str]) -> None:
     arch = {"x86_64": "x64", "aarch64": "arm64", "i686": "x86"}.get(target.split("-")[0])
     if not arch:
         raise PackagingError("unsupported-nsis-architecture")
     recipe = ROOT / "target" / "release" / "nsis" / arch / "installer.nsi"
     text = recipe.read_text(encoding="utf8")
+    verify_nsis_data_preservation(text, resource_destinations)
+    if not re.search(r'^!define ALLOWDOWNGRADES "false"$', text, re.M):
+        raise PackagingError("generated-installer-would-permit-downgrade")
     if not re.search(r'^[ \t]*SetCompressor(?:[ \t]+/SOLID)?[ \t]+(?:"zlib"|zlib)[ \t]*$', text, re.MULTILINE | re.IGNORECASE):
         raise PackagingError("unexpected-installer-compressor")
     plugin_path = re.search(r'^!define ADDITIONALPLUGINSPATH "([^"]+)"$', text, re.MULTILINE)
@@ -202,7 +281,7 @@ def clear_package_outputs(bundle: str) -> None:
         if stale.is_symlink() or not stale.is_file():
             raise PackagingError("unsafe-installer-output")
         stale.unlink()
-    for name in ("package-manifest.json", "SHA256SUMS.txt"):
+    for name in ("package-manifest.json", "SHA256SUMS.txt", FAILURE_REPORT):
         (ARTIFACTS / name).unlink(missing_ok=True)
 
 
@@ -223,7 +302,16 @@ def hashes(names: tuple[str, ...], root: Path) -> dict:
 
 
 def checked_output(arguments: list[str]) -> bytes:
-    return subprocess.run(arguments, cwd=ROOT, capture_output=True, check=True).stdout
+    global CURRENT_STAGE
+    # Fixed tool identity only: do not include arbitrary arguments, stderr or
+    # exception messages in packaging diagnostics.
+    tool = Path(arguments[0]).stem.lower()
+    CURRENT_STAGE = "inspection-tool-" + (tool if tool in {"git", "rpm", "rpm2cpio", "readelf", "dpkg-deb"} else "other")
+    try:
+        return subprocess.run(arguments, cwd=ROOT, capture_output=True, check=True).stdout
+    except subprocess.CalledProcessError as error:
+        raise PackagingError(f"{CURRENT_STAGE}-failed-exit-{error.returncode}") from error
+
 
 
 def cpio_files(data: bytes) -> dict[str, bytes]:
@@ -234,10 +322,18 @@ def cpio_files(data: bytes) -> dict[str, bytes]:
         header = data[offset:offset + 110]
         if header[:6] not in (b"070701", b"070702"):
             raise PackagingError("invalid-rpm-payload")
-        fields = [int(header[6 + i * 8:14 + i * 8], 16) for i in range(13)]
+        try:
+            fields = [int(header[6 + i * 8:14 + i * 8], 16) for i in range(13)]
+        except ValueError as error:
+            raise PackagingError("invalid-rpm-payload-header") from error
         mode, size, name_size = fields[1], fields[6], fields[11]
         offset += 110
-        name = data[offset:offset + name_size].rstrip(b"\0").decode("utf8")
+        if name_size <= 0 or len(data[offset:offset + name_size]) != name_size or data[offset + name_size - 1] != 0:
+            raise PackagingError("invalid-rpm-payload-name")
+        try:
+            name = data[offset:offset + name_size].rstrip(b"\0").decode("utf8")
+        except UnicodeDecodeError as error:
+            raise PackagingError("invalid-rpm-payload-name") from error
         offset = (offset + name_size + 3) & ~3
         body = data[offset:offset + size]
         if len(body) != size:
@@ -276,6 +372,7 @@ def verify_linux_payload(files: dict[str, bytes], evidence: dict) -> None:
 
 
 def verify_linux_package(path: Path, bundle: str, evidence: dict, runtime_dependencies: list[str]) -> dict:
+    global CURRENT_STAGE
     if bundle == "deb":
         dependencies = checked_output([executable("dpkg-deb"), "-f", str(path), "Depends"]).decode("utf8").strip()
         architecture = checked_output([executable("dpkg-deb"), "-f", str(path), "Architecture"]).decode("utf8").strip()
@@ -297,7 +394,10 @@ def verify_linux_package(path: Path, bundle: str, evidence: dict, runtime_depend
         architecture = checked_output([rpm, "-qp", "--queryformat", "%{ARCH}", str(path)]).decode("utf8").strip()
         if architecture != "x86_64":
             raise PackagingError("linux-package-architecture-mismatch")
-        files = cpio_files(checked_output([executable("rpm2cpio"), str(path)]))
+        payload = checked_output([executable("rpm2cpio"), str(path)])
+        CURRENT_STAGE = "linux-rpm-payload-parsing"
+        files = cpio_files(payload)
+    CURRENT_STAGE = "linux-runtime-dependencies-and-bundled-evidence"
     for dependency in runtime_dependencies:
         if dependency not in dependencies:
             raise PackagingError("linux-runtime-dependency-missing")
@@ -331,6 +431,7 @@ def rpm_elf_requirements(dynamic: str, versions: str) -> list[str]:
 
 
 def main() -> int:
+    global CURRENT_STAGE
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bundle", choices=tuple(BUNDLE_SUFFIXES), required=True)
     parser.add_argument("--offline", action="store_true", help="use only cached Cargo/bundler dependencies")
@@ -348,6 +449,9 @@ def main() -> int:
         distribution = linux_build_distribution(Path("/etc/os-release").read_text(encoding="utf8"))
     installer_notices = verify_installer_notices() if args.bundle == "nsis" else None
     brand_notices = verify_brand_notices()
+    overlay = preview_config(args.bundle, installer_notices)
+    effective_config = effective_preview_config(args.bundle, overlay)
+    verify_preview_identity(effective_config, tomllib.loads((DESKTOP / "src-tauri/Cargo.toml").read_text(encoding="utf8")))
     ARTIFACTS.mkdir(exist_ok=True)
     clear_package_outputs(args.bundle)
     command([node, str(DESKTOP / "scripts" / "build-inventory.mjs")], cwd=DESKTOP)
@@ -358,6 +462,7 @@ def main() -> int:
     command([sys.executable, "-B", str(ROOT / "scripts" / "generate_notices.py"),
              "--target", target, "--overrides", "docs/legal/upstream/manifest.json",
              "--frontend-inventory", ".artifacts/frontend-bundle-inventory.json"], accepted={0, 1})
+    CURRENT_STAGE = "native-attribution-and-renderer-evidence"
     report = verify_attribution(target)
     inventory = verify_bundle()
     print(f"Preview attribution verified: {report['dependencyCount']} dependency records; no missing shipped texts.", flush=True)
@@ -391,7 +496,7 @@ def main() -> int:
         command(arguments, cwd=DESKTOP)
     if args.bundle == "nsis":
         verify_installer_notices()
-        verify_nsis_recipe(target, installer_notices)
+        verify_nsis_recipe(target, installer_notices, list(effective_config["bundle"]["resources"].values()))
         if notices_hash != hashes(("docs/legal/packaging/manifest.json",), ROOT)["docs/legal/packaging/manifest.json"]:
             raise PackagingError("installer-attribution-changed-during-build")
     verify_attribution(target)
@@ -402,6 +507,7 @@ def main() -> int:
     paths = sorted(output_directory(args.bundle).glob(BUNDLE_SUFFIXES[args.bundle]))
     if len(paths) != 1 or paths[0].is_symlink() or not paths[0].is_file():
         raise PackagingError("installer-output-missing-or-ambiguous")
+    CURRENT_STAGE = "package-provenance-assembly"
     packages = [{"path": path.relative_to(ROOT).as_posix(), "bytes": path.stat().st_size,
                  "sha256": hashlib.sha256(path.read_bytes()).hexdigest()} for path in paths]
     manifest = {"formatVersion": 2, "target": target, "bundle": args.bundle, "unsignedPreview": True,
@@ -429,5 +535,9 @@ if __name__ == "__main__":
         sys.exit(main())
     except (PackagingError, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
         message = str(error) if isinstance(error, PackagingError) else "packaging-could-not-complete"
-        print(f"Preview packaging failed: {message}.", file=sys.stderr)
+        ARTIFACTS.mkdir(exist_ok=True)
+        failure = {"formatVersion": 1, "failureStep": CURRENT_STAGE, "exceptionType": type(error).__name__,
+                   "reason": message}
+        (ARTIFACTS / FAILURE_REPORT).write_text(json.dumps(failure, indent=2, sort_keys=True) + "\n", encoding="utf8")
+        print(f"Preview packaging failed: {message} (step: {CURRENT_STAGE}; type: {type(error).__name__}).", file=sys.stderr)
         sys.exit(2)

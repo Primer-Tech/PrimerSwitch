@@ -55,6 +55,11 @@ jobs:
             .artifacts/frontend-bundle-inventory.json
             .artifacts/linux-installed-demo-report.json
             .artifacts/linux-installed-demo.png
+            .artifacts/package-failure.json
+            .artifacts/package-manifest.json
+            .artifacts/SHA256SUMS.txt
+            target/release/bundle/deb/*.deb
+            target/release/bundle/rpm/*.rpm
           if-no-files-found: warn
           include-hidden-files: true
           retention-days: 14

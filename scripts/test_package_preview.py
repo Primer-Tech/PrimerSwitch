@@ -9,6 +9,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
 import package_preview as packaging
 import qualify_linux_preview as qualification
 
@@ -284,6 +285,77 @@ class PackagingFixtures(unittest.TestCase):
         manifest["packages"][0]["path"] = "../foreign.deb"
         with self.assertRaisesRegex(qualification.QualificationError, "unsafe-preview-package-path"):
             qualification.verify_package_manifest(manifest, self.root)
+
+    def test_accessibility_observation_dispatches_registration_events_before_reading_children(self):
+        class States:
+            def contains(self, state): return True
+        class Node:
+            def __init__(self, name): self.name, self.children, self.cleared = name, [], False
+            @property
+            def childCount(self): return len(self.children)
+            def getRoleName(self): return "application"
+            def getState(self): return States()
+            def queryText(self): raise NotImplementedError
+            def getChildAtIndex(self, index): return self.children[index]
+            def clearCache(self): self.cleared = True
+        desktop, application = Node("fixture desktop"), Node("PrimerSwitch")
+        class Context:
+            def __init__(self): self.events = [lambda: desktop.children.append(application)]
+            def pending(self): return bool(self.events)
+            def iteration(self, blocking):
+                self.assertNonBlocking = not blocking
+                self.events.pop(0)()
+        context = Context()
+        spi = SimpleNamespace(STATE_ENABLED=1, Registry=SimpleNamespace(getDesktop=lambda index: desktop))
+        glib = SimpleNamespace(MainContext=SimpleNamespace(default=lambda: context))
+        rows = qualification.observe_accessibility_desktop(spi, glib)
+        self.assertEqual([row["name"] for row in rows], ["fixture desktop", "PrimerSwitch"])
+        self.assertTrue(desktop.cleared)
+        self.assertTrue(context.assertNonBlocking)
+
+    def stable_identity(self):
+        return {"productName": "PrimerSwitch", "identifier": "com.primertech.primerswitch", "version": "0.1.1",
+                "bundle": {"publisher": "Primer-Tech", "windows": {"allowDowngrades": False, "nsis": {"installMode": "currentUser"}},
+                           "resources": {"source-license.txt": "installer-notices/LICENSE.txt"}}}
+
+    def test_upgrade_version_progression_preserves_storage_identity_and_rejects_custom_hooks(self):
+        config = self.stable_identity()
+        cargo = {"package": {"default-run": "primerswitch"}, "bin": [{"name": "primerswitch"}]}
+        packaging.verify_preview_identity(config, cargo)
+        config["version"] = "0.1.2"
+        packaging.verify_preview_identity(config, cargo)
+        config["bundle"]["windows"]["nsis"]["installerHooks"] = "custom-hooks.nsh"
+        self.rejects("unreviewed-nsis-template-or-hooks", lambda: packaging.verify_preview_identity(config, cargo))
+        del config["bundle"]["windows"]["nsis"]["installerHooks"]
+        config["identifier"] = "com.primertech.primerswitch2"
+        self.rejects("preview-identity-would-change-existing-installation", lambda: packaging.verify_preview_identity(config, cargo))
+
+    def nsis_cleanup_fixture(self):
+        identities = {"PRODUCTNAME": "PrimerSwitch", "BUNDLEID": "com.primertech.primerswitch", "MANUFACTURER": "Primer-Tech", "INSTALLMODE": "currentUser", "MAINBINARYNAME": "primerswitch"}
+        return "\n".join(f'!define {name} "{value}"' for name, value in identities.items()) + "\n" + r'''
+Delete "$INSTDIR\${MAINBINARYNAME}.exe"
+Delete "$INSTDIR\installer-notices\LICENSE.txt"
+RMDir /REBOOTOK "$INSTDIR\installer-notices"
+RMDir "$INSTDIR"
+${If} $DeleteAppDataCheckboxState = 1
+${AndIf} $UpdateMode <> 1
+RmDir /r "$APPDATA\${BUNDLEID}"
+RmDir /r "$LOCALAPPDATA\${BUNDLEID}"
+${EndIf}
+'''
+
+    def test_installer_resource_cleanup_preserves_co_located_settings_accounts_and_key_files(self):
+        baseline = self.nsis_cleanup_fixture()
+        destinations = ["installer-notices/LICENSE.txt"]
+        packaging.verify_nsis_data_preservation(baseline, destinations)
+        for harmful in (r'RMDir /r "$INSTDIR"', r'Delete "$INSTDIR"',
+                        r'Delete "$INSTDIR\runtime-state.vault"', r'Delete "$INSTDIR\*.vault"',
+                        r'Delete "$INSTDIR\master-key.dpapi"', r'RMDir /r "$LOCALAPPDATA\PrimerSwitch"',
+                        r'Delete "$INSTDIR\custom-data.json"'):
+            with self.subTest(cleanup=harmful):
+                with self.assertRaises(packaging.PackagingError):
+                    packaging.verify_nsis_data_preservation(baseline + "\n" + harmful + "\n", destinations)
+        self.rejects("installer-app-data-cleanup-not-update-guarded", lambda: packaging.verify_nsis_data_preservation(baseline.replace('${AndIf} $UpdateMode <> 1', ''), destinations))
 
     def test_malformed_rpm_payload_is_rejected_without_extraction(self):
         self.rejects("invalid-rpm-payload", lambda: packaging.cpio_files(b"untrusted payload"))

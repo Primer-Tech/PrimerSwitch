@@ -153,6 +153,39 @@ def run_silent(executable: Path, arguments: list[str], directory: Path | None = 
     require(completed.returncode == 0, "silent-installer-nonzero-exit")
 
 
+def installation_evidence(directory: Path, state: dict, old_hash: str, expected_binary: Path) -> dict:
+    """Capture only own fixture names/hashes and sanitized registry identity."""
+    executable = directory / "primerswitch.exe"
+    actual = executable.read_bytes() if executable.is_file() and not executable.is_symlink() else b""
+    expected = expected_binary.read_bytes()
+    actual_hash, expected_hash = sha256(actual), sha256(expected)
+    first_difference = last_difference = None
+    different_count = 0
+    for index, (left, right) in enumerate(zip(actual, expected)):
+        if left != right:
+            if first_difference is None:
+                first_difference = index
+            last_difference = index
+            different_count += 1
+    if len(actual) != len(expected):
+        if first_difference is None:
+            first_difference = min(len(actual), len(expected))
+        last_difference = max(len(actual), len(expected)) - 1
+    version = state.get(REGISTRY_KEYS[0], {}).get("DisplayVersion")
+    safe_version = version if isinstance(version, str) and re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:[.-][a-zA-Z0-9.-]+)?", version) else "unrecognized"
+    files = []
+    for file in sorted(directory.rglob("*")):
+        if file.is_file():
+            files.append({"file": file.relative_to(directory).as_posix(), "bytes": file.stat().st_size, "sha256": sha256(file.read_bytes())})
+    return {"registeredVersion": safe_version, "installedApplicationSha256": actual_hash,
+            "matchesOldApplication": actual_hash == old_hash, "matchesExpectedNewApplication": actual_hash == expected_hash,
+            "expectedApplicationSha256AtPhase": expected_hash, "installedApplicationBytes": len(actual), "expectedApplicationBytes": len(expected),
+            "firstDifferentByteOffset": first_difference, "lastDifferentByteOffset": last_difference,
+            "differentOverlappingByteCount": different_count,
+            "observedFiles": files,
+            "sentinelBytesPreserved": {name: (directory / name).is_file() and (directory / name).read_bytes() == body for name, body in SENTINELS.items()}}
+
+
 def verify_retention(directory: Path, expected_binary: str) -> dict:
     for name, original in SENTINELS.items():
         file = directory / name
@@ -249,18 +282,25 @@ def main() -> int:
         verify_registration(registry_state(), install, "0.1.0")
         require((install / "primerswitch.exe").is_file(), "old-application-not-installed")
         old_binary_hash = sha256((install / "primerswitch.exe").read_bytes())
+        report["oldApplicationSha256"] = old_binary_hash
         require(old_binary_hash != report["newApplicationSha256"], "new-preview-binary-not-distinct")
         for name, body in SENTINELS.items():
             (install / name).write_bytes(body)
         config = json.loads((ROOT / "apps/desktop/src-tauri/tauri.conf.json").read_text(encoding="utf8"))
         phases = {}
+        report["phases"] = phases
+        report["sentinelSha256"] = {name: sha256(body) for name, body in SENTINELS.items()}
         for name in ("upgrade", "same-version-reinstall"):
             stage = name
             validate_fixture(fixture, base)
             require(sha256(package.read_bytes()) == report["newInstallerSha256"], "new-installer-changed-before-execution")
             run_silent(package, ["/S", "/UPDATE"], install)
-            verify_registration(registry_state(), install, config["version"])
-            phases[name] = verify_retention(install, report["newApplicationSha256"])
+            validate_fixture(fixture, base)
+            state = registry_state()
+            phases[name] = installation_evidence(install, state, old_binary_hash, binary)
+            verify_registration(state, install, config["version"])
+            require(phases[name]["expectedApplicationSha256AtPhase"] == report["newApplicationSha256"], "compiled-application-changed-during-qualification")
+            phases[name].update(verify_retention(install, report["newApplicationSha256"]))
         report.update({"oldApplicationSha256": old_binary_hash, "phases": phases, "sentinelSha256": {name: sha256(body) for name, body in SENTINELS.items()}, "ok": True})
     except (QualificationError, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
         report["failure"] = str(error) if isinstance(error, QualificationError) else "qualification-tool-or-input-failure"

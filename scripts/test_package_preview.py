@@ -357,6 +357,43 @@ ${EndIf}
                     packaging.verify_nsis_data_preservation(baseline + "\n" + harmful + "\n", destinations)
         self.rejects("installer-app-data-cleanup-not-update-guarded", lambda: packaging.verify_nsis_data_preservation(baseline.replace('${AndIf} $UpdateMode <> 1', ''), destinations))
 
+    def test_native_rpm_rejects_spec_macro_and_requirement_injection(self):
+        files = {"usr/bin/primerswitch": b"\x7fELFfixture"}
+        dependencies = ["libc.so.6(GLIBC_2.39)(64bit)", "libgtk-3.so.0()(64bit)",
+                        "/usr/share/dbus-1/services/org.freedesktop.secrets.service"]
+        spec = packaging.native_rpm_spec("0.1.1", dependencies, files)
+        self.assertIn("Version: 0.1.1", spec)
+        for dependency in ("%{lua:os.execute('id')}", "libc.so.6()\n%post\necho injected", "glibc >= 2.39"):
+            self.rejects("unsafe-native-rpm-requirement", lambda: packaging.native_rpm_spec("0.1.1", [dependency], files))
+        self.rejects("unreviewed-native-rpm-version", lambda: packaging.native_rpm_spec("0.1.1\n%post", dependencies, files))
+        self.rejects("unsafe-native-rpm-destination", lambda: packaging.native_rpm_spec("0.1.1", dependencies, {"usr/bin/../../escape/runtime-state.vault": b"bad"}))
+
+    def test_native_rpm_final_payload_must_equal_all_staged_bytes(self):
+        files = {"usr/bin/primerswitch": b"\x7fELFfresh native binary", "usr/lib/PrimerSwitch/THIRD_PARTY_NOTICES.txt": b"full license"}
+        expected = {name: digest(body) for name, body in files.items()}
+        packaging.verify_native_rpm_payload({"./" + name: body for name, body in files.items()}, expected)
+        for changed in (files | {"usr/bin/primerswitch": b"\x7fELFold substituted binary"},
+                        files | {"usr/lib/PrimerSwitch/unreviewed.so": b"helper"},
+                        {name: body for name, body in files.items() if not name.endswith(".txt")}):
+            self.rejects("native-rpm-payload-changed-after-staging", lambda: packaging.verify_native_rpm_payload(changed, expected))
+        self.rejects("unsafe-native-rpm-payload-path", lambda: packaging.verify_native_rpm_payload({"./" + name: body for name, body in files.items()} | files, expected))
+
+    def test_native_rpm_digest_failure_stops_before_payload_extraction(self):
+        # A known defective upstream RPM must not be accepted merely because
+        # its gzip payload happens to decompress or its notices look correct.
+        with patch.object(packaging, "executable", side_effect=lambda name: name), patch.object(packaging, "checked_output", side_effect=packaging.PackagingError("native-digest-failed")) as output:
+            self.rejects("native-digest-failed", lambda: packaging.verify_linux_package(self.root / "broken.rpm", "rpm", {}, [], {}))
+            self.assertEqual(output.call_args_list[0].args[0][1:3], ["--checksig", "--nosignature"])
+            self.assertEqual(output.call_count, 1)
+
+    def test_native_rpm_input_inventory_rejects_extra_resources_and_escaping_binary(self):
+        config = {"bundle": {"resources": {"foreign": "runtime-state.vault"}}}
+        binary = self.root / "target/release/primerswitch"
+        binary.parent.mkdir(parents=True)
+        binary.write_bytes(b"\x7fELFfixture")
+        self.rejects("unreviewed-native-rpm-resources", lambda: packaging.rpm_payload_inputs(config, binary))
+        self.rejects("unsafe-native-rpm-source", lambda: packaging.rpm_payload_inputs(config, self.root / "../foreign-binary"))
+
     def test_malformed_rpm_payload_is_rejected_without_extraction(self):
         self.rejects("invalid-rpm-payload", lambda: packaging.cpio_files(b"untrusted payload"))
 

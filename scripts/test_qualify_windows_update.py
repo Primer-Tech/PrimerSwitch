@@ -114,6 +114,28 @@ class GuardTests(unittest.TestCase):
             with self.assertRaises(qualification.QualificationError):
                 qualification.verify_retention(root, digest)
 
+    def test_hash_failure_diagnostics_distinguish_stale_binary_without_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            install = root / "installation"
+            install.mkdir()
+            old_body = b"MZ historical installed application"
+            (install / "primerswitch.exe").write_bytes(old_body)
+            expected = root / "compiled-new.exe"
+            expected.write_bytes(b"MZ updated compiled application")
+            for name, body in qualification.SENTINELS.items():
+                (install / name).write_bytes(body)
+            state = {qualification.REGISTRY_KEYS[0]: {"DisplayVersion": "0.1.1"}}
+            evidence = qualification.installation_evidence(install, state, qualification.sha256(old_body), expected)
+            self.assertEqual(evidence["registeredVersion"], "0.1.1")
+            self.assertTrue(evidence["matchesOldApplication"])
+            self.assertFalse(evidence["matchesExpectedNewApplication"])
+            self.assertTrue(all(evidence["sentinelBytesPreserved"].values()))
+            self.assertIsNotNone(evidence["firstDifferentByteOffset"])
+            self.assertNotIn(str(root), json.dumps(evidence))
+            with self.assertRaisesRegex(qualification.QualificationError, "installed-application-hash-mismatch"):
+                qualification.verify_retention(install, qualification.sha256(expected.read_bytes()))
+
     def test_registry_paths_must_belong_to_the_fixture(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()

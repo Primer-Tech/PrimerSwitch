@@ -172,6 +172,9 @@ describe('desktop workflows', () => {
   it('disables every mutation in demo while keeping details readable', async () => {
     const { call } = setup(snapshot({ demo: true }));
     await screen.findByText('Preview');
+    expect(
+      screen.getByRole('status', { name: 'Demo data · actions are disabled.' }),
+    ).toBeVisible();
     expect(screen.getByRole('button', { name: /Add account/ })).toBeDisabled();
     expect(screen.getByRole('button', { name: 'Switch' })).toBeDisabled();
     const dialog = await details();

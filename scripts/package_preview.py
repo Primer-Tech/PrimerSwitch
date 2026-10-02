@@ -8,6 +8,7 @@ import io
 import platform
 import stat
 import tarfile
+import tempfile
 import tomllib
 from pathlib import Path
 import re
@@ -306,7 +307,7 @@ def checked_output(arguments: list[str]) -> bytes:
     # Fixed tool identity only: do not include arbitrary arguments, stderr or
     # exception messages in packaging diagnostics.
     tool = Path(arguments[0]).stem.lower()
-    CURRENT_STAGE = "inspection-tool-" + (tool if tool in {"git", "rpm", "rpm2cpio", "readelf", "dpkg-deb"} else "other")
+    CURRENT_STAGE = "inspection-tool-" + (tool if tool in {"git", "rpm", "rpmbuild", "rpm2cpio", "readelf", "dpkg-deb"} else "other")
     try:
         return subprocess.run(arguments, cwd=ROOT, capture_output=True, check=True).stdout
     except subprocess.CalledProcessError as error:
@@ -371,7 +372,7 @@ def verify_linux_payload(files: dict[str, bytes], evidence: dict) -> None:
         raise PackagingError("linux-package-executable-missing-or-ambiguous")
 
 
-def verify_linux_package(path: Path, bundle: str, evidence: dict, runtime_dependencies: list[str]) -> dict:
+def verify_linux_package(path: Path, bundle: str, evidence: dict, runtime_dependencies: list[str], native_rpm: dict | None = None) -> dict:
     global CURRENT_STAGE
     if bundle == "deb":
         dependencies = checked_output([executable("dpkg-deb"), "-f", str(path), "Depends"]).decode("utf8").strip()
@@ -390,6 +391,9 @@ def verify_linux_package(path: Path, bundle: str, evidence: dict, runtime_depend
                     files[entry.name] = archive.extractfile(entry).read()
     else:
         rpm = executable("rpm")
+        checked_output([rpm, "--checksig", "--nosignature", str(path)])
+        if checked_output([rpm, "-qp", "--scripts", "--triggers", "--filetriggers", str(path)]).strip():
+            raise PackagingError("unreviewed-native-rpm-scriptlets")
         dependencies = checked_output([rpm, "-qp", "--requires", str(path)]).decode("utf8").strip()
         architecture = checked_output([rpm, "-qp", "--queryformat", "%{ARCH}", str(path)]).decode("utf8").strip()
         if architecture != "x86_64":
@@ -397,9 +401,26 @@ def verify_linux_package(path: Path, bundle: str, evidence: dict, runtime_depend
         payload = checked_output([executable("rpm2cpio"), str(path)])
         CURRENT_STAGE = "linux-rpm-payload-parsing"
         files = cpio_files(payload)
+        if not native_rpm:
+            raise PackagingError("native-rpm-staging-provenance-missing")
+        identity = checked_output([rpm, "-qp", "--queryformat", "%{NAME}\n%{VERSION}\n%{RELEASE}", str(path)]).decode("ascii")
+        config = json.loads((DESKTOP / "src-tauri/tauri.conf.json").read_text(encoding="utf8"))
+        if identity != "primer-switch\n" + config["version"] + "\n1":
+            raise PackagingError("native-rpm-package-identity-mismatch")
+        verify_native_rpm_payload(files, native_rpm["payloadSha256"])
+        records = checked_output([rpm, "-qp", "--queryformat", "[%{FILENAMES}|%{FILEMODES:octal}|%{FILEUSERNAME}|%{FILEGROUPNAME}\n]", str(path)]).decode("utf8")
+        expected_records = {"/" + name: (mode, "root", "root") for name, mode in native_rpm["payloadModes"].items()}
+        actual_records = {}
+        for line in records.splitlines():
+            name, mode, user, group = line.split("|")
+            if name in actual_records:
+                raise PackagingError("duplicate-native-rpm-file-metadata")
+            actual_records[name] = (int(mode, 8) & 0o7777, user, group)
+        if actual_records != expected_records:
+            raise PackagingError("native-rpm-file-permissions-or-ownership-changed")
     CURRENT_STAGE = "linux-runtime-dependencies-and-bundled-evidence"
     for dependency in runtime_dependencies:
-        if dependency not in dependencies:
+        if dependency not in (dependencies.splitlines() if bundle == "rpm" else dependencies):
             raise PackagingError("linux-runtime-dependency-missing")
     verify_linux_payload(files, evidence)
     return {"architecture": architecture, "declaredRuntimeDependencies": dependencies,
@@ -408,6 +429,166 @@ def verify_linux_package(path: Path, bundle: str, evidence: dict, runtime_depend
             "secretServiceRequirement": "Unlocked org.freedesktop.secrets on the desktop session bus; GNOME Keyring or compatible provider. KeePassXC requires Secret Service integration enabled.",
             "installedDesktopQualified": False}
 
+
+
+def rpm_payload_inputs(config: dict, binary: Path) -> tuple[dict[str, bytes], dict[str, int], dict[str, str]]:
+    """Read only reviewed native inputs; never consume a generated/broken RPM."""
+    files, modes, source_hashes = {}, {}, {}
+
+    def source(path: Path, destination: str, mode: int = 0o644) -> bytes:
+        resolved = path.resolve()
+        if path.is_symlink() or not resolved.is_relative_to(ROOT.resolve()) or not resolved.is_file():
+            raise PackagingError("unsafe-native-rpm-source")
+        body = resolved.read_bytes()
+        if destination in files:
+            raise PackagingError("duplicate-native-rpm-destination")
+        files[destination], modes[destination] = body, mode
+        source_hashes[resolved.relative_to(ROOT.resolve()).as_posix()] = hashlib.sha256(body).hexdigest()
+        return body
+
+    source(binary, "usr/bin/primerswitch", 0o755)
+    expected_resources = {
+        "../../../.artifacts/THIRD_PARTY_NOTICES.txt": "THIRD_PARTY_NOTICES.txt",
+        "../../../.artifacts/THIRD_PARTY_REPORT.json": "THIRD_PARTY_REPORT.json",
+        "../../../.artifacts/THIRD_PARTY_METADATA.json": "THIRD_PARTY_METADATA.json",
+        "../../../docs/legal/brand/Comfortaa-OFL.txt": "brand-notices/Comfortaa-OFL.txt",
+        "../../../docs/legal/brand/manifest.json": "brand-notices/manifest.json",
+    }
+    if config["bundle"].get("resources") != expected_resources:
+        raise PackagingError("unreviewed-native-rpm-resources")
+    for name, destination in expected_resources.items():
+        source(DESKTOP / "src-tauri" / name, "usr/lib/PrimerSwitch/" + destination)
+    source(ROOT / "LICENSE", "usr/share/licenses/primer-switch/LICENSE")
+    png_count = 0
+    for name in config["bundle"]["icon"]:
+        if not name.endswith(".png"):
+            continue
+        path = DESKTOP / "src-tauri" / name
+        # PNG signature + first IHDR dimensions; native icon inputs are already
+        # generated/reviewed, no shell command or third-party image helper needed.
+        resolved = path.resolve()
+        if path.is_symlink() or not resolved.is_relative_to(ROOT.resolve()) or not resolved.is_file():
+            raise PackagingError("unsafe-native-rpm-source")
+        body = resolved.read_bytes()
+        if body[:16] != b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" or len(body) < 33:
+            raise PackagingError("invalid-native-rpm-icon")
+        width, height = int.from_bytes(body[16:20], "big"), int.from_bytes(body[20:24], "big")
+        if width != height or width not in {32, 128, 256}:
+            raise PackagingError("unreviewed-native-rpm-icon-dimensions")
+        source(path, f"usr/share/icons/hicolor/{width}x{height}/apps/PrimerSwitch.png")
+        png_count += 1
+    if png_count != 3:
+        raise PackagingError("native-rpm-icon-set-incomplete")
+    # Fixed executable and desktop identity preserve launch/storage behavior.
+    desktop = ("[Desktop Entry]\nType=Application\nName=PrimerSwitch\n"
+               "Comment=Claude account switching and quota monitoring\n"
+               "Exec=primerswitch\nIcon=PrimerSwitch\nTerminal=false\nCategories=Development;\n")
+    destination = "usr/share/applications/PrimerSwitch.desktop"
+    files[destination], modes[destination] = desktop.encode("utf8"), 0o644
+    return files, modes, source_hashes
+
+
+def native_rpm_spec(version: str, dependencies: list[str], files: dict[str, bytes]) -> str:
+    # Reject spec/macro/shell injection. Requirement syntax is limited to the
+    # reviewed SONAME/version capabilities and one Secret Service provider file.
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+        raise PackagingError("unreviewed-native-rpm-version")
+    for dependency in dependencies:
+        if not re.fullmatch(r"(?:[A-Za-z0-9_.+-]+\.so(?:\.[0-9]+)*(?:\([A-Za-z0-9_.+-]*\))?\(64bit\)|/usr/share/dbus-1/services/org\.freedesktop\.secrets\.service)", dependency):
+            raise PackagingError("unsafe-native-rpm-requirement")
+    for name in files:
+        if not re.fullmatch(r"usr/[A-Za-z0-9_./+-]+", name) or ".." in name.split("/"):
+            raise PackagingError("unsafe-native-rpm-destination")
+    requires = "\n".join("Requires: " + value for value in sorted(set(dependencies)))
+    entries = "\n".join("/" + value for value in sorted(files))
+    # Build-only commands unpack our regular-file-only tar. No install/uninstall
+    # scriptlets, triggers, network access or user-data paths are generated.
+    return f"""%global _build_id_links none
+%global debug_package %{{nil}}
+%global __os_install_post %{{nil}}
+%global _binary_payload w6.gzdio
+Name: primer-switch
+Version: {version}
+Release: 1
+Summary: Claude account switching and quota monitoring
+License: MIT
+Vendor: Primer-Tech
+BuildArch: x86_64
+AutoReqProv: no
+Source0: payload.tar
+{requires}
+
+%description
+PrimerSwitch native unsigned preview. Requires an unlocked Secret Service
+provider on the desktop session bus. RPM installation remains unqualified.
+
+%prep
+%build
+%install
+install -d "%{{buildroot}}"
+tar -xf "%{{SOURCE0}}" -C "%{{buildroot}}"
+
+%files
+%defattr(-,root,root,-)
+{entries}
+"""
+
+
+def verify_native_rpm_payload(files: dict[str, bytes], expected: dict[str, str]) -> None:
+    actual = {}
+    for name, body in files.items():
+        normalized = name.removeprefix("./")
+        if normalized in actual or normalized.startswith("/") or ".." in normalized.split("/"):
+            raise PackagingError("unsafe-native-rpm-payload-path")
+        actual[normalized] = hashlib.sha256(body).hexdigest()
+    if actual != expected:
+        raise PackagingError("native-rpm-payload-changed-after-staging")
+
+
+def build_native_rpm(config: dict, dependencies: list[str], binary: Path) -> dict:
+    global CURRENT_STAGE
+    CURRENT_STAGE = "native-rpm-input-staging"
+    files, modes, sources = rpm_payload_inputs(config, binary)
+    expected = {name: hashlib.sha256(body).hexdigest() for name, body in files.items()}
+    spec = native_rpm_spec(config["version"], dependencies, files)
+    spec_path = ARTIFACTS / "primerswitch-preview.spec"
+    if spec_path.is_symlink() or not spec_path.resolve().is_relative_to(ROOT.resolve()):
+        raise PackagingError("unsafe-native-rpm-spec-path")
+    spec_path.write_text(spec, encoding="utf8", newline="\n")
+    rpmbuild = executable("rpmbuild")
+    tool_version = checked_output([rpmbuild, "--version"]).decode("ascii").strip()
+    if not re.fullmatch(r"RPM version [0-9]+(?:\.[0-9]+)+", tool_version):
+        raise PackagingError("native-rpm-tool-version-undetected")
+    with tempfile.TemporaryDirectory(prefix="primerswitch-rpmbuild-", dir=ARTIFACTS) as temporary:
+        top = Path(temporary).resolve()
+        # These paths appear in native RPM macro expansions/build-only commands.
+        if any(value in str(top) for value in ('%', '"', "'", "\\", "\n", "\r", "`", "$")):
+            raise PackagingError("unsafe-native-rpm-build-directory")
+        for name in ("BUILD", "BUILDROOT", "RPMS", "SOURCES", "SPECS", "SRPMS", "tmp"):
+            (top / name).mkdir()
+        source_tar = top / "SOURCES/payload.tar"
+        with tarfile.open(source_tar, "w", format=tarfile.USTAR_FORMAT) as archive:
+            for name, body in sorted(files.items()):
+                entry = tarfile.TarInfo(name)
+                entry.size, entry.mode, entry.uid, entry.gid = len(body), modes[name], 0, 0
+                entry.uname = entry.gname = "root"
+                archive.addfile(entry, io.BytesIO(body))
+        source_tar_hash = hashlib.sha256(source_tar.read_bytes()).hexdigest()
+        CURRENT_STAGE = "native-rpm-build"
+        command([rpmbuild, "-bb", "--define", f"_topdir {top}", "--define", f"_tmppath {top / 'tmp'}", str(spec_path)])
+        if spec_path.read_bytes() != spec.encode() or hashlib.sha256(source_tar.read_bytes()).hexdigest() != source_tar_hash:
+            raise PackagingError("native-rpm-build-input-changed")
+        outputs = list((top / "RPMS").rglob("*.rpm"))
+        if len(outputs) != 1 or outputs[0].is_symlink() or not outputs[0].is_file():
+            raise PackagingError("native-rpm-output-missing-or-ambiguous")
+        destination = output_directory("rpm") / f"PrimerSwitch-{config['version']}-1.x86_64.rpm"
+        shutil.copyfile(outputs[0], destination)
+    if sources != hashes(tuple(sources), ROOT):
+        raise PackagingError("native-rpm-source-changed-during-build")
+    return {"producer": "native-rpmbuild", "toolVersion": tool_version,
+            "specPath": spec_path.relative_to(ROOT).as_posix(), "specSha256": hashlib.sha256(spec.encode()).hexdigest(),
+            "sourceTarSha256": source_tar_hash, "sourceInputSha256": sources, "payloadSha256": expected,
+            "payloadModes": modes, "maintainerScriptlets": False, "elfStrippingDisabled": True}
 
 def rpm_elf_requirements(dynamic: str, versions: str) -> list[str]:
     # RPM's Tauri bundler stores explicit capabilities; it does not infer ELF
@@ -472,7 +653,6 @@ def main() -> int:
     config_hashes = hashes(CONFIG_FILES, ROOT)
     notices_hash = hashes(("docs/legal/packaging/manifest.json",), ROOT)["docs/legal/packaging/manifest.json"] if installer_notices else None
     overlay = preview_config(args.bundle, installer_notices)
-    cli = [node, str(DESKTOP / "node_modules" / "@tauri-apps" / "cli" / "tauri.js")]
     arguments = [node, str(DESKTOP / "node_modules" / "@tauri-apps" / "cli" / "tauri.js"),
                  "build", "--bundles", args.bundle, "--config", "src-tauri/tauri.preview.conf.json",
                  "--config", json.dumps(overlay), "--", "--locked", "--target-dir", str(ROOT / "target")]
@@ -480,6 +660,7 @@ def main() -> int:
         arguments.append("--offline")
     config = json.loads((DESKTOP / "src-tauri/tauri.conf.json").read_text(encoding="utf8"))
     runtime_dependencies = config["bundle"]["linux"].get(args.bundle, {}).get("depends", [])
+    native_rpm = None
     if args.bundle == "rpm":
         # Build first so RPM requirements come from the same successful native
         # executable that will be packaged. No pre-existing binary is trusted.
@@ -490,8 +671,7 @@ def main() -> int:
         versions = checked_output([executable("readelf"), "--version-info", str(binary)]).decode("utf8")
         runtime_dependencies = sorted(set(runtime_dependencies + rpm_elf_requirements(dynamic, versions)))
         overlay["bundle"]["linux"] = {"rpm": {"depends": runtime_dependencies}}
-        command(cli + ["bundle", "--bundles", "rpm", "--config", "src-tauri/tauri.preview.conf.json",
-                       "--config", json.dumps(overlay)], cwd=DESKTOP)
+        native_rpm = build_native_rpm(effective_config, runtime_dependencies, binary)
     else:
         command(arguments, cwd=DESKTOP)
     if args.bundle == "nsis":
@@ -520,7 +700,9 @@ def main() -> int:
     if args.bundle in {"deb", "rpm"}:
         bundled_evidence = evidence_hashes | {"Comfortaa-OFL.txt": brand_notices["license"]["sha256"],
                                                "manifest.json": config_hashes["docs/legal/brand/manifest.json"]}
-        manifest["linuxPackageVerification"] = verify_linux_package(paths[0], args.bundle, bundled_evidence, runtime_dependencies)
+        manifest["linuxPackageVerification"] = verify_linux_package(paths[0], args.bundle, bundled_evidence, runtime_dependencies, native_rpm)
+        if native_rpm:
+            manifest["nativeRpmBuild"] = native_rpm
         manifest["buildHost"]["distribution"] = distribution
         manifest["linuxBuildBaseline"] = "Ubuntu 24.04 x86_64 / glibc >= 2.39; RPM install compatibility requires separate native qualification"
     (ARTIFACTS / "package-manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf8")

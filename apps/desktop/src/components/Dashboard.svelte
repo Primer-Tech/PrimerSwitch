@@ -108,7 +108,11 @@
         >
       </div>
     </header>
-    {#if snapshot?.demo}<div class="demo-notice" role="status">
+    {#if snapshot?.demo}<div
+        class="demo-notice"
+        role="status"
+        aria-label={t($language, 'demoNotice')}
+      >
         <strong>{t($language, 'preview')}</strong><span
           >{t($language, 'demoNotice')}</span
         >

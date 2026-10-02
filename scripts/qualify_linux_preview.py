@@ -171,15 +171,11 @@ def window_details() -> dict | None:
             # Readiness polling waits; the final acceptance still needs both.
             if "Map State: IsViewable" not in details:
                 continue
-            absolute_x = re.search(r"Absolute upper-left X:\s*(-?\d+)", details)
-            absolute_y = re.search(r"Absolute upper-left Y:\s*(-?\d+)", details)
             width = int(re.search(r"Width: (\d+)", details).group(1))
             height = int(re.search(r"Height: (\d+)", details).group(1))
             if width < 560 or height < 620:
                 continue
-            return {"id": match.group(1), "title": match.group(2), "width": width, "height": height,
-                    "x": int(absolute_x.group(1)) if absolute_x else 0,
-                    "y": int(absolute_y.group(1)) if absolute_y else 0}
+            return {"id": match.group(1), "title": match.group(2), "width": width, "height": height}
     return None
 
 

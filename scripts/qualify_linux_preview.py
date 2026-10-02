@@ -244,6 +244,27 @@ def arrow_provider(tab: dict, direction: str, pyatspi) -> None:
         pyatspi.Registry.generateKeyboardEvent(0xff51 if direction == "left" else 0xff53, None, pyatspi.KEY_SYM)
 
 
+def press_escape(pyatspi) -> None:
+    """Dismiss the active HTML dialog through the real window keyboard path."""
+    if shutil.which("xdotool"):
+        output(["xdotool", "key", "--clearmodifiers", "Escape"], timeout=5)
+    else:
+        pyatspi.Registry.generateKeyboardEvent(0xff1b, None, pyatspi.KEY_SYM)
+
+
+def wait_for_dialog_close(pyatspi, glib, application) -> list[dict]:
+    """Wait for Svelte's dialog teardown, retrying Escape if WebKit defers it."""
+    deadline = time.monotonic() + 8
+    while time.monotonic() < deadline:
+        require(application.poll() is None, "installed-demo-exited-during-dialog-close")
+        rows = observe_accessibility_desktop(pyatspi, glib)
+        if not any(row["role"] == "dialog" and row["name"] == "Personal Codex" for row in rows):
+            return rows
+        press_escape(pyatspi)
+        time.sleep(0.25)
+    raise QualificationError("codex-read-only-details-close-timeout")
+
+
 def wait_for_provider(pyatspi, glib, application, provider: str) -> list[dict]:
     deadline = time.monotonic() + 20
     while time.monotonic() < deadline:
@@ -386,6 +407,8 @@ def worker(directory: Path) -> int:
             time.sleep(0.25)
         else:
             raise QualificationError("codex-read-only-details-timeout")
+        rows = wait_for_dialog_close(pyatspi, GLib, application)
+        require(not any(row["role"] == "dialog" and row["name"] == "Personal Codex" for row in rows), "codex-read-only-details-close-timeout")
         rows = wait_for_provider(pyatspi, GLib, application, "codex")
         arrow_provider(provider_tab(rows, "codex", selected=True), "left", pyatspi)
         active_provider = "claude"

@@ -338,14 +338,14 @@ impl ActiveStore {
     fn read_raw(&self) -> Result<RawSnapshot> {
         self.context()?;
         #[cfg(target_os = "macos")]
-        if self.native {
-            if let Some(auth) = mac::read_current()? {
-                return Ok(RawSnapshot {
-                    auth: Some(auth),
-                    config: files::read_optional(&self.paths.global_config_file)?,
-                    backend: Backend::Keychain,
-                });
-            }
+        if self.native
+            && let Some(auth) = mac::read_current()?
+        {
+            return Ok(RawSnapshot {
+                auth: Some(auth),
+                config: files::read_optional(&self.paths.global_config_file)?,
+                backend: Backend::Keychain,
+            });
         }
         #[cfg(not(target_os = "macos"))]
         let _ = self.native;

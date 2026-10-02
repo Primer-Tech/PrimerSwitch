@@ -50,6 +50,9 @@ pub(crate) fn protect_file(path: &Path, directory: bool) -> Result<()> {
         let sid = String::from_utf16_lossy(std::slice::from_raw_parts(sid_string, len));
         LocalFree(sid_string.cast());
         let inherit = if directory { "OICI" } else { "" };
+        // Preserve existing ownership: this helper also protects CLI-owned files.
+        // The explicit DACL is current process user plus SYSTEM, independently of
+        // whether an elevated process has Administrators as its default owner.
         let descriptor = format!("D:P(A;{inherit};FA;;;{sid})(A;{inherit};FA;;;SY)");
         let wide: Vec<u16> = descriptor.encode_utf16().chain(Some(0)).collect();
         let mut security = ptr::null_mut();
@@ -157,18 +160,23 @@ fn dpapi(bytes: &[u8], encrypt: bool) -> Result<Vec<u8>> {
 pub(crate) mod tests {
     use super::*;
     use std::{os::windows::ffi::OsStrExt, ptr};
-    use windows_sys::Win32::Security::{
-        ACCESS_ALLOWED_ACE, CreateWellKnownSid, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
-        GetFileSecurityW, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
-        GetSecurityDescriptorOwner, OWNER_SECURITY_INFORMATION, SE_DACL_PROTECTED,
-        WinLocalSystemSid,
+    use windows_sys::Win32::{
+        Foundation::CloseHandle,
+        Security::{
+            ACCESS_ALLOWED_ACE, CreateWellKnownSid, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
+            GetFileSecurityW, GetLengthSid, GetSecurityDescriptorControl,
+            GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, GetTokenInformation,
+            OWNER_SECURITY_INFORMATION, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER, TokenUser,
+            WinLocalSystemSid,
+        },
+        System::Threading::{GetCurrentProcess, OpenProcessToken},
     };
 
     pub(crate) fn assert_private_acl(path: &Path, directory: bool) {
         let filename: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
         unsafe {
             let mut needed = 0;
-            let info = DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION;
+            let info = DACL_SECURITY_INFORMATION;
             GetFileSecurityW(filename.as_ptr(), info, ptr::null_mut(), 0, &mut needed);
             let mut buffer = vec![0usize; (needed as usize).div_ceil(size_of::<usize>())];
             let security = buffer.as_mut_ptr().cast();
@@ -193,11 +201,27 @@ pub(crate) mod tests {
             assert_ne!(present, 0);
             assert!(!dacl.is_null());
             assert_eq!((*dacl).AceCount, 2);
-            let mut owner = ptr::null_mut();
+            // Compare the first ACE directly with TokenUser. An elevated token's
+            // default file owner can be Administrators, which is not an ACL grant.
+            let mut token = ptr::null_mut();
             assert_ne!(
-                GetSecurityDescriptorOwner(security, &mut owner, &mut defaulted),
+                OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token),
                 0
             );
+            let mut token_needed = 0;
+            GetTokenInformation(token, TokenUser, ptr::null_mut(), 0, &mut token_needed);
+            let mut token_buffer =
+                vec![0usize; (token_needed as usize).div_ceil(size_of::<usize>())];
+            let token_ok = GetTokenInformation(
+                token,
+                TokenUser,
+                token_buffer.as_mut_ptr().cast(),
+                token_needed,
+                &mut token_needed,
+            );
+            CloseHandle(token);
+            assert_ne!(token_ok, 0);
+            let token_user = &*(token_buffer.as_ptr().cast::<TOKEN_USER>());
             let mut system_sid = [0usize; 16];
             let mut system_len = size_of_val(&system_sid) as u32;
             assert_ne!(
@@ -217,12 +241,68 @@ pub(crate) mod tests {
                 assert_eq!(ace.Header.AceFlags, if directory { 3 } else { 0 }); // inheritance, never inherited
                 let sid = ptr::addr_of!(ace.SidStart).cast_mut().cast();
                 let expected = if index == 0 {
-                    owner
+                    token_user.User.Sid
                 } else {
                     system_sid.as_mut_ptr().cast()
                 };
                 assert_ne!(EqualSid(sid, expected), 0);
             }
         }
+    }
+
+    fn file_owner(path: &Path) -> Vec<u8> {
+        let filename: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        unsafe {
+            let mut needed = 0;
+            GetFileSecurityW(
+                filename.as_ptr(),
+                OWNER_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                0,
+                &mut needed,
+            );
+            let mut buffer = vec![0usize; (needed as usize).div_ceil(size_of::<usize>())];
+            let security = buffer.as_mut_ptr().cast();
+            assert_ne!(
+                GetFileSecurityW(
+                    filename.as_ptr(),
+                    OWNER_SECURITY_INFORMATION,
+                    security,
+                    needed,
+                    &mut needed
+                ),
+                0
+            );
+            let mut owner = ptr::null_mut();
+            let mut defaulted = 0;
+            assert_ne!(
+                GetSecurityDescriptorOwner(security, &mut owner, &mut defaulted),
+                0
+            );
+            std::slice::from_raw_parts(owner.cast::<u8>(), GetLengthSid(owner) as usize).to_vec()
+        }
+    }
+
+    #[test]
+    fn protecting_existing_fixtures_preserves_owners_and_private_replacement() {
+        let root = crate::files::test_root();
+        let directory = root.path().join("existing-cli-directory");
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("fixture.json");
+        std::fs::write(&path, b"original-fixture").unwrap();
+        let directory_owner = file_owner(&directory);
+        let file_owner_before = file_owner(&path);
+        // On an elevated CI runner these default owners can be Administrators.
+        protect_file(&directory, true).unwrap();
+        protect_file(&path, false).unwrap();
+        assert_eq!(file_owner(&directory), directory_owner);
+        assert_eq!(file_owner(&path), file_owner_before);
+        assert_private_acl(&directory, true);
+        assert_private_acl(&path, false);
+        crate::files::atomic_write(&path, b"replacement-fixture").unwrap();
+        assert_eq!(file_owner(&directory), directory_owner);
+        assert_eq!(file_owner(&path), file_owner_before);
+        assert_private_acl(&path, false);
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement-fixture");
     }
 }

@@ -304,7 +304,7 @@ def wait_for_provider(pyatspi, glib, application, provider: str, *, timeout: flo
 
 
 def navigate_provider(pyatspi, glib, application, rows: list[dict], current: str, target: str,
-                      *, window_id: str | None = None) -> list[dict]:
+                      *, window_id: str | None = None) -> tuple[list[dict], str]:
     """Navigate with keyboard transports, retrying only while target is not selected."""
     direction = "right" if target == "codex" else "left"
     transports = ["xdotool", "xdotool-window", "atspi"] if shutil.which("xdotool") else ["atspi"]
@@ -315,7 +315,7 @@ def navigate_provider(pyatspi, glib, application, rows: list[dict], current: str
             arrow_provider(provider_tab(current_rows, current, selected=True), direction, pyatspi,
                            window_id=window_id, transport=transport)
             try:
-                return wait_for_provider(pyatspi, glib, application, target, timeout=5)
+                return wait_for_provider(pyatspi, glib, application, target, timeout=5), transport
             except QualificationError as error:
                 # A selected target can need a little more time to expose its
                 # content; do not send a second Arrow and toggle it back.
@@ -324,12 +324,21 @@ def navigate_provider(pyatspi, glib, application, rows: list[dict], current: str
                     provider_tab(observed, target, selected=True)
                 except QualificationError:
                     raise error
-                return wait_for_provider(pyatspi, glib, application, target)
+                return wait_for_provider(pyatspi, glib, application, target), transport
         except Exception as error:
             last_error = error
-    if isinstance(last_error, QualificationError):
-        raise last_error
-    raise QualificationError("provider-keyboard-navigation-timeout") from last_error
+    # WebKitGTK can retain a stale X11 focus owner after a modal has closed.
+    # The tab's native action is the same user-visible selection, and gives the
+    # installed-package check a deterministic recovery without touching state.
+    try:
+        current_rows = wait_for_provider(pyatspi, glib, application, current, timeout=5)
+        target_tab = provider_tab(current_rows, target, selected=False)
+        require(target_tab["accessible"].queryAction().doAction(0), "provider-tab-action-failed")
+        return wait_for_provider(pyatspi, glib, application, target), "native-click"
+    except Exception as error:
+        if isinstance(error, QualificationError):
+            raise error
+        raise QualificationError("provider-keyboard-navigation-timeout") from (last_error or error)
 
 
 def accessible_section_content(rows: list[dict], label: str) -> str:
@@ -427,7 +436,7 @@ def worker(directory: Path) -> int:
         # Switch providers through the real keyboard path, inspect Codex's
         # native in-memory fixture, then return to retain Claude/Settings checks.
         active_provider = "codex"
-        rows = navigate_provider(pyatspi, GLib, application, rows, "claude", "codex", window_id=window["id"])
+        rows, first_provider_transport = navigate_provider(pyatspi, GLib, application, rows, "claude", "codex", window_id=window["id"])
         report["codexDemoVerification"] = verify_codex_demo_rows(rows)
         # Allow the provider replacement to reach a compositor frame; require
         # its dark PNG to differ from the already accepted Claude PNG as well.
@@ -459,8 +468,10 @@ def worker(directory: Path) -> int:
         # the provider tab for the reverse keyboard traversal.
         time.sleep(0.5)
         active_provider = "claude"
-        rows = navigate_provider(pyatspi, GLib, application, rows, "codex", "claude", window_id=window["id"])
-        report["checks"]["providerTabsArrowKeyboardRoundTrip"] = True
+        rows, second_provider_transport = navigate_provider(pyatspi, GLib, application, rows, "codex", "claude", window_id=window["id"])
+        report["providerNavigationTransports"] = [first_provider_transport, second_provider_transport]
+        report["checks"]["providerTabsArrowKeyboardRoundTrip"] = "native-click" not in {first_provider_transport, second_provider_transport}
+        report["checks"]["providerTabsNativeRoundTrip"] = True
         settings = [row for row in rows if row["name"] == "Open settings" and row["role"] in {"push button", "button"}]
         require(len(settings) == 1 and settings[0]["enabled"], "settings-navigation-unavailable")
         require(settings[0]["accessible"].queryAction().doAction(0), "settings-navigation-action-failed")

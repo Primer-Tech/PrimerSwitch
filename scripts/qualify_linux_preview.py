@@ -228,9 +228,11 @@ def provider_tab(rows: list[dict], provider: str, *, selected: bool) -> dict:
     return tabs[0]
 
 
-def arrow_provider(tab: dict, direction: str, pyatspi, *, window_id: str | None = None) -> None:
+def arrow_provider(tab: dict, direction: str, pyatspi, *, window_id: str | None = None,
+                   transport: str = "xdotool") -> None:
     require(direction in {"left", "right"}, "invalid-provider-arrow")
-    if window_id and shutil.which("xdotool"):
+    use_xdotool = transport.startswith("xdotool") and bool(shutil.which("xdotool"))
+    if window_id and use_xdotool:
         # Bring the native window forward before AT-SPI assigns focus to the
         # tab; doing this afterwards can reset WebKit's active DOM element.
         output(["xdotool", "windowfocus", window_id], timeout=5)
@@ -250,8 +252,12 @@ def arrow_provider(tab: dict, direction: str, pyatspi, *, window_id: str | None 
     # AT-SPI remains the hermetic fallback when the helper is unavailable.
     time.sleep(0.15)
     key = "Left" if direction == "left" else "Right"
-    if shutil.which("xdotool"):
-        output(["xdotool", "key", "--clearmodifiers", key], timeout=5)
+    if use_xdotool:
+        arguments = ["xdotool", "key"]
+        if transport == "xdotool-window" and window_id:
+            arguments.extend(["--window", window_id])
+        arguments.extend(["--clearmodifiers", key])
+        output(arguments, timeout=5)
     else:
         # KEY_SYM interprets the value as an X11 keysym. This still exercises
         # the real ArrowLeft/ArrowRight DOM keyboard behavior.
@@ -279,8 +285,8 @@ def wait_for_dialog_close(pyatspi, glib, application) -> list[dict]:
     raise QualificationError("codex-read-only-details-close-timeout")
 
 
-def wait_for_provider(pyatspi, glib, application, provider: str) -> list[dict]:
-    deadline = time.monotonic() + 20
+def wait_for_provider(pyatspi, glib, application, provider: str, *, timeout: float = 20) -> list[dict]:
+    deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         require(application.poll() is None, "installed-demo-exited-during-provider-navigation")
         rows = observe_accessibility_desktop(pyatspi, glib)
@@ -295,6 +301,35 @@ def wait_for_provider(pyatspi, glib, application, provider: str) -> list[dict]:
             pass
         time.sleep(0.25)
     raise QualificationError("provider-keyboard-navigation-timeout")
+
+
+def navigate_provider(pyatspi, glib, application, rows: list[dict], current: str, target: str,
+                      *, window_id: str | None = None) -> list[dict]:
+    """Navigate with keyboard transports, retrying only while target is not selected."""
+    direction = "right" if target == "codex" else "left"
+    transports = ["xdotool", "xdotool-window", "atspi"] if shutil.which("xdotool") else ["atspi"]
+    last_error: Exception | None = None
+    for transport in transports:
+        try:
+            current_rows = wait_for_provider(pyatspi, glib, application, current, timeout=5)
+            arrow_provider(provider_tab(current_rows, current, selected=True), direction, pyatspi,
+                           window_id=window_id, transport=transport)
+            try:
+                return wait_for_provider(pyatspi, glib, application, target, timeout=5)
+            except QualificationError as error:
+                # A selected target can need a little more time to expose its
+                # content; do not send a second Arrow and toggle it back.
+                observed = observe_accessibility_desktop(pyatspi, glib)
+                try:
+                    provider_tab(observed, target, selected=True)
+                except QualificationError:
+                    raise error
+                return wait_for_provider(pyatspi, glib, application, target)
+        except Exception as error:
+            last_error = error
+    if isinstance(last_error, QualificationError):
+        raise last_error
+    raise QualificationError("provider-keyboard-navigation-timeout") from last_error
 
 
 def accessible_section_content(rows: list[dict], label: str) -> str:
@@ -391,11 +426,8 @@ def worker(directory: Path) -> int:
                                  "automationPanelPresent": True, "demoMutationButtonsDisabled": True})
         # Switch providers through the real keyboard path, inspect Codex's
         # native in-memory fixture, then return to retain Claude/Settings checks.
-        claude_tab = provider_tab(rows, "claude", selected=True)
-        provider_tab(rows, "codex", selected=False)
-        arrow_provider(claude_tab, "right", pyatspi, window_id=window["id"])
         active_provider = "codex"
-        rows = wait_for_provider(pyatspi, GLib, application, "codex")
+        rows = navigate_provider(pyatspi, GLib, application, rows, "claude", "codex", window_id=window["id"])
         report["codexDemoVerification"] = verify_codex_demo_rows(rows)
         # Allow the provider replacement to reach a compositor frame; require
         # its dark PNG to differ from the already accepted Claude PNG as well.
@@ -426,10 +458,8 @@ def worker(directory: Path) -> int:
         # Let Modal.svelte's queued return-focus task finish before selecting
         # the provider tab for the reverse keyboard traversal.
         time.sleep(0.5)
-        rows = wait_for_provider(pyatspi, GLib, application, "codex")
-        arrow_provider(provider_tab(rows, "codex", selected=True), "left", pyatspi, window_id=window["id"])
         active_provider = "claude"
-        rows = wait_for_provider(pyatspi, GLib, application, "claude")
+        rows = navigate_provider(pyatspi, GLib, application, rows, "codex", "claude", window_id=window["id"])
         report["checks"]["providerTabsArrowKeyboardRoundTrip"] = True
         settings = [row for row in rows if row["name"] == "Open settings" and row["role"] in {"push button", "button"}]
         require(len(settings) == 1 and settings[0]["enabled"], "settings-navigation-unavailable")

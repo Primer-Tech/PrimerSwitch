@@ -15,6 +15,7 @@ from pathlib import Path
 import platform
 import re
 import signal
+import shutil
 import stat
 import subprocess
 import sys
@@ -229,10 +230,18 @@ def provider_tab(rows: list[dict], provider: str, *, selected: bool) -> dict:
 
 def arrow_provider(tab: dict, direction: str, pyatspi) -> None:
     require(tab["accessible"].queryComponent().grabFocus(), "provider-tab-focus-failed")
-    # AT-SPI KEY_SYM interprets keyval as an X11 keysym. String injection would
-    # not exercise the real ArrowLeft/ArrowRight DOM keyboard behavior.
     require(direction in {"left", "right"}, "invalid-provider-arrow")
-    pyatspi.Registry.generateKeyboardEvent(0xff51 if direction == "left" else 0xff53, None, pyatspi.KEY_SYM)
+    # Let the focus transition reach the WebKit child before sending the key.
+    # xdotool uses the XTest path and is reliable with the isolated Xvfb display;
+    # AT-SPI remains the hermetic fallback when the helper is unavailable.
+    time.sleep(0.15)
+    key = "Left" if direction == "left" else "Right"
+    if shutil.which("xdotool"):
+        output(["xdotool", "key", "--clearmodifiers", key], timeout=5)
+    else:
+        # KEY_SYM interprets the value as an X11 keysym. This still exercises
+        # the real ArrowLeft/ArrowRight DOM keyboard behavior.
+        pyatspi.Registry.generateKeyboardEvent(0xff51 if direction == "left" else 0xff53, None, pyatspi.KEY_SYM)
 
 
 def wait_for_provider(pyatspi, glib, application, provider: str) -> list[dict]:

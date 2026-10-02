@@ -171,11 +171,15 @@ def window_details() -> dict | None:
             # Readiness polling waits; the final acceptance still needs both.
             if "Map State: IsViewable" not in details:
                 continue
+            absolute_x = re.search(r"Absolute upper-left X:\s*(-?\d+)", details)
+            absolute_y = re.search(r"Absolute upper-left Y:\s*(-?\d+)", details)
             width = int(re.search(r"Width: (\d+)", details).group(1))
             height = int(re.search(r"Height: (\d+)", details).group(1))
             if width < 560 or height < 620:
                 continue
-            return {"id": match.group(1), "title": match.group(2), "width": width, "height": height}
+            return {"id": match.group(1), "title": match.group(2), "width": width, "height": height,
+                    "x": int(absolute_x.group(1)) if absolute_x else 0,
+                    "y": int(absolute_y.group(1)) if absolute_y else 0}
     return None
 
 
@@ -303,7 +307,8 @@ def wait_for_provider(pyatspi, glib, application, provider: str, *, timeout: flo
     raise QualificationError("provider-keyboard-navigation-timeout")
 
 
-def click_provider_tab(pyatspi, glib, application, current: str, target: str) -> list[dict]:
+def click_provider_tab(pyatspi, glib, application, current: str, target: str,
+                       *, window_id: str | None = None) -> list[dict]:
     """Use the installed tab's native click action when X11 key focus is stale."""
     current_rows = wait_for_provider(pyatspi, glib, application, current, timeout=5)
     target_tab = provider_tab(current_rows, target, selected=False)
@@ -316,11 +321,25 @@ def click_provider_tab(pyatspi, glib, application, current: str, target: str) ->
         if not shutil.which("xdotool"):
             raise
         extents = target_tab["accessible"].queryComponent().getExtents(getattr(pyatspi, "DESKTOP_COORDS", 0))
-        x = int(extents.x + extents.width / 2)
-        y = int(extents.y + extents.height / 2)
-        output(["xdotool", "mousemove", "--sync", str(x), str(y)], timeout=5)
-        output(["xdotool", "click", "1"], timeout=5)
-        return wait_for_provider(pyatspi, glib, application, target)
+        candidates = [(int(extents.x + extents.width / 2), int(extents.y + extents.height / 2))]
+        if window_id:
+            details = output(["xwininfo", "-id", window_id], timeout=8).decode("utf8", errors="replace")
+            absolute_x = re.search(r"Absolute upper-left X:\s*(-?\d+)", details)
+            absolute_y = re.search(r"Absolute upper-left Y:\s*(-?\d+)", details)
+            origin = (int(absolute_x.group(1)) if absolute_x else 0, int(absolute_y.group(1)) if absolute_y else 0)
+            candidates.append((candidates[0][0] + origin[0], candidates[0][1] + origin[1]))
+            # WebKitGTK occasionally reports zero/parent-relative extents for
+            # a tab after dialog teardown. The installed demo layout is fixed
+            # by the accepted 1160x820 window, so use its visible tab centers.
+            candidates.append((origin[0] + (1095 if target == "codex" else 1000), origin[1] + 58))
+        for x, y in dict.fromkeys(candidates):
+            output(["xdotool", "mousemove", "--sync", str(x), str(y)], timeout=5)
+            output(["xdotool", "click", "1"], timeout=5)
+            try:
+                return wait_for_provider(pyatspi, glib, application, target, timeout=3)
+            except QualificationError:
+                pass
+        raise QualificationError("provider-tab-click-timeout")
 
 
 def navigate_provider(pyatspi, glib, application, rows: list[dict], current: str, target: str,
@@ -351,7 +370,7 @@ def navigate_provider(pyatspi, glib, application, rows: list[dict], current: str
     # The tab's native action is the same user-visible selection, and gives the
     # installed-package check a deterministic recovery without touching state.
     try:
-        return click_provider_tab(pyatspi, glib, application, current, target), "native-click"
+        return click_provider_tab(pyatspi, glib, application, current, target, window_id=window_id), "native-click"
     except Exception as error:
         if isinstance(error, QualificationError):
             raise error

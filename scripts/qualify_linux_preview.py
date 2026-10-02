@@ -228,7 +228,7 @@ def provider_tab(rows: list[dict], provider: str, *, selected: bool) -> dict:
     return tabs[0]
 
 
-def arrow_provider(tab: dict, direction: str, pyatspi) -> None:
+def arrow_provider(tab: dict, direction: str, pyatspi, *, window_id: str | None = None) -> None:
     require(tab["accessible"].queryComponent().grabFocus(), "provider-tab-focus-failed")
     require(direction in {"left", "right"}, "invalid-provider-arrow")
     # Let the focus transition reach the WebKit child before sending the key.
@@ -237,6 +237,11 @@ def arrow_provider(tab: dict, direction: str, pyatspi) -> None:
     time.sleep(0.15)
     key = "Left" if direction == "left" else "Right"
     if shutil.which("xdotool"):
+        if window_id:
+            # Modal teardown can leave X11 focus on the transient WebKit dialog
+            # even after AT-SPI has restored the tab's accessibility focus.
+            # Re-focus the real native window before sending the DOM key event.
+            output(["xdotool", "windowfocus", window_id], timeout=5)
         output(["xdotool", "key", "--clearmodifiers", key], timeout=5)
     else:
         # KEY_SYM interprets the value as an X11 keysym. This still exercises
@@ -379,7 +384,7 @@ def worker(directory: Path) -> int:
         # native in-memory fixture, then return to retain Claude/Settings checks.
         claude_tab = provider_tab(rows, "claude", selected=True)
         provider_tab(rows, "codex", selected=False)
-        arrow_provider(claude_tab, "right", pyatspi)
+        arrow_provider(claude_tab, "right", pyatspi, window_id=window["id"])
         active_provider = "codex"
         rows = wait_for_provider(pyatspi, GLib, application, "codex")
         report["codexDemoVerification"] = verify_codex_demo_rows(rows)
@@ -410,7 +415,7 @@ def worker(directory: Path) -> int:
         rows = wait_for_dialog_close(pyatspi, GLib, application)
         require(not any(row["role"] == "dialog" and row["name"] == "Personal Codex" for row in rows), "codex-read-only-details-close-timeout")
         rows = wait_for_provider(pyatspi, GLib, application, "codex")
-        arrow_provider(provider_tab(rows, "codex", selected=True), "left", pyatspi)
+        arrow_provider(provider_tab(rows, "codex", selected=True), "left", pyatspi, window_id=window["id"])
         active_provider = "claude"
         rows = wait_for_provider(pyatspi, GLib, application, "claude")
         report["checks"]["providerTabsArrowKeyboardRoundTrip"] = True

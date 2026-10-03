@@ -127,7 +127,10 @@ impl ContextPaths {
         let user_layer = self.home.join("config.toml").canonicalize().ok();
         for parent in cwd.ancestors() {
             let candidate = parent.join(".codex").join("config.toml");
-            if candidate.canonicalize().ok().is_none_or(|path| Some(path) != user_layer)
+            if candidate
+                .canonicalize()
+                .ok()
+                .is_none_or(|path| Some(path) != user_layer)
                 && let Some(bytes) = capture(CodexSourceRole::Project, candidate)?
             {
                 validate_config(&parse_config(Some(bytes))?)?;

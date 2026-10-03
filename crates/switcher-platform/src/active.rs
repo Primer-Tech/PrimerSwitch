@@ -390,20 +390,20 @@ fn is_desired(current: &RawSnapshot, journal: &Journal) -> bool {
 #[cfg(target_os = "macos")]
 mod mac {
     use super::*;
-    use security_framework::os::macos::passwords::find_generic_password;
-    use security_framework::passwords::{get_generic_password, set_generic_password};
+    use security_framework::os::macos::keychain::SecKeychain;
     // Static source inspection of installed public Claude 2.1.287, not native Mac
     // acceptance. Older username/service-only selectors are intentionally not guessed.
     const SERVICE: &str = "Claude Code-credentials";
     const ACCOUNT: &str = "claude-code-user";
     pub(super) fn read_current() -> Result<Option<Vec<u8>>> {
-        match find_generic_password(None, SERVICE, ACCOUNT) {
+        let keychain = SecKeychain::default().map_err(|_| PlatformError::KeyUnavailable)?;
+        match keychain.find_generic_password(SERVICE, ACCOUNT) {
             Ok((bytes, _)) => Ok(Some(bytes.to_owned())),
             Err(error) if error.code() == -25300 => {
                 // The original Mac app used NSUserName. A legacy OAuth item is an
                 // ambiguous CLI version/context, not permission to write a fallback file.
                 let username = native_username()?;
-                match find_generic_password(None, SERVICE, &username) {
+                match keychain.find_generic_password(SERVICE, &username) {
                     Ok((bytes, _)) => {
                         let value = parse_object(Some(bytes.as_ref()))?;
                         if value.get("claudeAiOauth").is_some() {
@@ -420,17 +420,16 @@ mod mac {
         }
     }
     pub(super) fn update_current(bytes: &[u8]) -> Result<()> {
-        // Confirm that the exact CLI item still exists before updating it. The
-        // modern SecItem API persists the data reliably across fresh Keychain
-        // queries; the legacy SecKeychainItemModifyAttributesAndData call can
-        // otherwise appear updated only through its in-process item handle.
-        get_generic_password(SERVICE, ACCOUNT).map_err(|_| PlatformError::Conflict)?;
-        set_generic_password(SERVICE, ACCOUNT, bytes).map_err(|_| PlatformError::KeyUnavailable)?;
-        match get_generic_password(SERVICE, ACCOUNT) {
-            Ok(updated) if updated == bytes => Ok(()),
-            Ok(_) => Err(PlatformError::Conflict),
-            Err(_) => Err(PlatformError::KeyUnavailable),
-        }
+        // Use an explicit handle to the user's default keychain. This matches
+        // Claude's `security add-generic-password -U` write target and avoids
+        // SecItem queries selecting a different keychain item with the same
+        // service/account pair.
+        let keychain = SecKeychain::default().map_err(|_| PlatformError::KeyUnavailable)?;
+        let (_, mut item) = keychain
+            .find_generic_password(SERVICE, ACCOUNT)
+            .map_err(|_| PlatformError::Conflict)?;
+        item.set_password(bytes)
+            .map_err(|_| PlatformError::KeyUnavailable)
     }
     fn native_username() -> Result<String> {
         use std::{ffi::CStr, mem::MaybeUninit, ptr};

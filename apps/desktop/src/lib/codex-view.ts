@@ -240,9 +240,7 @@ function row(
       chatgpt &&
       !account.needsSignIn,
     canDelete: !account.selected && snapshot.capabilities.deleteSaved.enabled,
-    deleteReason: account.selected
-      ? codexMessage('activeAccount', locale)
-      : null,
+    deleteReason: account.selected ? t(locale, 'deleteActiveReason') : null,
   };
 }
 

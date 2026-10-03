@@ -145,8 +145,9 @@ function row(
         : t(locale, account.error ? 'switchUnverified' : 'switchChecking'),
     canSignIn: signIn && !account.active,
     canRefresh: true,
-    canDelete: true,
-    deleteReason: null,
+    // Same rule as Codex: switch away before removing the account in use.
+    canDelete: !account.active,
+    deleteReason: account.active ? t(locale, 'deleteActiveReason') : null,
   };
 }
 

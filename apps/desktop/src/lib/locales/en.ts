@@ -182,6 +182,7 @@ export const en = {
   codexAuthUnsupported: 'Unsupported sign-in',
   deleteAccount: 'Delete account',
   deleteLabel: 'Delete account {name}',
+  deleteActiveReason: 'Switch to another account before removing this one.',
 
   // Delete confirmation.
   deleteTitle: 'Delete saved account?',

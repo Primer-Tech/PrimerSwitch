@@ -156,7 +156,7 @@ describe('desktop workflows', () => {
       expect(call).toHaveBeenCalledWith('delete_account', { id: 'b' }),
     );
   });
-  it('refreshes and deletes from the row menu, also for the active Claude account', async () => {
+  it('refreshes from the row menu and keeps Delete off the active account, as Codex does', async () => {
     const { call } = setup();
     const trigger = await menu('Studio');
     await fireEvent.click(
@@ -167,16 +167,39 @@ describe('desktop workflows', () => {
     );
     expect(trigger).toHaveFocus();
     await fireEvent.click(trigger);
-    // Claude keeps its login when the saved active account is removed.
-    const remove = menuItems(trigger).getByRole('button', { name: 'Delete' });
+    const removeActive = menuItems(trigger).getByRole('button', {
+      name: 'Delete',
+    });
+    expect(removeActive).toBeDisabled();
+    expect(removeActive).toHaveAccessibleDescription(
+      'Switch to another account before removing this one.',
+    );
+    await fireEvent.keyDown(window, { key: 'Escape' });
+    expect(trigger).toHaveFocus();
+    // The active account's details say the same.
+    const dialog = await details('Studio');
+    const removeInDetails = within(dialog).getByRole('button', {
+      name: 'Delete account Studio',
+    });
+    expect(removeInDetails).toBeDisabled();
+    expect(removeInDetails).toHaveAccessibleDescription(
+      t('en', 'deleteActiveReason'),
+    );
+    await fireEvent.click(
+      within(dialog).getByRole('button', { name: 'Close' }),
+    );
+    // Any other account is deleted from its menu after confirmation.
+    const personal = await menu('Personal');
+    const remove = menuItems(personal).getByRole('button', { name: 'Delete' });
     await waitFor(() => expect(remove).toBeEnabled());
     await fireEvent.click(remove);
     expect(screen.getByRole('dialog')).toHaveTextContent(
-      t('en', 'deleteClaude', { name: 'Studio' }),
+      t('en', 'deleteClaude', { name: 'Personal' }),
     );
     await fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
     await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
-    await waitFor(() => expect(trigger).toHaveFocus());
+    await waitFor(() => expect(personal).toHaveFocus());
+    expect(call).not.toHaveBeenCalledWith('delete_account', expect.anything());
   });
   it('restores the stable table trigger after canceling deletion from account details', async () => {
     setup();

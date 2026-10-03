@@ -289,13 +289,20 @@ describe('Codex adapter: the page', () => {
     );
     expect(view(fixture()).allLimited).toBeNull();
   });
-  it('keeps Delete off the active account and says why', () => {
+  it('keeps Delete off the active account and says why, as Claude does', () => {
     const page = view(fixture());
     expect(page.active).toMatchObject({
       primary: null,
       canDelete: false,
-      deleteReason: codexMessage('activeAccount', 'en'),
+      deleteReason: t('en', 'deleteActiveReason'),
     });
+    // The same words as the native reason for a refused removal.
+    expect(t('en', 'deleteActiveReason')).toBe(
+      codexMessage('activeAccount', 'en'),
+    );
+    expect(t('ro', 'deleteActiveReason')).toBe(
+      codexMessage('activeAccount', 'ro'),
+    );
     expect(page.rows[1]).toMatchObject({
       primary: 'switch',
       canSwitch: true,

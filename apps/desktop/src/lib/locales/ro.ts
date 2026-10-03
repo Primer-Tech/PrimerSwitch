@@ -189,6 +189,7 @@ export const ro: Record<keyof typeof en, string> = {
   codexAuthUnsupported: 'Autentificare neacceptată',
   deleteAccount: 'Șterge contul',
   deleteLabel: 'Șterge contul {name}',
+  deleteActiveReason: 'Comută pe alt cont înainte să-l ștergi pe acesta.',
 
   // Delete confirmation.
   deleteTitle: 'Ștergi contul salvat?',

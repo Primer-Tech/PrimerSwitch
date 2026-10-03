@@ -222,19 +222,24 @@ describe('Claude adapter: the page', () => {
     );
     expect(view(snapshot()).allLimited).toBeNull();
   });
-  it('keeps every Claude action: delete stays possible for the active account', () => {
+  it('keeps Delete off the active account with the reason Codex gives', () => {
     const page = view(snapshot());
     expect(page.active).toMatchObject({
       primary: null,
-      canDelete: true,
+      canDelete: false,
       canRefresh: true,
-      deleteReason: null,
+      deleteReason: 'Switch to another account before removing this one.',
     });
     expect(page.rows[1]).toMatchObject({
       primary: 'switch',
       canSwitch: true,
       switchReason: null,
+      canDelete: true,
+      deleteReason: null,
     });
+    expect(
+      claudeView(snapshot(), { locale: 'ro', now }).active!.deleteReason,
+    ).toBe('Comută pe alt cont înainte să-l ștergi pe acesta.');
     expect(page.model).toBe('Sonnet');
     expect(view(snapshot({ activeModel: null })).model).toBe('Default model');
     expect(claudeView(null, { locale: 'en', now })).toMatchObject({

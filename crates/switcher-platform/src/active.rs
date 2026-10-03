@@ -391,6 +391,7 @@ fn is_desired(current: &RawSnapshot, journal: &Journal) -> bool {
 mod mac {
     use super::*;
     use security_framework::os::macos::passwords::find_generic_password;
+    use security_framework::passwords::{get_generic_password, set_generic_password};
     // Static source inspection of installed public Claude 2.1.287, not native Mac
     // acceptance. Older username/service-only selectors are intentionally not guessed.
     const SERVICE: &str = "Claude Code-credentials";
@@ -419,12 +420,17 @@ mod mac {
         }
     }
     pub(super) fn update_current(bytes: &[u8]) -> Result<()> {
-        // In-place native item update preserves its attributes and ACL. It cannot
-        // upsert a new item if the CLI deletes the old one between read and write.
-        let (_, mut item) =
-            find_generic_password(None, SERVICE, ACCOUNT).map_err(|_| PlatformError::Conflict)?;
-        item.set_password(bytes)
-            .map_err(|_| PlatformError::KeyUnavailable)
+        // Confirm that the exact CLI item still exists before updating it. The
+        // modern SecItem API persists the data reliably across fresh Keychain
+        // queries; the legacy SecKeychainItemModifyAttributesAndData call can
+        // otherwise appear updated only through its in-process item handle.
+        get_generic_password(SERVICE, ACCOUNT).map_err(|_| PlatformError::Conflict)?;
+        set_generic_password(SERVICE, ACCOUNT, bytes).map_err(|_| PlatformError::KeyUnavailable)?;
+        match get_generic_password(SERVICE, ACCOUNT) {
+            Ok(updated) if updated == bytes => Ok(()),
+            Ok(_) => Err(PlatformError::Conflict),
+            Err(_) => Err(PlatformError::KeyUnavailable),
+        }
     }
     fn native_username() -> Result<String> {
         use std::{ffi::CStr, mem::MaybeUninit, ptr};

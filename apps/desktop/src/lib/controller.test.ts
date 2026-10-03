@@ -247,7 +247,14 @@ describe('redacted IPC and runtime reconciliation', () => {
       autoUseResetsEnabled: true,
       appearance: 'dark',
       language: 'en',
+      preferSoonestWeeklyReset: true,
     });
+    // The native settings always carry the reset order; a snapshot without it is refused.
+    const { preferSoonestWeeklyReset: _omitted, ...older } = defaults;
+    expect(
+      snapshotSchema.safeParse(snapshot({ settings: older as typeof defaults }))
+        .success,
+    ).toBe(false);
     expect(
       snapshotSchema.safeParse(
         snapshot({ settings: { ...defaults, pollInterval: 121 } }),

@@ -89,6 +89,9 @@ export const en = {
     'Choose how your Claude accounts are monitored and used.',
   automation: 'Automation',
   autoSwitchHelp: 'Switch accounts when usage reaches your chosen threshold.',
+  preferSoonestReset: 'Use the account whose weekly limit resets soonest first',
+  preferSoonestResetHelp:
+    'Spends quota that would otherwise expire unused. Off: prefer the account with the most weekly usage left.',
   primeWindow: 'Start the weekly window',
   primeHelp:
     "When an account's weekly window ends, send one very short message to start the next one right away, so its next reset comes sooner.",

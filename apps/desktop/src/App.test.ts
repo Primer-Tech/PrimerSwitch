@@ -11,6 +11,7 @@ import App from './App.svelte';
 import { createController } from './lib/controller';
 import { snapshot, account } from './test/fixtures';
 import type { Bridge } from './lib/bridge';
+import { defaults } from './lib/types';
 import { language, t } from './lib/i18n';
 function setup(raw = snapshot()) {
   let emit: (snapshot: unknown) => void = () => {};
@@ -153,7 +154,7 @@ describe('desktop workflows', () => {
     );
     await waitFor(() => expect(trigger).toHaveFocus());
   });
-  it('retains three enabled toggles, polling bounds, and fractional thresholds', async () => {
+  it('retains four enabled toggles, polling bounds, and fractional thresholds', async () => {
     const raw = snapshot();
     raw.settings.threshold = 99.5;
     setup(raw);
@@ -164,7 +165,7 @@ describe('desktop workflows', () => {
     screen
       .getAllByRole('switch')
       .forEach((toggle) => expect(toggle).toBeChecked());
-    expect(screen.getAllByRole('switch')).toHaveLength(3);
+    expect(screen.getAllByRole('switch')).toHaveLength(4);
     expect(screen.getByRole('slider')).toHaveAttribute('min', '120');
     expect(screen.getByRole('slider')).toHaveAttribute('max', '900');
     expect(screen.getByRole('slider')).toHaveAttribute('step', '30');
@@ -174,6 +175,40 @@ describe('desktop workflows', () => {
     expect(
       screen.getByText(/even when automatic switching is off/),
     ).toBeVisible();
+  });
+  it('saves the weekly reset order with the other automation settings', async () => {
+    const { call } = setup();
+    await screen.findAllByText('a@example.invalid');
+    await fireEvent.click(
+      screen.getByRole('button', { name: 'Open settings' }),
+    );
+    const order = screen.getByRole('switch', {
+      name: new RegExp(`^${t('en', 'preferSoonestReset')}`),
+    });
+    expect(order).toBeChecked();
+    expect(screen.getByText(t('en', 'preferSoonestResetHelp'))).toBeVisible();
+    await fireEvent.click(order);
+    expect(order).not.toBeChecked();
+    const updated = snapshot({ revision: 2 });
+    updated.settings.preferSoonestWeeklyReset = false;
+    call.mockResolvedValueOnce(updated);
+    await fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() =>
+      expect(call).toHaveBeenCalledWith('update_settings', {
+        settings: { ...defaults, preferSoonestWeeklyReset: false },
+      }),
+    );
+    await waitFor(() =>
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument(),
+    );
+    await fireEvent.click(
+      screen.getByRole('button', { name: 'Open settings' }),
+    );
+    expect(
+      screen.getByRole('switch', {
+        name: new RegExp(`^${t('en', 'preferSoonestReset')}`),
+      }),
+    ).not.toBeChecked();
   });
   it('disables every mutation in demo while keeping details readable', async () => {
     const { call } = setup(snapshot({ demo: true }));

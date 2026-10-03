@@ -2,6 +2,70 @@ use crate::{AccountUsageInfo, CoreError, PendingResetClaim, ResetGrant, UsageRes
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
+/// A target has preferred headroom when both binding windows are at most
+/// `threshold - HEADROOM_MARGIN` (B13).
+pub const HEADROOM_MARGIN: f64 = 5.0;
+/// Weekly resets compare by UTC hour, so resets within the same hour tie (B13).
+pub fn reset_hour_bucket(at: i64) -> i64 {
+    at.div_euclid(3600) * 3600
+}
+/// Which usable account goes first once preferred headroom is equal. Shared by Claude
+/// and Codex; `Settings::prefer_soonest_weekly_reset` selects it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CandidateOrder {
+    /// The original order (B13): the earliest weekly reset first, which spends quota
+    /// that would otherwise expire unused, then the lower five-hour usage.
+    #[default]
+    SoonestWeeklyReset,
+    /// The most weekly usage left first, then the earliest weekly reset, then the lower
+    /// five-hour usage.
+    MostWeeklyLeft,
+}
+impl CandidateOrder {
+    pub fn from_preference(prefer_soonest_weekly_reset: bool) -> Self {
+        if prefer_soonest_weekly_reset {
+            Self::SoonestWeeklyReset
+        } else {
+            Self::MostWeeklyLeft
+        }
+    }
+}
+/// Provider-neutral ranking inputs of one usable candidate.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CandidateRank<'a> {
+    pub id: &'a str,
+    /// Both binding windows are at most `threshold - HEADROOM_MARGIN`.
+    pub headroom: bool,
+    /// Binding weekly usage in percent.
+    pub weekly_used: f64,
+    /// Weekly reset hour bucket; an unknown reset sorts last.
+    pub weekly_reset_bucket: Option<i64>,
+    pub five_hour_used: f64,
+}
+/// Total order over usable candidates: preferred headroom first, then `order`, then
+/// the lower five-hour usage and finally the stable id.
+pub fn compare_candidates(
+    a: &CandidateRank<'_>,
+    b: &CandidateRank<'_>,
+    order: CandidateOrder,
+) -> Ordering {
+    let reset = || {
+        a.weekly_reset_bucket
+            .unwrap_or(i64::MAX)
+            .cmp(&b.weekly_reset_bucket.unwrap_or(i64::MAX))
+    };
+    b.headroom
+        .cmp(&a.headroom)
+        .then_with(|| match order {
+            CandidateOrder::SoonestWeeklyReset => reset(),
+            CandidateOrder::MostWeeklyLeft => {
+                a.weekly_used.total_cmp(&b.weekly_used).then_with(reset)
+            }
+        })
+        .then_with(|| a.five_hour_used.total_cmp(&b.five_hour_used))
+        .then_with(|| a.id.cmp(b.id))
+}
+
 pub fn is_usable(info: &AccountUsageInfo, threshold: f64, model: Option<&str>) -> bool {
     info.usage.as_ref().is_some_and(|u| {
         threshold.is_finite()
@@ -25,49 +89,52 @@ pub fn has_headroom(
                 && u.weekly_utilization_for_model(model) <= threshold - margin
         })
 }
+fn rank<'a>(info: &'a AccountUsageInfo, threshold: f64, model: Option<&str>) -> CandidateRank<'a> {
+    let usage = info.usage.as_ref().expect("usable account has usage");
+    CandidateRank {
+        id: &info.account.id,
+        headroom: has_headroom(info, threshold, model, HEADROOM_MARGIN),
+        weekly_used: usage.weekly_utilization_for_model(model),
+        weekly_reset_bucket: usage.weekly_reset_bucket(),
+        five_hour_used: usage.five_hour.utilization,
+    }
+}
 fn compare(
     a: &AccountUsageInfo,
     b: &AccountUsageInfo,
     threshold: f64,
     model: Option<&str>,
+    order: CandidateOrder,
 ) -> Ordering {
-    let ua = a.usage.as_ref().expect("usable account has usage");
-    let ub = b.usage.as_ref().expect("usable account has usage");
-    has_headroom(b, threshold, model, 5.0)
-        .cmp(&has_headroom(a, threshold, model, 5.0))
-        .then_with(|| {
-            ua.weekly_reset_bucket()
-                .unwrap_or(i64::MAX)
-                .cmp(&ub.weekly_reset_bucket().unwrap_or(i64::MAX))
-        })
-        .then_with(|| {
-            ua.five_hour
-                .utilization
-                .total_cmp(&ub.five_hour.utilization)
-        })
-        .then_with(|| a.account.id.cmp(&b.account.id))
+    compare_candidates(
+        &rank(a, threshold, model),
+        &rank(b, threshold, model),
+        order,
+    )
 }
 pub fn best_candidate(
     infos: &[AccountUsageInfo],
     threshold: f64,
     model: Option<&str>,
+    order: CandidateOrder,
 ) -> Option<String> {
     infos
         .iter()
         .filter(|i| !i.is_active && is_usable(i, threshold, model))
-        .min_by(|a, b| compare(a, b, threshold, model))
+        .min_by(|a, b| compare(a, b, threshold, model, order))
         .map(|i| i.account.id.clone())
 }
 pub fn consumption_plan(
     infos: &[AccountUsageInfo],
     threshold: f64,
     model: Option<&str>,
+    order: CandidateOrder,
 ) -> Vec<String> {
     let mut sorted: Vec<_> = infos
         .iter()
         .filter(|i| is_usable(i, threshold, model))
         .collect();
-    sorted.sort_by(|a, b| compare(a, b, threshold, model));
+    sorted.sort_by(|a, b| compare(a, b, threshold, model, order));
     sorted.into_iter().map(|i| i.account.id.clone()).collect()
 }
 pub fn next_poll_delay(
@@ -180,10 +247,11 @@ pub fn decide_resets(
     now: i64,
 ) -> Vec<ResetAction> {
     let mut actions = vec![];
+    // Only whether another account is usable matters here, never the order.
     if let Some(active) = infos.iter().find(|i| i.is_active)
         && active.usage.is_some()
         && !is_usable(active, threshold, model)
-        && best_candidate(infos, threshold, model).is_none()
+        && best_candidate(infos, threshold, model, CandidateOrder::default()).is_none()
     {
         let pick = infos
             .iter()

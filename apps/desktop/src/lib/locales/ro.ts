@@ -90,6 +90,10 @@ export const ro: Record<keyof typeof en, string> = {
     'Alege cum se monitorizează și se folosesc conturile Claude.',
   automation: 'Automatizare',
   autoSwitchHelp: 'Schimbă contul când utilizarea atinge pragul ales.',
+  preferSoonestReset:
+    'Folosește întâi contul a cărui limită săptămânală se resetează cel mai curând',
+  preferSoonestResetHelp:
+    'Consumă întâi ce altfel ar expira nefolosit. Dezactivat: se preferă contul cu cea mai mare rezervă săptămânală.',
   primeWindow: 'Pornește fereastra săptămânală',
   primeHelp:
     'Când fereastra săptămânală a unui cont se încheie, trimite un mesaj foarte scurt pentru a o porni imediat pe următoarea, ca resetarea ei să vină mai devreme.',

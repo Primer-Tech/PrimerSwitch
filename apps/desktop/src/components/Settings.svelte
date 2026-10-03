@@ -61,6 +61,17 @@
       >
       <label class="toggle-row"
         ><span
+          ><strong>{t(locale, 'preferSoonestReset')}</strong><small
+            >{t(locale, 'preferSoonestResetHelp')}</small
+          ></span
+        ><input
+          type="checkbox"
+          role="switch"
+          bind:checked={draft.preferSoonestWeeklyReset}
+        /></label
+      >
+      <label class="toggle-row"
+        ><span
           ><strong>{t(locale, 'primeWindow')}</strong><small
             >{t(locale, 'primeHelp')}</small
           ></span

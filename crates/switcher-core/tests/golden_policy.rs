@@ -6,6 +6,9 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use switcher_core::*;
 
+const SOONEST: CandidateOrder = CandidateOrder::SoonestWeeklyReset;
+const MOST_LEFT: CandidateOrder = CandidateOrder::MostWeeklyLeft;
+
 fn usage(five: f64, seven: f64, weekly_reset: Option<i64>) -> UsageResponse {
     UsageResponse {
         five_hour: UsageWindow {
@@ -56,6 +59,8 @@ fn settings_defaults_and_constraints() {
     let s = Settings::default();
     assert_eq!((s.poll_interval, s.threshold), (300, 95.0));
     assert!(s.auto_switch_enabled && s.auto_start_window_enabled && s.auto_use_resets_enabled);
+    assert!(s.prefer_soonest_weekly_reset);
+    assert_eq!(s.candidate_order(), SOONEST);
     assert_eq!(s.appearance, "dark");
     assert_eq!(s.language, "en");
     for appearance in ["system", "light", "dark"] {
@@ -112,7 +117,7 @@ fn strict_boundary_headroom_and_no_data() {
     ));
     let mut absent = at.clone();
     absent.usage = None;
-    assert_eq!(best_candidate(&[absent], 95.0, None), None);
+    assert_eq!(best_candidate(&[absent], 95.0, None, SOONEST), None);
     assert!(!is_usable(
         &info("a", f64::NAN, 0.0, None, false),
         95.0,
@@ -124,11 +129,11 @@ fn headroom_precedes_perishability_and_fallback_is_retained() {
     let near = info("near", 99.0, 20.0, Some(3600), false);
     let preferred = info("preferred", 94.0, 94.0, Some(7200), false);
     assert_eq!(
-        best_candidate(&[near.clone(), preferred], 100.0, None).as_deref(),
+        best_candidate(&[near.clone(), preferred], 100.0, None, SOONEST).as_deref(),
         Some("preferred")
     );
     assert_eq!(
-        best_candidate(&[near], 100.0, None).as_deref(),
+        best_candidate(&[near], 100.0, None, SOONEST).as_deref(),
         Some("near")
     );
 }
@@ -137,31 +142,181 @@ fn hour_buckets_usage_missing_last_and_stable_ties() {
     let mut a = info("a", 50.0, 10.0, Some(3700), false);
     let b = info("b", 20.0, 10.0, Some(7100), false);
     assert_eq!(
-        best_candidate(&[a.clone(), b.clone()], 95.0, None).as_deref(),
+        best_candidate(&[a.clone(), b.clone()], 95.0, None, SOONEST).as_deref(),
         Some("b")
     );
     a.usage.as_mut().unwrap().seven_day.resets_at = Some(3500);
     assert_eq!(
-        best_candidate(&[a.clone(), b.clone()], 95.0, None).as_deref(),
+        best_candidate(&[a.clone(), b.clone()], 95.0, None, SOONEST).as_deref(),
         Some("a")
     );
     a.usage.as_mut().unwrap().seven_day.resets_at = None;
     assert_eq!(
-        best_candidate(&[a, b.clone()], 95.0, None).as_deref(),
+        best_candidate(&[a, b.clone()], 95.0, None, SOONEST).as_deref(),
         Some("b")
     );
     let c = info("c", 20.0, 10.0, Some(7100), false);
-    assert_eq!(consumption_plan(&[c, b], 95.0, None), vec!["b", "c"]);
+    assert_eq!(
+        consumption_plan(&[c, b], 95.0, None, SOONEST),
+        vec!["b", "c"]
+    );
 }
 #[test]
 fn active_in_plan_excluded_as_target() {
     let a = info("a", 20.0, 20.0, Some(3500), true);
     let b = info("b", 20.0, 20.0, Some(7100), false);
     assert_eq!(
-        consumption_plan(&[a.clone(), b.clone()], 95.0, None),
+        consumption_plan(&[a.clone(), b.clone()], 95.0, None, SOONEST),
         vec!["a", "b"]
     );
-    assert_eq!(best_candidate(&[a, b], 95.0, None).as_deref(), Some("b"));
+    assert_eq!(
+        best_candidate(&[a, b], 95.0, None, SOONEST).as_deref(),
+        Some("b")
+    );
+}
+#[test]
+fn settings_saved_before_the_reset_order_existed_keep_every_value_and_the_original_order() {
+    // Literal record written by an earlier release, before the setting existed.
+    let historical = json!({"poll_interval":900,"threshold":70.5,"auto_switch_enabled":false,
+        "auto_start_window_enabled":false,"auto_use_resets_enabled":false,
+        "appearance":"light","language":"ro"});
+    let loaded: Settings = serde_json::from_value(historical.clone()).unwrap();
+    assert_eq!(
+        loaded,
+        Settings {
+            poll_interval: 900,
+            threshold: 70.5,
+            auto_switch_enabled: false,
+            auto_start_window_enabled: false,
+            auto_use_resets_enabled: false,
+            appearance: "light".into(),
+            language: "ro".into(),
+            prefer_soonest_weekly_reset: true,
+        }
+    );
+    assert_eq!(loaded.candidate_order(), SOONEST);
+    assert!(loaded.validate().is_ok());
+    // The default is not written, so such a record round-trips unchanged...
+    assert_eq!(serde_json::to_value(&loaded).unwrap(), historical);
+    // ...while the opt-out is written and read back.
+    let off = Settings {
+        prefer_soonest_weekly_reset: false,
+        ..loaded.clone()
+    };
+    let written = serde_json::to_value(&off).unwrap();
+    assert_eq!(written["prefer_soonest_weekly_reset"], false);
+    let reread: Settings = serde_json::from_value(written).unwrap();
+    assert_eq!(reread, off);
+    assert_eq!(reread.candidate_order(), MOST_LEFT);
+}
+#[test]
+fn the_reset_order_setting_only_changes_the_order_after_headroom() {
+    // "soon" resets in an hour with much of its week used; "late" has the most left.
+    let soon = info("soon", 10.0, 70.0, Some(3600), false);
+    let late = info("late", 30.0, 20.0, Some(7 * 86400), false);
+    let both = [soon.clone(), late.clone()];
+    assert_eq!(
+        best_candidate(&both, 95.0, None, SOONEST).as_deref(),
+        Some("soon")
+    );
+    assert_eq!(
+        best_candidate(&both, 95.0, None, MOST_LEFT).as_deref(),
+        Some("late")
+    );
+    assert_eq!(
+        consumption_plan(&both, 95.0, None, SOONEST),
+        vec!["soon", "late"]
+    );
+    assert_eq!(
+        consumption_plan(&both, 95.0, None, MOST_LEFT),
+        vec!["late", "soon"]
+    );
+    // Preferred headroom still comes first in both orders.
+    let tight = info("tight", 92.0, 1.0, Some(60), false);
+    for order in [SOONEST, MOST_LEFT] {
+        assert_eq!(
+            best_candidate(&[tight.clone(), soon.clone()], 95.0, None, order).as_deref(),
+            Some("soon")
+        );
+    }
+    // Without any headroom the usable fallback remains (B13).
+    assert_eq!(
+        best_candidate(&[tight], 95.0, None, MOST_LEFT).as_deref(),
+        Some("tight")
+    );
+}
+#[test]
+fn most_weekly_left_breaks_ties_by_reset_hour_then_five_hour_then_id() {
+    // Equal weekly usage: the earliest reset hour first, an unknown reset last.
+    let early = info("early", 50.0, 20.0, Some(7200), false);
+    let later = info("later", 10.0, 20.0, Some(10800), false);
+    let unknown = info("unknown", 0.0, 20.0, None, false);
+    assert_eq!(
+        consumption_plan(&[unknown, later, early], 95.0, None, MOST_LEFT),
+        vec!["early", "later", "unknown"]
+    );
+    // Same weekly usage and reset hour (7200-10799): the lower five-hour usage, then id.
+    let busy = info("busy", 40.0, 20.0, Some(7300), false);
+    let z = info("z", 20.0, 20.0, Some(7250), false);
+    let y = info("y", 20.0, 20.0, Some(10700), false);
+    assert_eq!(
+        consumption_plan(&[busy, z, y], 95.0, None, MOST_LEFT),
+        vec!["y", "z", "busy"]
+    );
+    // The active account is planned but never the target.
+    let active = info("active", 1.0, 1.0, Some(7200), true);
+    let other = info("other", 1.0, 2.0, Some(7200), false);
+    assert_eq!(
+        consumption_plan(&[other.clone(), active.clone()], 95.0, None, MOST_LEFT),
+        vec!["active", "other"]
+    );
+    assert_eq!(
+        best_candidate(&[other, active], 95.0, None, MOST_LEFT).as_deref(),
+        Some("other")
+    );
+}
+#[test]
+fn most_weekly_left_uses_the_model_aware_weekly_usage() {
+    let mut scoped = info("scoped", 10.0, 10.0, Some(3600), false);
+    scoped.usage.as_mut().unwrap().limits = Some(vec![UsageLimit {
+        kind: "weekly_scoped".into(),
+        group: "weekly".into(),
+        percent: 80.0,
+        scope: Some(json!({"model":{"display_name":"Opus"}})),
+        ..UsageLimit::default()
+    }]);
+    let plain = info("plain", 10.0, 50.0, Some(3600), false);
+    let both = [scoped, plain];
+    assert_eq!(
+        best_candidate(&both, 95.0, None, MOST_LEFT).as_deref(),
+        Some("scoped")
+    );
+    assert_eq!(
+        best_candidate(&both, 95.0, Some("opus"), MOST_LEFT).as_deref(),
+        Some("plain")
+    );
+}
+#[test]
+fn provider_neutral_ranks_follow_the_same_rules() {
+    let rank = |id, headroom, weekly_used, weekly_reset_bucket, five_hour_used| CandidateRank {
+        id,
+        headroom,
+        weekly_used,
+        weekly_reset_bucket,
+        five_hour_used,
+    };
+    let mut ranks = [
+        rank("d", false, 1.0, Some(0), 1.0),
+        rank("c", true, 60.0, None, 1.0),
+        rank("b", true, 60.0, Some(7200), 9.0),
+        rank("a", true, 10.0, Some(10800), 50.0),
+    ];
+    ranks.sort_by(|x, y| compare_candidates(x, y, SOONEST));
+    assert_eq!(ranks.map(|r| r.id), ["b", "a", "c", "d"]);
+    ranks.sort_by(|x, y| compare_candidates(x, y, MOST_LEFT));
+    assert_eq!(ranks.map(|r| r.id), ["a", "b", "c", "d"]);
+    assert_eq!(reset_hour_bucket(7199), 3600);
+    assert_eq!(reset_hour_bucket(-1), -3600);
 }
 #[test]
 fn dynamic_model_matching_all_override_and_distinct_reset_times() {

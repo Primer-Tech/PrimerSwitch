@@ -11,6 +11,8 @@ pub struct SettingsView {
     pub auto_use_resets_enabled: bool,
     pub appearance: String,
     pub language: String,
+    /// Claude and Codex: the account whose weekly limit resets soonest goes first.
+    pub prefer_soonest_weekly_reset: bool,
 }
 impl From<&Settings> for SettingsView {
     fn from(s: &Settings) -> Self {
@@ -22,6 +24,7 @@ impl From<&Settings> for SettingsView {
             auto_use_resets_enabled: s.auto_use_resets_enabled,
             appearance: s.appearance.clone(),
             language: s.language.clone(),
+            prefer_soonest_weekly_reset: s.prefer_soonest_weekly_reset,
         }
     }
 }
@@ -35,6 +38,7 @@ impl From<SettingsView> for Settings {
             auto_use_resets_enabled: s.auto_use_resets_enabled,
             appearance: s.appearance,
             language: s.language,
+            prefer_soonest_weekly_reset: s.prefer_soonest_weekly_reset,
         }
     }
 }

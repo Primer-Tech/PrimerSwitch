@@ -988,15 +988,18 @@ impl Engine {
     fn snapshot(&self, busy: bool) -> Snapshot {
         let now = self.clock.now();
         let infos = self.infos(false);
+        let order = self.saved.settings.candidate_order();
         let next = best_candidate(
             &infos,
             self.saved.settings.threshold,
             self.active_model.as_deref(),
+            order,
         );
         let plan = consumption_plan(
             &infos,
             self.saved.settings.threshold,
             self.active_model.as_deref(),
+            order,
         );
         let accounts = self
             .saved
@@ -2225,6 +2228,7 @@ impl Engine {
             &infos,
             self.saved.settings.threshold,
             self.active_model.as_deref(),
+            self.saved.settings.candidate_order(),
         ) {
             if self.saved.settings.auto_switch_enabled
                 && let Err(error) = self.switch_to(&candidate, fast, true).await
@@ -2920,6 +2924,9 @@ mod tests {
         assert_eq!(snapshot.settings.language, "ro");
         assert_eq!(snapshot.settings.poll_interval, 900);
         assert_eq!(snapshot.settings.threshold, 70.5);
+        // The reset order did not exist yet: it loads as the original order and is
+        // not written back, so the record below stays byte-for-byte the same.
+        assert!(snapshot.settings.prefer_soonest_weekly_reset);
         assert!(snapshot.accounts.iter().all(|a| !a.identity_verified));
         let public = serde_json::to_string(&snapshot).unwrap();
         assert!(!public.contains("HISTORICAL_FIXTURE_ACCESS"));
@@ -2957,6 +2964,45 @@ mod tests {
         assert_eq!(serde_json::to_value(&engine.saved).unwrap(), expected);
         assert!(fake.calls.lock().unwrap().is_empty());
         assert_eq!(reopened.get_snapshot().settings.threshold, 71.5);
+        assert!(reopened.get_snapshot().settings.prefer_soonest_weekly_reset);
+    }
+    #[tokio::test]
+    async fn the_reset_order_setting_reorders_claude_accounts_and_is_saved() {
+        let fake = Arc::new(Fake::default());
+        // "soon" resets within the hour with 70% of its week used; "late" resets in a
+        // week with 20% used, like the active "a" (which resets at 90000).
+        let mut soon = account("soon", 1000);
+        soon.last_usage.as_mut().unwrap().seven_day = UsageWindow {
+            utilization: 70.0,
+            resets_at: Some(4600),
+        };
+        let mut late = account("late", 1000);
+        late.last_usage.as_mut().unwrap().seven_day = UsageWindow {
+            utilization: 20.0,
+            resets_at: Some(1000 + 7 * 86400),
+        };
+        let (temp, handle, _, _) = fixture(
+            vec![account("a", 1000), soon, late],
+            Some("a"),
+            1000,
+            fake.clone(),
+        );
+        let snapshot = handle.get_snapshot();
+        assert!(snapshot.settings.prefer_soonest_weekly_reset);
+        assert_eq!(
+            serde_json::to_value(&snapshot.settings).unwrap()["preferSoonestWeeklyReset"],
+            true
+        );
+        assert_eq!(snapshot.consumption_plan, vec!["soon", "a", "late"]);
+        assert!(view(&handle, "soon").is_next);
+        let mut settings = snapshot.settings;
+        settings.prefer_soonest_weekly_reset = false;
+        let updated = handle.update_settings(settings).await.unwrap();
+        assert!(!updated.settings.prefer_soonest_weekly_reset);
+        assert_eq!(updated.consumption_plan, vec!["a", "late", "soon"]);
+        assert!(view(&handle, "late").is_next);
+        assert!(!saved_record(&temp).settings.prefer_soonest_weekly_reset);
+        assert!(fake.calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

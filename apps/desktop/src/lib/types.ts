@@ -33,6 +33,8 @@ export const settingsSchema = z
     autoUseResetsEnabled: z.boolean(),
     appearance: z.enum(['system', 'light', 'dark']),
     language: z.enum(['en', 'ro']).default('en'),
+    /** Claude and Codex: the account whose weekly limit resets soonest goes first. */
+    preferSoonestWeeklyReset: z.boolean(),
   })
   .strict();
 export const accountSchema = z
@@ -119,6 +121,7 @@ export const defaults: Settings = {
   autoUseResetsEnabled: true,
   appearance: 'dark',
   language: 'en',
+  preferSoonestWeeklyReset: true,
 };
 export const loginSchema = z
   .object({ id: z.string().min(1), url: z.string().url() })

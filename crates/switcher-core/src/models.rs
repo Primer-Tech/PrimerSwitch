@@ -250,7 +250,7 @@ impl UsageResponse {
             .or(self.seven_day.resets_at)
     }
     pub fn weekly_reset_bucket(&self) -> Option<i64> {
-        self.weekly_resets_at().map(|t| t.div_euclid(3600) * 3600)
+        self.weekly_resets_at().map(crate::reset_hour_bucket)
     }
     pub fn earliest_reset(&self) -> Option<i64> {
         self.five_hour
@@ -408,6 +408,15 @@ pub struct Settings {
     pub auto_use_resets_enabled: bool,
     pub appearance: String,
     pub language: String,
+    /// Claude and Codex (owner request 2026-10-03): among usable accounts, use the one
+    /// whose weekly limit resets soonest first, the original B13 order. Off: the one
+    /// with the most weekly usage left. Records from earlier releases lack the field and
+    /// load as true; the default is not written, so those records stay byte-stable.
+    #[serde(skip_serializing_if = "is_true")]
+    pub prefer_soonest_weekly_reset: bool,
+}
+fn is_true(value: &bool) -> bool {
+    *value
 }
 // New-vault dark theme follows the owner-selected Dark A design (2026-10-02).
 // Explicit persisted appearance values remain unchanged.
@@ -421,10 +430,15 @@ impl Default for Settings {
             auto_use_resets_enabled: true,
             appearance: "dark".into(),
             language: "en".into(),
+            prefer_soonest_weekly_reset: true,
         }
     }
 }
 impl Settings {
+    /// The candidate order selected by `prefer_soonest_weekly_reset`.
+    pub fn candidate_order(&self) -> crate::CandidateOrder {
+        crate::CandidateOrder::from_preference(self.prefer_soonest_weekly_reset)
+    }
     pub fn validate(&self) -> Result<(), crate::CoreError> {
         if !(120..=900).contains(&self.poll_interval)
             || !self.poll_interval.is_multiple_of(30)

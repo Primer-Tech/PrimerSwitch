@@ -462,11 +462,6 @@ mod mac {
         }
     }
 
-    fn release_access(access: SecAccessRef) {
-        if !access.is_null() {
-            unsafe { CFRelease(access.cast()) };
-        }
-    }
     fn native_username() -> Result<String> {
         use std::{ffi::CStr, mem::MaybeUninit, ptr};
         let mut buffer = vec![0u8; 16_384];

@@ -51,6 +51,9 @@ jobs:
       - name: Installed Linux demo qualification
         if: runner.os == 'Linux' && matrix.bundle == 'deb'
         run: python -B scripts/qualify_linux_preview.py --bundle deb
+      - name: Isolated macOS Keychain and vault qualification
+        if: runner.os == 'macOS' && matrix.bundle == 'dmg'
+        run: python -B scripts/qualify_macos_native.py
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -64,6 +67,7 @@ jobs:
             .artifacts/windows-update-preservation-report.json
             .artifacts/linux-installed-demo.png
             .artifacts/linux-installed-codex-demo.png
+            .artifacts/macos-native-report.json
             .artifacts/package-failure.json
             .artifacts/primerswitch-preview.spec
             .artifacts/package-manifest.json

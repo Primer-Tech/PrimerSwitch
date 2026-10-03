@@ -514,13 +514,11 @@ mod mac {
         if keychain
             .add_generic_password(SERVICE, ACCOUNT, bytes)
             .is_ok()
+            && let Ok((_, item)) = keychain.find_generic_password(SERVICE, ACCOUNT)
         {
-            if let Ok((_, item)) = keychain.find_generic_password(SERVICE, ACCOUNT) {
-                let status =
-                    unsafe { SecKeychainItemSetAccess(item.as_concrete_TypeRef(), access) };
-                drop(item);
-                let _ = status;
-            }
+            let status = unsafe { SecKeychainItemSetAccess(item.as_concrete_TypeRef(), access) };
+            drop(item);
+            let _ = status;
         }
         release_access(access);
     }

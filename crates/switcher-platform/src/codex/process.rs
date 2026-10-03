@@ -36,9 +36,12 @@ enum Role {
 /// Classify one process from its image path and command line. `daemon_root` is
 /// `<CODEX_HOME>/packages/app-server-daemon`.
 fn classify(image: &Path, command_line: Option<&str>, daemon_root: &Path) -> Role {
-    let name = image
-        .file_name()
-        .and_then(|n| n.to_str())
+    // Split on both separators: image paths and command lines use the platform's own,
+    // but the classification (and its fixtures) must not depend on the host OS.
+    let text = image.to_string_lossy();
+    let name = text
+        .rsplit(['/', '\\'])
+        .next()
         .unwrap_or("")
         .to_ascii_lowercase();
     let name = name.strip_suffix(".exe").unwrap_or(&name);
@@ -398,7 +401,54 @@ fn native_scan(daemon_root: &Path) -> CodexProcessSummary {
     summary
 }
 
-#[cfg(not(any(windows, target_os = "linux")))]
+/// macOS: `ps` lists every process with its arguments (argv joined by spaces).
+#[cfg(target_os = "macos")]
+fn native_scan(daemon_root: &Path) -> CodexProcessSummary {
+    let mut summary = CodexProcessSummary::default();
+    let uid = unsafe { libc::geteuid() };
+    let own = std::process::id();
+    let Ok(output) = std::process::Command::new("/bin/ps")
+        .args(["-axww", "-o", "pid=,ppid=,uid=,args="])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+    else {
+        return summary;
+    };
+    for line in String::from_utf8_lossy(&output.stdout).lines().take(65536) {
+        let mut rest = line.trim_start();
+        let mut fields = [0u32; 3];
+        let mut parsed = true;
+        for field in &mut fields {
+            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            match rest[..end].parse() {
+                Ok(value) => *field = value,
+                Err(_) => parsed = false,
+            }
+            rest = rest[end..].trim_start();
+        }
+        let [pid, parent, owner] = fields;
+        if !parsed || owner != uid || pid == own || parent == own || rest.is_empty() {
+            continue;
+        }
+        let program = rest.split_whitespace().next().unwrap_or("");
+        if program.rsplit('/').next() == Some("codex-switcher") {
+            summary.switcher_running = true;
+            continue;
+        }
+        match classify(Path::new(program), Some(rest), daemon_root) {
+            Role::OtherClient => summary.other_clients = summary.other_clients.saturating_add(1),
+            Role::DaemonServer => {
+                summary.daemon_running = true;
+                summary.daemon_pid = Some(pid);
+            }
+            _ => (),
+        }
+    }
+    summary
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 fn native_scan(_: &Path) -> CodexProcessSummary {
     CodexProcessSummary::default()
 }

@@ -952,7 +952,7 @@ impl CodexEngine {
         };
         let summary = self.processes.scan(&home);
         self.environment = CodexEnvironmentView {
-            daemon_running: cfg!(any(windows, target_os = "linux"))
+            daemon_running: cfg!(any(windows, target_os = "linux", target_os = "macos"))
                 .then_some(summary.daemon_running),
             other_clients: summary.other_clients,
             codex_switcher_running: summary.switcher_running,

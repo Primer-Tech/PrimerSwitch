@@ -26,11 +26,25 @@ function setup(raw = snapshot()) {
   render(App, { controller });
   return { call, controller, emit: (next: unknown) => emit(next) };
 }
+const section = (heading: string) =>
+  within(screen.getByRole('heading', { name: heading }).closest('section')!);
+const activeCard = () => section('Active account');
+const row = (name: string) =>
+  within(within(screen.getByRole('table')).getByText(name).closest('tr')!);
+async function menu(name = 'Personal') {
+  const trigger = await screen.findByRole('button', {
+    name: t('en', 'moreLabel', { name }),
+  });
+  await fireEvent.click(trigger);
+  return trigger;
+}
+/** The open row menu's own buttons. */
+const menuItems = (trigger: HTMLElement) =>
+  within(document.getElementById(trigger.getAttribute('aria-controls')!)!);
 async function details(name = 'Personal') {
+  const trigger = await menu(name);
   await fireEvent.click(
-    await screen.findByRole('button', {
-      name: t('en', 'detailsLabel', { name }),
-    }),
+    menuItems(trigger).getByRole('button', { name: 'Details' }),
   );
   return screen.getByRole('dialog');
 }
@@ -53,67 +67,77 @@ describe('desktop workflows', () => {
     );
     await waitFor(() => expect(trigger).toHaveFocus());
   });
-  it('renders three authoritative active quotas and exact backend consumption order', async () => {
+  it('shows the shared windows, the per-model weekly row and the exact backend usage order', async () => {
     setup();
     await screen.findAllByText('a@example.invalid');
+    // Active card 3, two table rows of 2, Next up 2.
     expect(screen.getAllByRole('meter')).toHaveLength(9);
-    expect(screen.getByRole('meter', { name: 'Last 5 hours' })).toHaveAttribute(
+    const active = activeCard();
+    expect(
+      active.getByRole('meter', { name: '5-hour window' }),
+    ).toHaveAttribute('aria-valuenow', '68');
+    expect(active.getByRole('meter', { name: 'Weekly' })).toHaveAttribute(
       'aria-valuenow',
-      '68',
+      '47',
     );
     expect(
-      screen.getByRole('meter', { name: 'Weekly · overall' }),
-    ).toHaveAttribute('aria-valuenow');
+      active.getByRole('meter', { name: 'Weekly · Sonnet' }),
+    ).toHaveAttribute('aria-valuenow', '58');
+    expect(active.getByText('Sonnet')).toBeVisible();
     expect(
-      within(screen.getByRole('list')).getAllByRole('listitem')[0],
-    ).toHaveTextContent('Personal');
+      within(screen.getByRole('table'))
+        .getAllByRole('columnheader')
+        .map((header) => header.textContent?.trim()),
+    ).toEqual(['Account', '5-hour window', 'Weekly', 'Status', 'Actions']);
+    const order = within(screen.getByRole('region', { name: 'Next in order' }));
     expect(
-      screen.getByRole('columnheader', {
-        name: t('en', 'weeklyEffectiveHelp'),
-      }),
-    ).toHaveAttribute('title', t('en', 'weeklyEffectiveHelp'));
+      order.getAllByRole('listitem').map((item) => item.textContent),
+    ).toEqual(['1Personal']);
+    expect(row('Personal').getByText('Next')).toBeVisible();
     const dialog = await details('Studio');
     expect(dialog).toHaveTextContent('Available resets');
     expect(dialog).toHaveTextContent('Weekly window started');
-    expect(dialog).toHaveTextContent('selected model');
+    expect(
+      within(dialog).getByRole('meter', { name: 'Weekly · Sonnet' }),
+    ).toBeVisible();
+    expect(dialog).toHaveTextContent(t('en', 'identityVerified'));
   });
-
-  it('uses authoritative overall/model reset projections when their dates differ', async () => {
+  it('shows each weekly window with its own reset time', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-10-02T12:00:00Z'));
     const raw = snapshot();
     const now = Math.floor(Date.now() / 1000);
     raw.accounts[0].usage!.weeklyOverallResetsAt = now + 3600;
-    raw.accounts[0].usage!.weeklyModelResetsAt = now + 7200;
+    raw.accounts[0].usage!.scopedLimits[0].resetsAt = now + 7200;
     setup(raw);
     await vi.advanceTimersByTimeAsync(0);
     expect(
-      screen
-        .getByRole('meter', { name: 'Weekly · overall' })
+      activeCard()
+        .getByRole('meter', { name: 'Weekly' })
         .closest('.usage-quota'),
-    ).toHaveTextContent('Resets in 1h 0m 0s');
+    ).toHaveTextContent('Resets in 1h 0m');
     expect(
-      screen
-        .getByRole('meter', { name: 'Weekly · selected model' })
-        .closest('.usage-quota'),
-    ).toHaveTextContent('Resets in 2h 0m 0s');
+      activeCard()
+        .getByRole('meter', { name: 'Weekly · Sonnet' })
+        .closest('li'),
+    ).toHaveTextContent('Resets in 2h 0m');
   });
-  it('shows unknown binding resets without borrowing a known aggregate date', async () => {
+  it('shows unknown resets without borrowing a known aggregate date', async () => {
     const raw = snapshot();
     delete raw.accounts[0].usage!.weeklyOverallResetsAt;
-    raw.accounts[0].usage!.weeklyModelResetsAt = null;
+    raw.accounts[0].usage!.scopedLimits[0].resetsAt = null;
     setup(raw);
     await screen.findAllByText('a@example.invalid');
     expect(
-      screen
-        .getByRole('meter', { name: 'Weekly · overall' })
+      activeCard()
+        .getByRole('meter', { name: 'Weekly' })
         .closest('.usage-quota'),
     ).toHaveTextContent('Reset time unknown');
     expect(
-      screen
-        .getByRole('meter', { name: 'Weekly · selected model' })
-        .closest('.usage-quota'),
-    ).toHaveTextContent('Reset time unknown');
+      activeCard()
+        .getByRole('meter', { name: 'Weekly · Sonnet' })
+        .closest('li'),
+    ).not.toHaveTextContent('Resets in');
   });
   it('confirms deletion before sending the stable account ID', async () => {
     const { call } = setup();
@@ -132,13 +156,37 @@ describe('desktop workflows', () => {
       expect(call).toHaveBeenCalledWith('delete_account', { id: 'b' }),
     );
   });
-
+  it('refreshes and deletes from the row menu, also for the active Claude account', async () => {
+    const { call } = setup();
+    const trigger = await menu('Studio');
+    await fireEvent.click(
+      menuItems(trigger).getByRole('button', { name: 'Refresh' }),
+    );
+    await waitFor(() =>
+      expect(call).toHaveBeenCalledWith('refresh_account', { id: 'a' }),
+    );
+    expect(trigger).toHaveFocus();
+    await fireEvent.click(trigger);
+    // Claude keeps its login when the saved active account is removed.
+    const remove = menuItems(trigger).getByRole('button', { name: 'Delete' });
+    await waitFor(() => expect(remove).toBeEnabled());
+    await fireEvent.click(remove);
+    expect(screen.getByRole('dialog')).toHaveTextContent(
+      t('en', 'deleteClaude', { name: 'Studio' }),
+    );
+    await fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    await waitFor(() => expect(trigger).toHaveFocus());
+  });
   it('restores the stable table trigger after canceling deletion from account details', async () => {
     setup();
     const trigger = await screen.findByRole('button', {
-      name: 'Account details and actions for Personal',
+      name: 'More actions for Personal',
     });
     await fireEvent.click(trigger);
+    await fireEvent.click(
+      menuItems(trigger).getByRole('button', { name: 'Details' }),
+    );
     await fireEvent.click(
       within(screen.getByRole('dialog')).getByRole('button', {
         name: 'Delete account Personal',
@@ -179,6 +227,12 @@ describe('desktop workflows', () => {
   it('saves the weekly reset order with the other automation settings', async () => {
     const { call } = setup();
     await screen.findAllByText('a@example.invalid');
+    expect(
+      section('Automation').getByText('Soonest reset first'),
+    ).toBeVisible();
+    expect(
+      section('Next up').getByText(t('en', 'nextWhySoonest')),
+    ).toBeVisible();
     await fireEvent.click(
       screen.getByRole('button', { name: 'Open settings' }),
     );
@@ -201,8 +255,12 @@ describe('desktop workflows', () => {
     await waitFor(() =>
       expect(screen.queryByRole('dialog')).not.toBeInTheDocument(),
     );
+    expect(section('Automation').getByText('Most left first')).toBeVisible();
+    expect(
+      section('Next up').getByText(t('en', 'nextWhyMostLeft')),
+    ).toBeVisible();
     await fireEvent.click(
-      screen.getByRole('button', { name: 'Open settings' }),
+      section('Automation').getByRole('button', { name: 'Manage automation' }),
     );
     expect(
       screen.getByRole('switch', {
@@ -213,6 +271,9 @@ describe('desktop workflows', () => {
   it('says which automation applies to Codex and keeps the Claude-only settings apart', async () => {
     setup();
     await screen.findAllByText('a@example.invalid');
+    const automation = section('Automation');
+    expect(automation.getByText('Start the weekly window')).toBeVisible();
+    expect(automation.getByText('Use resets automatically')).toBeVisible();
     await fireEvent.click(
       screen.getByRole('button', { name: 'Open settings' }),
     );
@@ -252,7 +313,18 @@ describe('desktop workflows', () => {
       screen.getByRole('status', { name: 'Demo data · actions are disabled.' }),
     ).toBeVisible();
     expect(screen.getByRole('button', { name: /Add account/ })).toBeDisabled();
-    expect(screen.getByRole('button', { name: 'Switch' })).toBeDisabled();
+    const switchButton = screen.getByRole('button', { name: 'Switch' });
+    expect(switchButton).toBeDisabled();
+    expect(switchButton.parentElement).toHaveAttribute(
+      'title',
+      t('en', 'demoOnly'),
+    );
+    expect(screen.getByRole('button', { name: 'Refresh all' })).toBeDisabled();
+    expect(
+      section('Next up').getByRole('button', {
+        name: 'Switch now to Personal',
+      }),
+    ).toBeDisabled();
     const dialog = await details();
     expect(
       within(dialog).getByRole('button', { name: 'Delete account Personal' }),
@@ -273,22 +345,31 @@ describe('desktop workflows', () => {
         ],
       }),
     );
-    await screen.findByText('No usage data');
+    await screen.findAllByText('a@example.invalid');
     expect(
-      screen.getByRole('meter', { name: 'Last 5 hours' }),
+      activeCard().getByRole('meter', { name: '5-hour window' }),
     ).not.toHaveAttribute('aria-valuenow');
-    expect(screen.getByText('The last reading is retained.')).toBeVisible();
+    expect(activeCard().getByText('Not checked yet')).toBeVisible();
+    const failed = row('Personal').getByText('Last check failed');
+    expect(failed).toHaveAttribute('title', t('en', 'providerError'));
+    const dialog = await details();
+    expect(dialog).toHaveTextContent('The last reading is retained.');
   });
   it('opens the add disclosure by keyboard and closes it with Escape', async () => {
     setup();
     const trigger = await screen.findByRole('button', { name: /Add account/ });
     trigger.focus();
     await fireEvent.click(trigger);
-    const option = screen.getByRole('button', { name: 'Import archive' });
+    const option = screen.getByRole('button', {
+      name: 'Import from ClaudeSwitch…',
+    });
+    expect(
+      screen.getByRole('button', { name: 'Import current Claude Code login' }),
+    ).toBeEnabled();
     option.focus();
     await fireEvent.keyDown(option, { key: 'Escape' });
     expect(
-      screen.queryByRole('button', { name: 'Import archive' }),
+      screen.queryByRole('button', { name: 'Import from ClaudeSwitch…' }),
     ).not.toBeInTheDocument();
     expect(trigger).toHaveFocus();
   });
@@ -301,8 +382,13 @@ describe('desktop workflows', () => {
       url: 'https://platform.claude.com/oauth/authorize',
     });
     await fireEvent.click(
-      screen.getByRole('button', { name: 'Add a Claude account' }),
+      screen.getByRole('button', { name: 'Sign in with Claude…' }),
     );
+    expect(
+      within(screen.getByRole('dialog')).getByRole('heading', {
+        name: 'Sign in with Claude',
+      }),
+    ).toBeVisible();
     const input = await screen.findByLabelText('Authorization code');
     await waitFor(() => expect(input).toBeEnabled());
     await fireEvent.input(input, { target: { value: 'code#state' } });
@@ -369,6 +455,8 @@ describe('desktop workflows', () => {
     expect(
       screen.getByRole('button', { name: 'Deschide setările' }),
     ).toBeVisible();
+    expect(screen.getByText(t('ro', 'claudeSubtitle'))).toBeVisible();
+    expect(section('Automatizare').getByText('92%')).toBeVisible();
   });
   it('names the account in background errors and keeps a dismissed one hidden', async () => {
     const failing = {
@@ -424,9 +512,10 @@ describe('desktop workflows', () => {
     );
     const text = await screen.findByText(t('en', 'switchInterrupted'));
     await fireEvent.click(
-      within(text.parentElement!).getByRole('button', {
-        name: 'Dismiss message',
-      }),
+      within(text.closest('[role="status"]') as HTMLElement).getByRole(
+        'button',
+        { name: 'Dismiss message' },
+      ),
     );
     expect(
       screen.queryByText(t('en', 'switchInterrupted')),
@@ -441,10 +530,15 @@ describe('desktop workflows', () => {
         ],
       }),
     );
-    const reason = await screen.findByText(t('en', 'switchChecking'));
-    const button = screen.getByRole('button', { name: 'Switch' });
+    await screen.findAllByText('a@example.invalid');
+    const personal = row('Personal');
+    const status = personal.getByText('Checking…');
+    const button = personal.getByRole('button', { name: 'Switch' });
     expect(button).toBeDisabled();
-    expect(button).toHaveAttribute('aria-describedby', reason.id);
+    expect(button.getAttribute('aria-describedby')).toContain(
+      status.closest('[id]')!.id,
+    );
+    expect(button).toHaveAccessibleDescription(/Personal.*Checking…/);
     expect(button.parentElement).toHaveAttribute(
       'title',
       t('en', 'switchChecking'),
@@ -461,37 +555,49 @@ describe('desktop workflows', () => {
         ],
       }),
     );
-    expect(await screen.findByText(t('en', 'switchNeedsSignIn'))).toBeVisible();
+    await screen.findAllByText('a@example.invalid');
+    const personal = row('Personal');
+    expect(personal.queryByRole('button', { name: 'Switch' })).toBeNull();
     expect(
-      screen.queryByRole('button', { name: 'Switch' }),
-    ).not.toBeInTheDocument();
+      screen.getByText(t('en', 'signInNeeded', { names: 'Personal' })),
+    ).toBeVisible();
     call.mockResolvedValueOnce({
       id: 'login-1',
       url: 'https://platform.claude.com/oauth/authorize',
     });
-    await fireEvent.click(
-      screen.getByRole('button', { name: 'Sign in again to Personal' }),
-    );
+    const trigger = personal.getByRole('button', { name: 'Sign in again' });
+    expect(trigger).toHaveAccessibleDescription('Personal');
+    await fireEvent.click(trigger);
     await waitFor(() => expect(call).toHaveBeenCalledWith('begin_login'));
+    await fireEvent(
+      screen.getByRole('dialog'),
+      new Event('cancel', { cancelable: true }),
+    );
+    await waitFor(() => expect(trigger).toHaveFocus());
   });
-  it('shows when exhausted accounts free up and who frees up first', async () => {
+  it('shows when limited accounts free up and who frees up first', async () => {
     const now = Math.floor(Date.now() / 1000);
     const raw = snapshot({
       accounts: [
         account('a', { exhausted: true, freesAt: now + 7800 }),
-        account('b', { exhausted: true, freesAt: now + 3600 }),
+        account('b', { exhausted: true, freesAt: now + 3600, isNext: false }),
       ],
       consumptionPlan: [],
     });
     setup(raw);
     expect(
       await screen.findByText(
-        t('en', 'allExhaustedUntil', { name: 'Personal', duration: '1h 0m' }),
+        t('en', 'allLimitedUntil', { name: 'Personal', duration: '1h 0m' }),
       ),
     ).toBeVisible();
+    expect(row('Personal').getByText(/^Frees in 1h 0m/)).toBeVisible();
     expect(
-      screen.getByText(t('en', 'freesIn', { duration: '2h 10m' })),
+      row('Studio').getByText(/Limit reached · frees in 2h 10m/),
     ).toBeVisible();
+    // The active card offers no switch when no other account is usable.
+    expect(
+      activeCard().queryByRole('button', { name: /^Switch to/ }),
+    ).toBeNull();
     language.set('ro');
     const ro = { ...raw, revision: 2 };
     ro.settings = { ...raw.settings, language: 'ro' };
@@ -499,10 +605,36 @@ describe('desktop workflows', () => {
     setup(ro);
     expect(
       await screen.findByText(
-        'Toate conturile sunt la limită. Primul cont liber va fi Personal, în 1 h 0 min.',
+        'Toate conturile sunt la limită. Primul se eliberează Personal, în 1 h 0 min.',
       ),
     ).toBeVisible();
-    expect(screen.getByText('Se eliberează în 2 h 10 min')).toBeVisible();
+    expect(
+      row('Personal').getByText(/^Se eliberează în 1 h 0 min/),
+    ).toBeVisible();
+  });
+  it('offers the next account on the active card at the switch threshold', async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const { call } = setup(
+      snapshot({
+        accounts: [
+          account('a', { exhausted: true, freesAt: now + 7800 }),
+          account('b'),
+        ],
+      }),
+    );
+    await screen.findAllByText('a@example.invalid');
+    expect(
+      activeCard().getByText(
+        'Reached the 95% switch threshold · frees in 2h 10m',
+      ),
+    ).toBeVisible();
+    call.mockResolvedValueOnce(snapshot({ revision: 2, activeId: 'b' }));
+    await fireEvent.click(
+      activeCard().getByRole('button', { name: 'Switch to Personal now' }),
+    );
+    await waitFor(() =>
+      expect(call).toHaveBeenCalledWith('switch_account', { id: 'b' }),
+    );
   });
   it('names a blocking environment variable instead of showing an empty window', async () => {
     setup(
@@ -532,7 +664,9 @@ describe('desktop workflows', () => {
     ).toBeVisible();
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     expect(
-      screen.queryByRole('button', { name: 'Import current account' }),
+      screen.queryByRole('button', {
+        name: 'Import current Claude Code login',
+      }),
     ).not.toBeInTheDocument();
   });
   it('labels deletion in account details and maps raw plan tiers', async () => {
@@ -544,7 +678,7 @@ describe('desktop workflows', () => {
         ],
       }),
     );
-    expect(await screen.findByText('Max 20×')).toBeVisible();
+    expect((await screen.findAllByText('Max 20×'))[0]).toBeVisible();
     const dialog = await details();
     // The only "×" left in the dialog is its own close button.
     expect(

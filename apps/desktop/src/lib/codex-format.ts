@@ -62,29 +62,11 @@ export function codexWindowLabel(
 ): string {
   if (minutes === null)
     return t(locale, slot === 'short' ? 'codexWindowShort' : 'codexWindowLong');
-  if (minutes === 10080) return t(locale, 'codexWindowWeekly');
+  if (minutes === 10080) return t(locale, 'weekly');
   if (minutes === 1440) return t(locale, 'codexWindowDaily');
   if (minutes % 1440 === 0) return unit(minutes / 1440, 'day', locale);
   if (minutes % 60 === 0) return unit(minutes / 60, 'hour', locale);
   return unit(minutes, 'minute', locale);
-}
-
-/** Compact remaining time without seconds: "2h 10m", "3d 4h", "45m". */
-export function codexDuration(seconds: number, locale: Language): string {
-  const total = Math.max(1, Math.ceil(seconds / 60));
-  const days = Math.floor(total / 1440),
-    hours = Math.floor((total % 1440) / 60),
-    minutes = total % 60;
-  const day = locale === 'ro' ? 'z' : 'd';
-  if (days)
-    return hours
-      ? `${number(days, locale)}${day} ${number(hours, locale)}h`
-      : `${number(days, locale)}${day}`;
-  if (hours)
-    return minutes
-      ? `${number(hours, locale)}h ${number(minutes, locale)}m`
-      : `${number(hours, locale)}h`;
-  return `${number(minutes, locale)}m`;
 }
 
 /** Elapsed time for live progress, "0:23". */
@@ -190,35 +172,6 @@ export function codexLimitState(account: CodexAccount): CodexLimitState {
   return { limited, freesAt };
 }
 
-export type CodexStatusKind =
-  | 'signIn'
-  | 'active'
-  | 'apiKey'
-  | 'unsupported'
-  | 'unread'
-  | 'limited'
-  | 'ready';
-export interface CodexStatus extends CodexLimitState {
-  kind: CodexStatusKind;
-}
-export function codexStatus(account: CodexAccount): CodexStatus {
-  const limit = codexLimitState(account);
-  const kind: CodexStatusKind = account.needsSignIn
-    ? 'signIn'
-    : account.selected
-      ? 'active'
-      : account.authKind === 'apiKey'
-        ? 'apiKey'
-        : account.authKind === 'unsupported'
-          ? 'unsupported'
-          : !account.quota
-            ? 'unread'
-            : limit.limited
-              ? 'limited'
-              : 'ready';
-  return { kind, ...limit };
-}
-
 /** True when the account can be switched to right now, ignoring transient UI locks. */
 export function codexCanSwitch(
   snapshot: CodexSnapshot,
@@ -229,19 +182,6 @@ export function codexCanSwitch(
     account.switchable.enabled &&
     !account.selected &&
     !account.needsSignIn
-  );
-}
-
-/**
- * The account automatic switching uses next. The native side ranks it with the
- * rules shared with Claude; the window never ranks accounts itself.
- */
-export function codexNextAccount(snapshot: CodexSnapshot): CodexAccount | null {
-  if (!snapshot.nextId) return null;
-  return (
-    snapshot.accounts.find(
-      (account) => account.id === snapshot.nextId && !account.selected,
-    ) ?? null
   );
 }
 

@@ -1,54 +1,50 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
   import { language, t } from '../lib/i18n';
-  import { age } from '../lib/format';
   import {
+    codexElapsed,
     codexImportedMessage,
-    codexLastRead,
     codexMessage,
-    codexNextAccount,
   } from '../lib/codex-format';
   import type { CodexController, CodexNotice } from '../lib/codex-controller';
   import type { CodexAccount } from '../lib/codex-types';
   import type { Settings } from '../lib/types';
-  import Icon from './Icon.svelte';
-  import CodexIcon from './CodexIcon.svelte';
-  import ProviderTabs from './ProviderTabs.svelte';
+  import { codexView } from '../lib/codex-view';
+  import type {
+    AccountRowView,
+    AddOption,
+    AutomationItem,
+    NoticeView,
+    ProviderKey,
+  } from '../lib/provider-view';
+  import ProviderPage from './ProviderPage.svelte';
+  import AccountDetails from './AccountDetails.svelte';
+  import DeleteDialog from './DeleteDialog.svelte';
   import Modal from './Modal.svelte';
-  import CodexActiveCard from './CodexActiveCard.svelte';
-  import CodexAccountsTable from './CodexAccountsTable.svelte';
-  import CodexInsights from './CodexInsights.svelte';
-  import CodexSwitchBanner from './CodexSwitchBanner.svelte';
-  import CodexDetails from './CodexDetails.svelte';
-  import primerLogo from '../assets/primer-logo.png';
-  import meta from '../../package.json';
+  import Icon from './Icon.svelte';
   let {
     controller,
     now,
-    onclaude,
+    onprovider,
     onsettings,
     externalBlocked = false,
     externalDemo = false,
-    settingsAvailable = true,
+    settingsDisabled = false,
     automation = null,
   }: {
     controller: CodexController;
     now: number;
-    onclaude: () => void;
+    onprovider: (provider: ProviderKey) => void;
     onsettings: () => void;
+    /** A Claude action or sign-in is running. */
     externalBlocked?: boolean;
     externalDemo?: boolean;
-    settingsAvailable?: boolean;
+    settingsDisabled?: boolean;
     /** The automation settings Codex shares with Claude. */
     automation?: Settings | null;
   } = $props();
   let snapshot = $derived($controller.snapshot);
   let pending = $derived($controller.pending);
-  let selected = $derived(
-    snapshot?.accounts.find((a) => a.id === snapshot.selectedId) ??
-      snapshot?.accounts.find((a) => a.selected) ??
-      null,
-  );
   let switching = $derived(snapshot?.switching ?? null);
   let switchPending = $derived(pending === 'codex_switch_account');
   /** Any lock that must keep mutations disabled. */
@@ -61,7 +57,18 @@
       !!switching ||
       $controller.login.open,
   );
-  let nextBest = $derived(snapshot ? codexNextAccount(snapshot) : null);
+  let lockReason = $derived(
+    t($language, snapshot?.demo || externalDemo ? 'demoOnly' : 'switchBusy'),
+  );
+  let view = $derived(
+    codexView(snapshot, {
+      locale: $language,
+      now,
+      settings: automation,
+      pending,
+      pendingId: $controller.pendingId,
+    }),
+  );
   let switchTargetId = $derived(
     switching?.targetId ?? (switchPending ? $controller.pendingId : null),
   );
@@ -74,11 +81,21 @@
     else if (switchStartedLocally === null)
       switchStartedLocally = Math.floor(Date.now() / 1000);
   });
-  let lastRead = $derived(codexLastRead(snapshot));
   let setupProblem = $derived(
     !!snapshot &&
       snapshot.availability !== 'supported' &&
       !(snapshot.availability === 'unqualified' && !snapshot.blockedReason),
+  );
+  let setupReason = $derived(
+    snapshot && setupProblem
+      ? codexMessage(
+          snapshot.blockedReason ??
+            (snapshot.availability === 'notInstalled'
+              ? 'notInstalled'
+              : 'unsupportedVersion'),
+          $language,
+        )
+      : null,
   );
   let dismissedSnapshotError = $state<string | null>(null);
   $effect(() => {
@@ -94,9 +111,7 @@
   );
   let warnings = $derived([...new Set(snapshot?.warnings ?? [])]);
   let dismissedWarnings = $state('');
-  let showWarnings = $derived(
-    warnings.length > 0 && warnings.join(',') !== dismissedWarnings,
-  );
+  let dismissedSignIn = $state<string | null>(null);
   let canRefreshAll = $derived(
     !!snapshot?.capabilities.refreshQuota.enabled &&
       !!snapshot?.accounts.some(
@@ -113,28 +128,21 @@
     snapshot?.accounts.find((a) => a.id === $controller.login.accountId) ??
       null,
   );
-  let addOpen = $state(false);
-  let addButton = $state<HTMLButtonElement | null>(null);
-  let addMenu = $state<HTMLElement | null>(null);
-  let noticeElement = $state<HTMLElement | null>(null);
-  let errorElement = $state<HTMLElement | null>(null);
   let detailsId = $state<string | null>(null),
-    deleteTarget = $state<CodexAccount | null>(null),
+    deleteTarget = $state<AccountRowView | null>(null),
     returnFocus = $state<HTMLElement | null>(null);
-  let details = $derived(
-    snapshot?.accounts.find((a) => a.id === detailsId) ?? null,
-  );
+  let details = $derived(view.rows.find((r) => r.id === detailsId) ?? null);
+  const account = (id: string | undefined): CodexAccount | null =>
+    snapshot?.accounts.find((a) => a.id === id) ?? null;
   onMount(() => {
     void controller.start();
   });
   function noticeText(notice: CodexNotice): string {
     switch (notice.kind) {
       case 'loginComplete': {
-        const account = snapshot?.accounts.find(
-          (a) => a.id === notice.accountId,
-        );
-        return account
-          ? t($language, 'codexSignedInAgain', { name: account.name })
+        const target = account(notice.accountId ?? undefined);
+        return target
+          ? t($language, 'codexSignedInAgain', { name: target.name })
           : t($language, 'codexLoginComplete');
       }
       case 'deleteComplete':
@@ -143,18 +151,15 @@
         return codexImportedMessage('current', notice.added, $language);
       case 'importedSwitcher':
         return codexImportedMessage('switcher', notice.added, $language);
-      case 'switched': {
-        const name =
-          snapshot?.accounts.find((a) => a.id === notice.accountId)?.name ??
-          notice.name;
+      case 'switched':
         return t(
           $language,
           notice.daemonRestarted ? 'codexSwitchedLive' : 'codexSwitchedNext',
-          { name },
+          { name: account(notice.accountId)?.name ?? notice.name },
         );
-      }
     }
   }
+  /** After an action, move focus to its result unless focus is still somewhere useful. */
   function focusOutcome(trigger: HTMLElement | null) {
     const active = document.activeElement;
     if (
@@ -164,27 +169,32 @@
       !(active instanceof HTMLButtonElement && active.disabled)
     )
       return;
-    setTimeout(() => (noticeElement ?? errorElement)?.focus(), 0);
+    setTimeout(
+      () =>
+        (
+          document.getElementById('notice-outcome') ??
+          document.getElementById('notice-error')
+        )?.focus(),
+      0,
+    );
   }
-  async function switchTo(account: CodexAccount, trigger: HTMLElement | null) {
+  async function switchTo(row: AccountRowView, trigger: HTMLElement | null) {
     detailsId = null;
-    await controller.switchAccount(account);
+    const target = account(row.id);
+    if (!target) return;
+    await controller.switchAccount(target);
     await tick();
     focusOutcome(trigger);
   }
-  function signIn(account: CodexAccount | null, trigger: HTMLElement | null) {
+  function signIn(row: AccountRowView | null, trigger: HTMLElement | null) {
     detailsId = null;
     returnFocus = trigger;
-    void controller.beginLogin(account);
+    void controller.beginLogin(row ? account(row.id) : null);
   }
-  function openDetails(account: CodexAccount, trigger: HTMLElement) {
-    returnFocus = trigger;
-    detailsId = account.id;
-  }
-  function askDelete(account: CodexAccount, trigger: HTMLElement | null) {
+  function askDelete(row: AccountRowView, trigger: HTMLElement | null) {
     returnFocus = trigger;
     detailsId = null;
-    deleteTarget = account;
+    deleteTarget = row;
   }
   async function confirmDelete() {
     const target = deleteTarget;
@@ -203,371 +213,333 @@
     if ($controller.error) controller.dismissError();
     else dismissedSnapshotError = snapshot?.error ?? null;
   }
-  function add(run: () => void) {
-    addOpen = false;
-    returnFocus = addButton;
-    addButton?.focus();
-    run();
-  }
-  function keydown(event: KeyboardEvent) {
-    if (event.key === 'Escape' && addOpen) {
-      event.preventDefault();
-      addOpen = false;
-      addButton?.focus();
+  const stages = ['saving', 'restarting', 'verifying'] as const;
+  let notices = $derived.by(() => {
+    const list: NoticeView[] = [];
+    if (switching || switchPending) {
+      const stage = switching?.stage ?? 'saving';
+      const current = stages.indexOf(stage);
+      list.push({
+        key: 'switching',
+        tone: 'progress',
+        role: 'status',
+        title: t($language, 'codexSwitchingTo', {
+          name: switchTarget?.name ?? '',
+        }),
+        text: t(
+          $language,
+          stage === 'saving'
+            ? 'codexStageSaving'
+            : stage === 'restarting'
+              ? 'codexStageRestarting'
+              : 'codexStageVerifying',
+        ),
+        steps: stages.map((step, index) => ({
+          label: t(
+            $language,
+            step === 'saving'
+              ? 'codexStepSave'
+              : step === 'restarting'
+                ? 'codexStepRestart'
+                : 'codexStepVerify',
+          ),
+          state:
+            index < current ? 'done' : index === current ? 'current' : 'todo',
+        })),
+        elapsed: codexElapsed(
+          now - (switching?.startedAt ?? switchStartedLocally ?? now),
+        ),
+      });
+    } else if (snapshot?.busy && !pending && !$controller.login.open)
+      list.push({
+        key: 'busy',
+        tone: 'progress',
+        role: 'status',
+        text: t($language, 'codexBusy'),
+      });
+    if (errorReason)
+      list.push({
+        key: 'error',
+        tone: 'error',
+        role: 'alert',
+        id: 'notice-error',
+        text: codexMessage(errorReason, $language),
+        dismiss: dismissError,
+      });
+    if (setupReason && view.rows.length)
+      list.push({
+        key: 'setup',
+        tone: 'warn',
+        role: 'note',
+        title: t($language, 'codexSetupTitle'),
+        text: setupReason,
+        action: {
+          label: t($language, 'codexCheckSetup'),
+          disabled: locked,
+          run: () => void controller.discover(),
+        },
+      });
+    const outcome = $controller.notice;
+    if (outcome) {
+      const warning = outcome.kind === 'switched' ? outcome.warning : null;
+      list.push({
+        key: 'outcome',
+        tone: warning ? 'warn' : 'success',
+        role: 'status',
+        id: 'notice-outcome',
+        text: noticeText(outcome),
+        lines: [
+          ...(outcome.kind === 'switched' && outcome.otherClients > 0
+            ? [{ text: t($language, 'codexSwitchedOtherClients') }]
+            : []),
+          ...(warning
+            ? [
+                {
+                  text: codexMessage(warning, $language),
+                  tone: 'warn' as const,
+                },
+              ]
+            : []),
+        ],
+        dismiss: () => controller.dismissNotice(),
+      });
     }
-  }
-  function pointerdown(event: PointerEvent) {
-    if (
-      addOpen &&
-      !(event.target instanceof Node && addMenu?.contains(event.target))
-    )
-      addOpen = false;
-  }
+    if (view.allLimited)
+      list.push({
+        key: 'limited',
+        tone: 'info',
+        role: 'status',
+        text: view.allLimited,
+      });
+    const signInKey = view.signIn.map((r) => r.id).join(',');
+    if (view.signIn.length && signInKey !== dismissedSignIn) {
+      const only = view.signIn.length === 1 ? view.signIn[0] : null;
+      list.push({
+        key: 'sign-in',
+        tone: 'warn',
+        role: 'note',
+        text: t($language, 'signInNeeded', {
+          names: view.signIn.map((r) => r.name).join(', '),
+        }),
+        action:
+          only && only.canSignIn
+            ? {
+                label: t($language, 'signInAgain'),
+                disabled: locked,
+                run: (trigger) => signIn(only, trigger),
+              }
+            : undefined,
+        dismiss: () => (dismissedSignIn = signInKey),
+      });
+    }
+    if (snapshot?.environment.codexSwitcherRunning)
+      list.push({
+        key: 'switcher',
+        tone: 'warn',
+        role: 'note',
+        title: t($language, 'codexSwitcherTitle'),
+        text: t($language, 'codexSwitcherText'),
+        action: snapshot.capabilities.importSwitcher.enabled
+          ? {
+              label:
+                pending === 'codex_import_switcher'
+                  ? t($language, 'importing')
+                  : t($language, 'codexSwitcherImport'),
+              disabled: locked,
+              run: () => void controller.importSwitcher(),
+            }
+          : undefined,
+      });
+    if (warnings.length && warnings.join(',') !== dismissedWarnings)
+      list.push({
+        key: 'warnings',
+        tone: 'warn',
+        role: 'note',
+        label: t($language, 'codexWarnings'),
+        text: t($language, 'codexWarnings'),
+        items: warnings.map((warning) => codexMessage(warning, $language)),
+        dismiss: () => (dismissedWarnings = warnings.join(',')),
+      });
+    if (snapshot?.demo)
+      list.push({
+        key: 'demo',
+        tone: 'demo',
+        role: 'status',
+        title: t($language, 'preview'),
+        text: t($language, 'demoNotice'),
+        label: t($language, 'demoNotice'),
+      });
+    return list;
+  });
+  let importing = $derived(
+    pending === 'codex_import_current' || pending === 'codex_import_switcher',
+  );
+  let addOptions = $derived<AddOption[]>([
+    {
+      key: 'sign-in',
+      label: t($language, 'codexAddSignIn'),
+      icon: 'plus',
+      disabled: locked || !snapshot?.capabilities.loginBrowser.enabled,
+      run: (trigger) => signIn(null, trigger),
+    },
+    {
+      key: 'current',
+      label: t($language, 'codexImportCurrent'),
+      icon: 'import',
+      disabled: locked || !snapshot?.capabilities.importCurrent.enabled,
+      run: () => void controller.importCurrent(),
+    },
+    ...(snapshot?.capabilities.importSwitcher.enabled
+      ? [
+          {
+            key: 'switcher',
+            label: t($language, 'codexImportSwitcher'),
+            icon: 'archive',
+            disabled: locked,
+            run: () => void controller.importSwitcher(),
+          },
+        ]
+      : []),
+  ]);
+  let environment = $derived(snapshot?.environment ?? null);
+  let automationItems = $derived<AutomationItem[]>([
+    ...(environment?.daemonRunning === true
+      ? [
+          {
+            kind: 'note' as const,
+            tone: 'ok' as const,
+            text: t($language, 'codexEnvDaemon'),
+          },
+        ]
+      : environment?.daemonRunning === false
+        ? [
+            {
+              kind: 'note' as const,
+              tone: 'muted' as const,
+              text: t($language, 'codexEnvNoDaemon'),
+            },
+          ]
+        : []),
+    environment && environment.otherClients > 0
+      ? {
+          kind: 'note' as const,
+          tone: 'warn' as const,
+          text: t($language, 'codexEnvOtherClients'),
+        }
+      : {
+          kind: 'note' as const,
+          tone: 'muted' as const,
+          text: t($language, 'codexEnvApps'),
+        },
+  ]);
+  let setupState = $derived(
+    !snapshot ||
+      pending === 'codex_discover' ||
+      (snapshot.availability === 'unqualified' && !snapshot.blockedReason)
+      ? 'checking'
+      : snapshot.availability === 'supported'
+        ? 'ready'
+        : snapshot.availability === 'notInstalled'
+          ? 'missing'
+          : 'attention',
+  );
+  let setupText = $derived.by(() => {
+    const version = snapshot?.executableVersion;
+    if (setupState === 'checking') return t($language, 'codexSetupChecking');
+    if (setupState === 'missing') return t($language, 'codexSetupNotInstalled');
+    if (setupState === 'ready')
+      return version
+        ? t($language, 'codexSetupReady', { version })
+        : t($language, 'codexSetupReadyUnknown');
+    return version
+      ? t($language, 'codexSetupAttention', { version })
+      : t($language, 'codexSetupAttentionUnknown');
+  });
 </script>
 
-<svelte:window onkeydown={keydown} onpointerdown={pointerdown} />
-<div class="desktop-shell">
-  <aside class="sidebar" aria-label={t($language, 'navigation')}>
-    <div class="sidebar-brand" role="img" aria-label="PrimerSwitch">
-      <img
-        class="primer-mark"
-        src={primerLogo}
-        alt=""
-        aria-hidden="true"
-      /><span class="primer-wordmark" aria-hidden="true"
-        ><strong>primer</strong><span>Switch</span></span
-      >
-    </div>
-    <nav>
-      <button
-        class="nav-current"
-        aria-current="page"
-        onclick={() =>
-          document
-            .getElementById('codex-accounts-heading')
-            ?.scrollIntoView({ behavior: 'smooth' })}
-        ><Icon name="accounts" /><span>{t($language, 'accounts')}</span></button
-      ><button
-        aria-label={t($language, 'openSettings')}
-        disabled={!settingsAvailable}
-        onclick={onsettings}
-        ><Icon name="settings" /><span>{t($language, 'settings')}</span></button
-      >
-    </nav>
-    <div class="sidebar-bottom">
-      <span class="status-dot"></span><span
-        >{t($language, 'localAccounts')}</span
-      >
-    </div>
-  </aside>
-  <div class="workspace">
-    <header class="workspace-header">
-      <div>
-        <h1>{t($language, 'accounts')}</h1>
-        <p>{t($language, 'codexDescription')}</p>
-      </div>
-      <ProviderTabs
-        active="codex"
-        onselect={(provider) => {
-          if (provider === 'claude') onclaude();
-        }}
-        disabled={externalBlocked ||
-          !!pending ||
-          !!switching ||
-          $controller.login.open}
-      />
-    </header>
-    {#if snapshot?.demo}<div
-        class="demo-notice"
-        role="status"
-        aria-label={t($language, 'demoNotice')}
-      >
-        <strong>{t($language, 'preview')}</strong><span
-          >{t($language, 'demoNotice')}</span
-        >
-      </div>{/if}
-    <div class="codex-live" aria-live="polite">
-      {#if switching || switchPending}<CodexSwitchBanner
-          name={switchTarget?.name ?? ''}
-          stage={switching?.stage ?? 'saving'}
-          elapsed={now - (switching?.startedAt ?? switchStartedLocally ?? now)}
-        />{/if}
-    </div>
-    {#if snapshot?.environment.codexSwitcherRunning}<div
-        class="codex-banner warn"
-        role="note"
-      >
-        <CodexIcon name="warning" />
-        <p>
-          <strong>{t($language, 'codexSwitcherTitle')}</strong>
-          {t($language, 'codexSwitcherText')}
-        </p>
-        {#if snapshot.capabilities.importSwitcher.enabled}<button
-            disabled={locked}
-            onclick={() => controller.importSwitcher()}
-            >{pending === 'codex_import_switcher'
-              ? t($language, 'codexImporting')
-              : t($language, 'codexSwitcherImport')}</button
-          >{/if}
-      </div>{/if}
-    {#if showWarnings}<div
-        class="codex-banner warn"
-        role="note"
-        aria-label={t($language, 'codexWarnings')}
-      >
-        <CodexIcon name="info" />
-        <ul>
-          {#each warnings as warning (warning)}<li>
-              {codexMessage(warning, $language)}
-            </li>{/each}
-        </ul>
-        <button
-          class="icon-button"
-          aria-label={t($language, 'dismissMessage')}
-          onclick={() => (dismissedWarnings = warnings.join(','))}>×</button
-        >
-      </div>{/if}
-    {#if errorReason}<div
-        class="error-notice"
-        role="alert"
-        tabindex="-1"
-        bind:this={errorElement}
-      >
-        <span>{codexMessage(errorReason, $language)}</span><button
-          class="icon-button"
-          aria-label={t($language, 'dismissMessage')}
-          onclick={dismissError}>×</button
-        >
-      </div>{/if}
-    {#if $controller.notice}
-      {@const notice = $controller.notice}
-      {@const warning = notice.kind === 'switched' ? notice.warning : null}
-      <div
-        class="codex-notice"
-        class:warn={!!warning}
-        role="status"
-        tabindex="-1"
-        bind:this={noticeElement}
-      >
-        <CodexIcon name={warning ? 'warning' : 'check'} />
-        <div>
-          <p>{noticeText(notice)}</p>
-          {#if notice.kind === 'switched' && notice.otherClients > 0}<p
-              class="sub"
-            >
-              {t($language, 'codexSwitchedOtherClients')}
-            </p>{/if}
-          {#if warning}<p class="sub warning">
-              {codexMessage(warning, $language)}
-            </p>{/if}
-        </div>
-        <button
-          class="icon-button"
-          aria-label={t($language, 'dismissMessage')}
-          onclick={() => controller.dismissNotice()}>×</button
-        >
-      </div>
-    {/if}
-    {#if snapshot?.busy && !pending && !switching && !$controller.login.open}<div
-        class="pending-notice"
-        role="status"
-      >
-        <span class="spinner" aria-hidden="true"></span>{t(
-          $language,
-          'codexBusy',
-        )}
-      </div>{/if}
-    <div
-      id="provider-content"
-      role="tabpanel"
-      aria-labelledby="provider-codex"
-      tabindex="0"
+<ProviderPage
+  {view}
+  {now}
+  subtitle={t($language, 'codexSubtitle')}
+  tabsDisabled={externalBlocked ||
+    !!pending ||
+    !!switching ||
+    $controller.login.open}
+  {onprovider}
+  {settingsDisabled}
+  {onsettings}
+  {notices}
+  refreshAll={{
+    label: t(
+      $language,
+      pending === 'codex_refresh_all' ? 'refreshing' : 'refreshAll',
+    ),
+    disabled: locked || !canRefreshAll,
+    run: () => void controller.refreshAll(),
+  }}
+  {locked}
+  {lockReason}
+  refreshingActive={!!view.active &&
+    ((pending === 'codex_refresh_account' &&
+      $controller.pendingId === view.active.id) ||
+      pending === 'codex_refresh_all')}
+  activeEmpty={setupReason && !view.rows.length
+    ? {
+        title: t($language, 'codexSetupTitle'),
+        text: setupReason,
+        action: {
+          label: t($language, 'codexCheckSetup'),
+          disabled: locked,
+          run: () => void controller.discover(),
+        },
+      }
+    : snapshot
+      ? { title: t($language, 'noActive'), text: t($language, 'noActiveCodex') }
+      : { title: t($language, 'loadingAccounts'), text: null }}
+  addLabel={importing ? t($language, 'importing') : t($language, 'addAccount')}
+  addDisabled={locked || !canAdd}
+  {addOptions}
+  emptyText={t($language, 'emptyCodex')}
+  {automationItems}
+  onswitch={(row, trigger) => void switchTo(row, trigger)}
+  onsignin={(row, trigger) => signIn(row, trigger)}
+  ondetails={(row, trigger) => {
+    returnFocus = trigger;
+    detailsId = row.id;
+  }}
+  onrefresh={(row) => void controller.refreshAccount(row.id)}
+  ondelete={askDelete}
+>
+  {#snippet providerCard()}
+    <section
+      class="panel side-panel setup-panel"
+      aria-labelledby="codex-setup-heading"
     >
-      <main class="dashboard-grid codex-dashboard">
-        <div class="main-column">
-          {#if snapshot && setupProblem}<section
-              class="panel codex-setup-panel"
-              aria-labelledby="codex-setup-panel-heading"
-            >
-              <div class="panel-heading">
-                <h2 id="codex-setup-panel-heading">
-                  <Icon name="settings" />{t($language, 'codexSetupTitle')}
-                </h2>
-                <button disabled={locked} onclick={() => controller.discover()}
-                  ><Icon name="refresh" size={16} />{t(
-                    $language,
-                    'codexCheckSetup',
-                  )}</button
-                >
-              </div>
-              <p>
-                {codexMessage(
-                  snapshot.blockedReason ??
-                    (snapshot.availability === 'notInstalled'
-                      ? 'notInstalled'
-                      : 'unsupportedVersion'),
-                  $language,
-                )}
-              </p>
-            </section>{/if}
-          <CodexActiveCard
-            {snapshot}
-            account={selected}
-            {now}
-            {locked}
-            refreshing={!!selected &&
-              ((pending === 'codex_refresh_account' &&
-                $controller.pendingId === selected.id) ||
-                pending === 'codex_refresh_all')}
-            {nextBest}
-            onrefresh={(account) => controller.refreshAccount(account.id)}
-            ondetails={openDetails}
-            onswitch={(account, trigger) => switchTo(account, trigger)}
-            onsignin={(account, trigger) => signIn(account, trigger)}
-          />
-          <section
-            class="saved-section"
-            aria-labelledby="codex-accounts-heading"
-          >
-            <div class="section-heading">
-              <h2 id="codex-accounts-heading">
-                {t($language, 'codexSavedAccounts')}<span class="count"
-                  >{snapshot?.accounts.length ?? 0}</span
-                >
-              </h2>
-              <div
-                class="add-menu"
-                role="group"
-                aria-label={t($language, 'codexAddActions')}
-                bind:this={addMenu}
-              >
-                <button
-                  class="primary"
-                  bind:this={addButton}
-                  disabled={locked || !canAdd}
-                  aria-expanded={addOpen}
-                  aria-controls="codex-add-actions"
-                  onclick={() => (addOpen = !addOpen)}
-                  ><Icon name="plus" size={16} />{pending ===
-                    'codex_import_current' ||
-                  pending === 'codex_import_switcher'
-                    ? t($language, 'codexImporting')
-                    : t($language, 'codexAddAccount')}<Icon
-                    name="chevron"
-                    size={14}
-                  /></button
-                >{#if addOpen}<div id="codex-add-actions" class="add-options">
-                    <button
-                      disabled={locked ||
-                        !snapshot?.capabilities.loginBrowser.enabled}
-                      onclick={() => add(() => signIn(null, addButton))}
-                      ><Icon name="plus" />{t(
-                        $language,
-                        'codexAddSignIn',
-                      )}</button
-                    ><button
-                      disabled={locked ||
-                        !snapshot?.capabilities.importCurrent.enabled}
-                      onclick={() =>
-                        add(() => {
-                          void controller.importCurrent();
-                        })}
-                      ><Icon name="import" />{t(
-                        $language,
-                        'codexAddImportCurrent',
-                      )}</button
-                    >{#if snapshot?.capabilities.importSwitcher.enabled}<button
-                        disabled={locked}
-                        onclick={() =>
-                          add(() => {
-                            void controller.importSwitcher();
-                          })}
-                        ><Icon name="archive" />{t(
-                          $language,
-                          'codexAddImportSwitcher',
-                        )}</button
-                      >{/if}
-                  </div>{/if}
-              </div>
-            </div>
-            {#if snapshot?.accounts.length}<CodexAccountsTable
-                {snapshot}
-                {now}
-                {locked}
-                {pending}
-                pendingId={$controller.pendingId}
-                onswitch={(account, trigger) => switchTo(account, trigger)}
-                onsignin={(account, trigger) => signIn(account, trigger)}
-                ondetails={openDetails}
-                onrefresh={(account) => controller.refreshAccount(account.id)}
-                ondelete={askDelete}
-              />{:else if snapshot}<div
-                class="panel empty-accounts codex-empty"
-              >
-                <span class="empty-account-icon"
-                  ><CodexIcon name="terminal" size={22} /></span
-                >
-                <h3>{t($language, 'codexEmptyTitle')}</h3>
-                <p>{t($language, 'codexEmptyText')}</p>
-                <div class="empty-actions">
-                  <button
-                    class="primary"
-                    disabled={locked ||
-                      !snapshot.capabilities.loginBrowser.enabled}
-                    onclick={(event) => signIn(null, event.currentTarget)}
-                    >{t($language, 'codexAddSignIn')}</button
-                  ><button
-                    disabled={locked ||
-                      !snapshot.capabilities.importCurrent.enabled}
-                    onclick={() => controller.importCurrent()}
-                    >{t($language, 'codexAddImportCurrent')}</button
-                  >{#if snapshot.capabilities.importSwitcher.enabled}<button
-                      disabled={locked}
-                      onclick={() => controller.importSwitcher()}
-                      >{t($language, 'codexAddImportSwitcher')}</button
-                    >{/if}
-                </div>
-              </div>{/if}
-          </section>
-        </div>
-        <aside
-          class="insights-column"
-          aria-label={t($language, 'accountInsights')}
-        >
-          <CodexInsights
-            {snapshot}
-            {now}
-            {locked}
-            {nextBest}
-            {automation}
-            checkingSetup={pending === 'codex_discover'}
-            onswitch={(account, trigger) => switchTo(account, trigger)}
-            ondiscover={() => controller.discover()}
-          />
-        </aside>
-      </main>
-    </div>
-    <footer class="workspace-footer">
-      <div>
-        <span class="status-dot" class:inactive={!lastRead}></span><span
-          >{lastRead
-            ? t($language, 'codexUpdatedAge', {
-                age: age(lastRead, now, $language),
-              })
-            : t($language, 'codexNoReadings')}</span
+      <div class="panel-heading">
+        <h2 id="codex-setup-heading">
+          <Icon name="terminal" />{t($language, 'codexSetupTitle')}
+        </h2>
+        <button
+          class="icon-button"
+          aria-label={t($language, 'codexCheckSetup')}
+          title={t($language, 'codexCheckSetup')}
+          disabled={locked || pending === 'codex_discover'}
+          onclick={() => controller.discover()}
+          ><Icon name="refresh" size={16} /></button
         >
       </div>
-      <span class="version">PrimerSwitch {meta.version}</span><button
-        class="quiet-button"
-        disabled={locked || !canRefreshAll}
-        onclick={() => controller.refreshAll()}
-        ><Icon name="refresh" size={15} />{pending === 'codex_refresh_all'
-          ? t($language, 'codexRefreshing')
-          : t($language, 'codexRefreshAll')}</button
-      >
-    </footer>
-  </div>
-</div>
+      <p class="setup-line" data-state={setupState}>
+        {#if setupState === 'checking'}<span class="spinner" aria-hidden="true"
+          ></span>{:else}<span class="status-dot"></span>{/if}<span
+          >{setupText}</span
+        >
+      </p>
+      <p>{t($language, 'codexHowSaves')}</p>
+      <p>{t($language, 'codexHowResumes')}</p>
+    </section>
+  {/snippet}
+</ProviderPage>
+
 {#if $controller.login.open}<Modal
     title={t($language, loginFor ? 'codexLoginAgainTitle' : 'codexLoginTitle')}
     {returnFocus}
@@ -601,179 +573,57 @@
       <button onclick={() => cancelLogin()}>{t($language, 'cancel')}</button>
     </div>
   </Modal>{/if}
-{#if details && snapshot}<Modal
+{#if details}{@const saved = account(details.id)}<Modal
     title={details.name}
     {returnFocus}
     onclose={() => (detailsId = null)}
   >
-    <CodexDetails
-      account={details}
-      {snapshot}
+    <AccountDetails
+      row={details}
       {now}
+      threshold={view.threshold}
       {locked}
-      checking={(pending === 'codex_refresh_account' &&
-        $controller.pendingId === details.id) ||
-        pending === 'codex_refresh_all'}
-      onswitch={() => switchTo(details!, returnFocus)}
-      onsignin={() => signIn(details, returnFocus)}
+      {lockReason}
       onrefresh={() => controller.refreshAccount(details!.id)}
+      onswitch={() => void switchTo(details!, returnFocus)}
+      onsignin={() => signIn(details, returnFocus)}
       ondelete={() => askDelete(details!, returnFocus)}
-    />
+    >
+      {#snippet facts()}
+        {#if saved}
+          <div>
+            <dt>{t($language, 'detailsSignIn')}</dt>
+            <dd>
+              {t(
+                $language,
+                saved.authKind === 'chatgpt'
+                  ? 'codexAuthChatGPT'
+                  : saved.authKind === 'apiKey'
+                    ? 'codexAuthApiKey'
+                    : 'codexAuthUnsupported',
+              )}
+            </dd>
+          </div>
+          {#if saved.workspaceName}<div>
+              <dt>{t($language, 'detailsWorkspace')}</dt>
+              <dd>{saved.workspaceName}</dd>
+            </div>{/if}
+          {#if details?.credits}<div>
+              <dt>{t($language, 'credits')}</dt>
+              <dd>{details.credits}</dd>
+            </div>{/if}
+        {/if}
+      {/snippet}
+    </AccountDetails>
   </Modal>{/if}
-{#if deleteTarget}<Modal
-    title={t($language, 'codexDeleteTitle')}
+{#if deleteTarget}<DeleteDialog
+    text={t($language, 'deleteCodex', { name: deleteTarget.name })}
+    pending={pending === 'codex_delete_account'}
+    disabled={locked}
+    error={$controller.error
+      ? codexMessage($controller.error, $language)
+      : null}
     {returnFocus}
-    onclose={() => (deleteTarget = null)}
-    ><p class="modal-intro">
-      {t($language, 'codexDeleteDescription', { name: deleteTarget.name })}
-    </p>
-    {#if $controller.error}<p class="warning-text" role="alert">
-        {codexMessage($controller.error, $language)}
-      </p>{/if}
-    <div class="modal-actions">
-      <button
-        disabled={pending === 'codex_delete_account'}
-        onclick={() => (deleteTarget = null)}>{t($language, 'cancel')}</button
-      ><button class="danger-button" disabled={locked} onclick={confirmDelete}
-        >{pending === 'codex_delete_account'
-          ? t($language, 'codexDeleting')
-          : t($language, 'codexDeleteConfirm')}</button
-      >
-    </div></Modal
-  >{/if}
-
-<style>
-  :global(:root) {
-    --codex-warn: #f0c46f;
-  }
-  :global(:root[data-theme='light']) {
-    --codex-warn: #8a5300;
-  }
-  @media (prefers-color-scheme: light) {
-    :global(:root:not([data-theme='dark'])) {
-      --codex-warn: #8a5300;
-    }
-  }
-  .codex-banner,
-  .codex-notice {
-    display: flex;
-    align-items: flex-start;
-    gap: 12px;
-    padding: 12px 14px 12px 16px;
-    margin-bottom: 17px;
-    border: 1px solid var(--line);
-    border-radius: 10px;
-    background: var(--surface);
-    font-size: 0.79rem;
-    line-height: 1.55;
-  }
-  .codex-banner > :global(svg),
-  .codex-notice > :global(svg) {
-    flex: none;
-    margin-top: 1px;
-  }
-  .codex-banner.warn {
-    border-color: color-mix(in srgb, var(--codex-warn) 45%, var(--line));
-    background: color-mix(in srgb, var(--codex-warn) 7%, var(--surface));
-  }
-  .codex-banner.warn > :global(svg) {
-    color: var(--codex-warn);
-  }
-  .codex-banner p,
-  .codex-banner ul {
-    flex: 1;
-    min-width: 0;
-    margin: 0;
-  }
-  .codex-banner ul {
-    padding: 0;
-    list-style: none;
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-  }
-  .codex-banner strong {
-    color: var(--codex-warn);
-  }
-  .codex-banner button:not(.icon-button) {
-    flex: none;
-    align-self: center;
-    font-size: 0.76rem;
-    padding: 0.45rem 0.8rem;
-  }
-  .codex-banner .icon-button,
-  .codex-notice .icon-button {
-    margin: -5px -4px -5px 0;
-  }
-  .codex-notice {
-    border-color: color-mix(in srgb, var(--green) 40%, var(--line));
-    background: color-mix(in srgb, var(--green) 6%, var(--surface));
-  }
-  .codex-notice > :global(svg) {
-    color: var(--green);
-  }
-  .codex-notice > div {
-    flex: 1;
-    min-width: 0;
-  }
-  .codex-notice p {
-    margin: 0;
-  }
-  .codex-notice .sub {
-    color: var(--subtle);
-    margin-top: 3px;
-  }
-  .codex-notice .sub.warning {
-    color: var(--codex-warn);
-  }
-  .codex-notice.warn {
-    border-color: color-mix(in srgb, var(--codex-warn) 45%, var(--line));
-    background: color-mix(in srgb, var(--codex-warn) 7%, var(--surface));
-  }
-  .codex-notice.warn > :global(svg) {
-    color: var(--codex-warn);
-  }
-  .codex-notice:focus-visible,
-  .error-notice:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 2px;
-  }
-  .panel.codex-setup-panel {
-    padding: 17px 19px;
-    margin-bottom: 18px;
-    border-color: color-mix(in srgb, var(--danger) 40%, var(--line));
-  }
-  .codex-setup-panel p {
-    margin: 10px 0 0;
-    font-size: 0.8rem;
-    line-height: 1.6;
-    color: var(--subtle);
-  }
-  .codex-setup-panel button {
-    font-size: 0.76rem;
-    padding: 0.45rem 0.8rem;
-  }
-  .codex-empty .empty-actions {
-    display: flex;
-    justify-content: center;
-    flex-wrap: wrap;
-    gap: 9px;
-  }
-  .codex-empty .empty-account-icon {
-    margin-bottom: 14px;
-  }
-  .add-options button {
-    gap: 9px;
-  }
-  @media (max-width: 560px) {
-    .codex-banner {
-      flex-wrap: wrap;
-    }
-    .codex-banner p {
-      flex-basis: calc(100% - 34px);
-    }
-    .codex-banner button:not(.icon-button) {
-      margin-left: 30px;
-    }
-  }
-</style>
+    onconfirm={() => void confirmDelete()}
+    oncancel={() => (deleteTarget = null)}
+  />{/if}

@@ -12,55 +12,28 @@ function romanianDays(days: number): string {
       ? `${n} zile`
       : `${n} de zile`;
 }
-/** Units for a countdown: compact in English, spelled out in Romanian. */
-function units(
-  locale: Language,
-  days: number,
-  hours: number,
-  minutes: number,
-  seconds: number | null,
-): string {
-  const n = (value: number) => number(value, locale);
-  const ro = locale === 'ro';
-  const parts: string[] = [];
-  if (days) parts.push(ro ? romanianDays(days) : `${n(days)}d`);
-  if (days || hours) parts.push(ro ? `${n(hours)} h` : `${n(hours)}h`);
-  parts.push(ro ? `${n(minutes)} min` : `${n(minutes)}m`);
-  if (seconds !== null && !days)
-    parts.push(ro ? `${n(seconds)} s` : `${n(seconds)}s`);
-  return parts.join(' ');
-}
-
-export function countdown(
-  timestamp: number | null,
-  now: number,
-  locale: Language = 'en',
-): string {
-  if (timestamp === null) return t(locale, 'resetUnknown');
-  const seconds = Math.max(0, Math.ceil(timestamp - now));
-  if (!seconds) return t(locale, 'resetting');
-  return units(
-    locale,
-    Math.floor(seconds / 86400),
-    Math.floor(seconds / 3600) % 24,
-    Math.floor(seconds / 60) % 60,
-    seconds % 60,
-  );
-}
-/** Coarse time left, rounded up to the minute: "2h 10m" / "2 h 10 min". */
+/**
+ * Time left, rounded up to the minute; one format for every countdown on both tabs:
+ * "45m", "2h 10m", "3d 4h" in English, "45 min", "2 h 10 min", "3 zile 4 h" in Romanian.
+ */
 export function duration(
   timestamp: number,
   now: number,
   locale: Language = 'en',
 ): string {
+  const n = (value: number) => number(value, locale);
+  const ro = locale === 'ro';
   const minutes = Math.max(1, Math.ceil((timestamp - now) / 60));
   const days = Math.floor(minutes / 1440),
     hours = Math.floor(minutes / 60) % 24;
   if (days)
-    return locale === 'ro'
-      ? `${romanianDays(days)} ${number(hours, locale)} h`
-      : `${number(days, locale)}d ${number(hours, locale)}h`;
-  return units(locale, 0, hours, minutes % 60, null);
+    return ro
+      ? `${romanianDays(days)} ${n(hours)} h`
+      : `${n(days)}d ${n(hours)}h`;
+  const parts: string[] = [];
+  if (hours) parts.push(ro ? `${n(hours)} h` : `${n(hours)}h`);
+  parts.push(ro ? `${n(minutes % 60)} min` : `${n(minutes % 60)}m`);
+  return parts.join(' ');
 }
 /** Readable plan from Claude's raw rate-limit tier; unknown tiers stay hidden. */
 export function planLabel(tier: string | null | undefined): string | null {

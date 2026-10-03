@@ -18,13 +18,10 @@ import {
   type CodexSnapshot,
 } from './codex-types';
 import {
-  codexDuration,
   codexExtraLimits,
   codexLimitState,
   codexMessage,
-  codexNextAccount,
   codexPlanLabel,
-  codexStatus,
   codexUsingCredits,
   codexWindowLabel,
 } from './codex-format';
@@ -485,9 +482,7 @@ describe('Codex view derivations', () => {
     const [studio, personal, research] = codexSnapshot().accounts;
     expect(codexLimitState(studio).limited).toBe(false);
     expect(codexLimitState(personal).limited).toBe(true);
-    expect(codexStatus(personal).kind).toBe('limited');
-    expect(codexStatus(studio).kind).toBe('active');
-    expect(codexStatus(research).kind).toBe('ready');
+    expect(codexLimitState(research).limited).toBe(false);
     const both = codexAccount('codex-both', {
       quota: {
         ordinaryUsageAllowed: true,
@@ -563,36 +558,9 @@ describe('Codex view derivations', () => {
       },
     });
     expect(codexLimitState(extraOnly).limited).toBe(false);
-    expect(codexStatus(codexAccount('codex-new', { quota: null })).kind).toBe(
-      'unread',
+    expect(codexLimitState(codexAccount('codex-new', { quota: null }))).toEqual(
+      { limited: false, freesAt: null },
     );
-    expect(
-      codexStatus(codexAccount('codex-gone', { needsSignIn: true })).kind,
-    ).toBe('signIn');
-  });
-  it('shows the account the native side ranks next and never ranks accounts itself', () => {
-    const raw = codexSnapshot();
-    expect(codexNextAccount(raw)?.id).toBe('codex-research');
-    // An account with more weekly usage left changes nothing by itself.
-    raw.accounts.push(
-      codexAccount('codex-tie', {
-        quota: {
-          ordinaryUsageAllowed: true,
-          resetCreditsAvailable: null,
-          limits: [codexMainLimit(3, 1)],
-        },
-      }),
-    );
-    expect(codexNextAccount(raw)?.id).toBe('codex-research');
-    raw.nextId = 'codex-tie';
-    expect(codexNextAccount(raw)?.id).toBe('codex-tie');
-    // No pick, an unknown id or the active account show nothing.
-    raw.nextId = null;
-    expect(codexNextAccount(raw)).toBeNull();
-    raw.nextId = 'codex-missing';
-    expect(codexNextAccount(raw)).toBeNull();
-    raw.nextId = 'codex-studio';
-    expect(codexNextAccount(raw)).toBeNull();
   });
   it('marks only main windows past 100% with purchased credits as using credits', () => {
     const withCredits = (
@@ -635,7 +603,7 @@ describe('Codex view derivations', () => {
     // Such an account is limited, so the native side never ranks it next.
     expect(codexLimitState(over).limited).toBe(true);
   });
-  it('labels windows from real durations, known plans and compact durations', () => {
+  it('labels windows from real durations and known plans', () => {
     expect(codexWindowLabel(300, 'short', 'en')).toBe('5 hours');
     expect(codexWindowLabel(10080, 'long', 'en')).toBe('Weekly');
     expect(codexWindowLabel(1440, 'short', 'en')).toBe('Daily');
@@ -650,9 +618,6 @@ describe('Codex view derivations', () => {
     expect(codexPlanLabel('free', 'ro')).toBe('Gratuit');
     expect(codexPlanLabel('future-plan', 'en')).toBeNull();
     expect(codexPlanLabel(null, 'en')).toBeNull();
-    expect(codexDuration(2 * 3600 + 10 * 60, 'en')).toBe('2h 10m');
-    expect(codexDuration(26 * 3600, 'ro')).toBe('1z 2h');
-    expect(codexDuration(20, 'en')).toBe('1m');
     expect(
       codexExtraLimits(codexSnapshot().accounts[0]).map((l) => l.key),
     ).toEqual(['bucket:code-review']);

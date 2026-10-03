@@ -133,6 +133,20 @@ impl KeychainFixture {
         ])?;
         Ok(())
     }
+
+    fn read_claude_item(&self) -> Result<Value, String> {
+        let path = self.path.to_string_lossy().into_owned();
+        let password = security_ok([
+            "find-generic-password",
+            "-a",
+            ACCOUNT,
+            "-s",
+            SERVICE,
+            "-w",
+            &path,
+        ])?;
+        serde_json::from_slice(&password).map_err(|error| error.to_string())
+    }
 }
 
 impl Drop for KeychainFixture {
@@ -237,7 +251,15 @@ fn isolated_keychain_and_vault_round_trip() {
             .map_err(|error| error.to_string())?;
         let after = store.read().map_err(|error| error.to_string())?;
         if after.credentials != new_credentials || after.identity != new_identity {
-            return Err("native Keychain switch did not persist the fixture payload".to_owned());
+            let credentials_equal = after.credentials == new_credentials;
+            let identity_equal = after.identity == new_identity;
+            let cli_credentials_equal = keychain
+                .read_claude_item()
+                .map(|value| value == new_credentials)
+                .unwrap_or(false);
+            return Err(format!(
+                "native Keychain switch did not persist the fixture payload (credentialsEqual={credentials_equal}, identityEqual={identity_equal}, cliCredentialsEqual={cli_credentials_equal})"
+            ));
         }
         let config: Value = serde_json::from_slice(
             &fs::read(&paths.global_config_file).map_err(|error| error.to_string())?,

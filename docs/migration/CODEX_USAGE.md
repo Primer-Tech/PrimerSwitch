@@ -25,7 +25,7 @@ Resumed conversations carry encrypted reasoning that belongs to the previous acc
 ## Add accounts
 
 - **Sign in with ChatGPT…** opens the browser login in a private, temporary Codex home, so adding an account never changes the active one.
-- **Import current Codex sign-in** saves whatever `codex login` produced. PrimerSwitch also does this by itself: when it sees a login it does not know in `auth.json`, it keeps it as a new account.
+- **Import current Codex login** saves whatever `codex login` produced. PrimerSwitch also does this by itself: when it sees a login it does not know in `auth.json`, it keeps it as a new account.
 - **Import from Codex Switcher** reads `~/.codex-switcher/accounts.json` from lampese's Codex Switcher (store version 1) and saves its ChatGPT accounts with their names (API-key entries are kept but cannot be selected). If an account exists in both, the copy whose token was issued later wins. Close Codex Switcher afterwards: it also refreshes tokens in the background and force-closes `codex.exe` processes when it switches, so running both makes them invalidate each other's sign-ins.
 
 ## Usage readings
@@ -40,11 +40,11 @@ Automatic switching, the switch threshold, the check interval and the weekly res
 
 ## Which account is next
 
-Rust ranks the Codex accounts with the same rules as Claude, and the **Next best** card shows that account. An account can be next when it is a saved ChatGPT sign-in that can be switched to, its latest reading succeeded, and both main windows are below the threshold with no limit reported (a spent window, a reached-limit flag or blocked included usage). Accounts with both windows at least 5 points below the threshold come first. Then, with **Use the account whose weekly limit resets soonest first** on (the default), the account whose weekly limit resets soonest (to the hour) goes first, which spends quota that would otherwise expire unused; with it off, the account with the most weekly usage left goes first, then the soonest weekly reset. Remaining ties go to the lower 5-hour usage, then a stable order.
+Rust ranks the Codex accounts with the same rules as Claude, and the **Next up** card shows that account; **Next in order** under the account list shows every usable account in that ranking (the snapshot's `order`, whose first entry is `nextId`), and the list itself puts the active account first, then that order. An account can be next when it is a saved ChatGPT sign-in that can be switched to, its latest reading succeeded, and both main windows are below the threshold with no limit reported (a spent window, a reached-limit flag or blocked included usage). Accounts with both windows at least 5 points below the threshold come first. Then, with **Use the account whose weekly limit resets soonest first** on (the default), the account whose weekly limit resets soonest (to the hour) goes first, which spends quota that would otherwise expire unused; with it off, the account with the most weekly usage left goes first, then the soonest weekly reset. Remaining ties go to the lower 5-hour usage, then a stable order.
 
 ## Credits beyond the plan
 
-When an account keeps working on purchased credits, Codex reports more than 100% used. PrimerSwitch shows the real number, fills the bar to 100% and adds **Using credits** to that window when the account has credits. Such an account counts as limited: it is never next, and when it is the active account automatic switching moves to a usable one, so credits are not spent while included usage is available on another account.
+When an account keeps working on purchased credits, Codex reports more than 100% used. PrimerSwitch shows the real number, fills the bar to 100% and adds **Using credits** to that window and to the account's status when the account has credits. Such an account counts as limited: it is never next, and when it is the active account automatic switching moves to a usable one, so credits are not spent while included usage is available on another account.
 
 ## Data and privacy
 

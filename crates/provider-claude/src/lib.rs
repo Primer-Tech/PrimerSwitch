@@ -33,6 +33,10 @@ pub enum ClientError {
     Transport,
     #[error("Anthropic rejected this token. Sign in to this account again.")]
     Unauthorized,
+    /// The token endpoint rejected the refresh token or code itself: retrying with
+    /// the same grant cannot succeed, only a new sign-in can.
+    #[error("Anthropic no longer accepts this sign-in. Sign in to this account again.")]
+    InvalidGrant,
     #[error("Anthropic is temporarily limiting requests. Waiting before retrying.")]
     RateLimited { retry_after: Option<u64> },
     #[error("Unexpected response from Anthropic (HTTP {0}).")]
@@ -56,6 +60,10 @@ impl ClientError {
         match self {
             Self::Transport => "Conexiunea cu Anthropic a eșuat. Reîncearcă mai târziu.".into(),
             Self::Unauthorized => "Token respins de Anthropic. Reautentifică acest cont.".into(),
+            Self::InvalidGrant => {
+                "Anthropic nu mai acceptă această autentificare. Autentifică din nou acest cont."
+                    .into()
+            }
             Self::RateLimited { .. } => {
                 "Anthropic limitează temporar cererile. Așteptăm înainte de reîncercare.".into()
             }
@@ -236,6 +244,14 @@ impl ClaudeClient {
             .transport
             .send(self.request("POST", TOKEN_URL, None, Some(body), 30, false))
             .await?;
+        // OAuth reports a revoked or consumed grant as `invalid_grant`; this public
+        // client has no secret, so a 401 here also means the grant was refused. Only
+        // the fixed error code is inspected, never other response text.
+        if response.status == 401
+            || (response.status == 400 && response.body["error"] == "invalid_grant")
+        {
+            return Err(ClientError::InvalidGrant);
+        }
         check_status(&response)?;
         TokenResponse::parse(&response.body)
     }
@@ -809,6 +825,30 @@ mod tests {
         assert_eq!(requests[0].body.as_ref().unwrap()["scope"], REFRESH_SCOPES);
         assert!(!format!("{:?}", requests[0]).contains("sentinel-refresh"));
         assert!(!format!("{tokens:?}").contains("sentinel-new-access"));
+    }
+    #[tokio::test]
+    async fn rejected_refresh_grants_are_distinct_from_temporary_failures() {
+        let (client, _) = fake(vec![
+            reply(
+                400,
+                json!({"error":"invalid_grant","error_description":"secret-response-sentinel"}),
+            ),
+            reply(401, Value::Null),
+            reply(400, json!({"error":"invalid_request"})),
+            reply(503, Value::Null),
+            reply(429, Value::Null),
+        ]);
+        for expected in [
+            ClientError::InvalidGrant,
+            ClientError::InvalidGrant,
+            ClientError::Http(400),
+            ClientError::Http(503),
+            ClientError::RateLimited { retry_after: None },
+        ] {
+            let error = client.refresh_token("sentinel-refresh").await.unwrap_err();
+            assert_eq!(error, expected);
+            assert!(!error.to_string().contains("sentinel"));
+        }
     }
     #[tokio::test]
     async fn generic_429_is_not_budget_reading() {

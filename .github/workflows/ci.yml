@@ -61,8 +61,13 @@ jobs:
           python -B scripts/test_qualify_windows_update.py
       - name: Repository boundary and documentation links
         run: python scripts/check_repository.py
+      # Open qualification (owner decision 2026-10-03): on hosted runners an in-place
+      # Keychain update is not visible to /usr/bin/security. Keep the evidence, but do
+      # not gate merges on it until it is verified on a real Mac.
       - name: Isolated macOS Keychain and vault qualification
         if: runner.os == 'macOS'
+        continue-on-error: true
+        timeout-minutes: 5
         run: python -B scripts/qualify_macos_native.py
       - uses: actions/upload-artifact@v4
         if: always() && runner.os == 'Linux'

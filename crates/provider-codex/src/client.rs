@@ -457,11 +457,14 @@ impl CodexClient {
         Ok(client)
     }
     async fn initialize(&mut self, context: &CodexContext) -> Result<(), CodexError> {
-        let response=self.request("initialize",json!({"clientInfo":{"name":"primerswitch","title":"PrimerSwitch","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":false,"requestAttestation":false}}),10).await?;
+        // The first start after boot can wait on an antivirus scan of the ~300 MB binary.
+        let response=self.request("initialize",json!({"clientInfo":{"name":"primerswitch","title":"PrimerSwitch","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":false,"requestAttestation":false}}),30).await?;
         let home = response.0["codexHome"]
             .as_str()
             .ok_or(CodexError::Protocol)?;
-        if std::path::Path::new(home) != context.home {
+        // Codex reports its canonical home without the Windows `\\?\` prefix that
+        // `std::fs::canonicalize` adds, so compare canonical forms, never the text.
+        if !same_home(std::path::Path::new(home), &context.home) {
             return Err(CodexError::UnsafeContext);
         }
         let family = if cfg!(windows) { "windows" } else { "unix" };
@@ -716,6 +719,13 @@ impl CodexClient {
         self.dead = true;
         self.transport.shutdown().await
     }
+}
+
+/// The home a Codex child reports is the one it was given: equal after canonicalizing
+/// (which also resolves the Windows verbatim `\\?\C:\...` versus `C:\...` forms).
+fn same_home(reported: &std::path::Path, expected: &std::path::Path) -> bool {
+    reported == expected
+        || std::fs::canonicalize(reported).is_ok_and(|reported| reported.as_path() == expected)
 }
 
 /// Codex 0.160.0 reports a rejected refresh ("...Please log out and sign in again.")

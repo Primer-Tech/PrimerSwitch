@@ -492,3 +492,29 @@ fn native_command_clears_overrides_and_preserves_fixed_context() {
         Some(context.cwd.as_path())
     );
 }
+#[tokio::test]
+async fn reported_home_is_compared_in_canonical_form() {
+    // Codex 0.160 reports `C:\...` for a CODEX_HOME given as `\?\C:\...`.
+    let (_dir, context) = private_context();
+    let text = context.home.to_string_lossy().into_owned();
+    let plain = text.strip_prefix(r"\?\").unwrap_or(&text).to_owned();
+    for (reported, accepted) in [(plain, true), (format!("{text}-other"), false)] {
+        let (mut client, _) = fake(
+            true,
+            vec![
+                (
+                    "initialize",
+                    vec![reply(
+                        json!({"codexHome":reported,"platformOs":std::env::consts::OS,"platformFamily":if cfg!(windows){"windows"}else{"unix"},"userAgent":"x"}),
+                    )],
+                ),
+                ("initialized", vec![]),
+            ],
+        );
+        assert_eq!(
+            client.initialize(&context).await.is_ok(),
+            accepted,
+            "{reported}"
+        );
+    }
+}

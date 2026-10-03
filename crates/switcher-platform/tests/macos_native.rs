@@ -108,6 +108,12 @@ impl KeychainFixture {
             // isolated fixture keychain instead of the runner login keychain.
             let path_text = fixture.path.to_string_lossy().into_owned();
             set_default_keychain(&path_text)?;
+            if default_keychain()? != path_text {
+                return Err(
+                    "macOS fixture default keychain did not switch to the isolated keychain"
+                        .to_owned(),
+                );
+            }
             Ok::<_, String>(())
         })();
         if let Err(error) = setup {
@@ -118,7 +124,6 @@ impl KeychainFixture {
     }
 
     fn add_claude_item(&self, value: &Value) -> Result<(), String> {
-        let path = self.path.to_string_lossy().into_owned();
         let password = serde_json::to_string(value).map_err(|error| error.to_string())?;
         security_ok([
             "add-generic-password",
@@ -129,7 +134,6 @@ impl KeychainFixture {
             SERVICE,
             "-w",
             &password,
-            &path,
         ])?;
         Ok(())
     }

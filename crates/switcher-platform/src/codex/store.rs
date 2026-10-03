@@ -135,6 +135,14 @@ impl CodexFileStore {
                     return Err(crate::PlatformError::Io.into());
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
+                // Codex may have rotated the login while the move was blocked.
+                let current = self.read()?;
+                let still_absent = originally_absent
+                    && current.auth_bytes().is_none()
+                    && current.generation.native_identity == expected.native_identity;
+                if &current.generation != expected && !still_absent {
+                    return Err(CodexStoreError::ExternalChange);
+                }
             }
         }
         #[cfg(not(windows))]

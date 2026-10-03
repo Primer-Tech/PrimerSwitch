@@ -16,6 +16,8 @@ pub struct CodexProcessSummary {
     pub switcher_running: bool,
     /// The shared app-server daemon (`--managed-daemon`) of this CODEX_HOME runs.
     pub daemon_running: bool,
+    /// Its process id, used to restart it with the environment it was started with.
+    pub daemon_pid: Option<u32>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -311,7 +313,10 @@ fn native_scan(daemon_root: &Path) -> CodexProcessSummary {
                                 Role::OtherClient => {
                                     summary.other_clients = summary.other_clients.saturating_add(1)
                                 }
-                                Role::DaemonServer => summary.daemon_running = true,
+                                Role::DaemonServer => {
+                                    summary.daemon_running = true;
+                                    summary.daemon_pid = Some(pid);
+                                }
                                 _ => (),
                             }
                         }
@@ -383,7 +388,10 @@ fn native_scan(daemon_root: &Path) -> CodexProcessSummary {
             });
         match classify(&image, line.as_deref(), daemon_root) {
             Role::OtherClient => summary.other_clients = summary.other_clients.saturating_add(1),
-            Role::DaemonServer => summary.daemon_running = true,
+            Role::DaemonServer => {
+                summary.daemon_running = true;
+                summary.daemon_pid = Some(pid);
+            }
             _ => (),
         }
     }
@@ -393,6 +401,163 @@ fn native_scan(daemon_root: &Path) -> CodexProcessSummary {
 #[cfg(not(any(windows, target_os = "linux")))]
 fn native_scan(_: &Path) -> CodexProcessSummary {
     CodexProcessSummary::default()
+}
+
+/// The environment block of another process of this user: the shared daemon's, so a
+/// restart can give the new daemon the same environment the terminal that started it
+/// had (agent shell commands inherit it). None when it cannot be read.
+pub fn process_environment(pid: u32) -> Option<Vec<(std::ffi::OsString, std::ffi::OsString)>> {
+    let block = native_environment(pid)?;
+    let mut pairs = Vec::new();
+    for entry in block.split(|unit| *unit == 0) {
+        if entry.is_empty() {
+            break;
+        }
+        // Skip per-drive working directories such as "=C:=C:\repo".
+        let Some(split) = entry
+            .iter()
+            .skip(1)
+            .position(|unit| *unit == u16::from(b'='))
+        else {
+            continue;
+        };
+        let (name, value) = entry.split_at(split + 1);
+        pairs.push((os_string(name), os_string(&value[1..])));
+        if pairs.len() > 4096 {
+            return None;
+        }
+    }
+    (!pairs.is_empty()).then_some(pairs)
+}
+#[cfg(windows)]
+fn os_string(units: &[u16]) -> std::ffi::OsString {
+    use std::os::windows::ffi::OsStringExt;
+    std::ffi::OsString::from_wide(units)
+}
+#[cfg(not(windows))]
+fn os_string(units: &[u16]) -> std::ffi::OsString {
+    String::from_utf16_lossy(units).into()
+}
+/// Read the UTF-16 environment block from the target's process parameters (x64 PEB:
+/// ProcessParameters at +0x20; Environment at +0x80 and EnvironmentSize at +0x3F0).
+#[cfg(all(windows, target_pointer_width = "64"))]
+fn native_environment(pid: u32) -> Option<Vec<u16>> {
+    use std::ffi::c_void;
+    use windows_sys::{
+        Wdk::System::Threading::{NtQueryInformationProcess, ProcessBasicInformation},
+        Win32::{
+            Foundation::CloseHandle,
+            System::{
+                Diagnostics::Debug::ReadProcessMemory,
+                Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ},
+            },
+        },
+    };
+    #[repr(C)]
+    struct BasicInformation {
+        exit_status: i32,
+        peb: usize,
+        affinity: usize,
+        base_priority: i32,
+        unique_process_id: usize,
+        parent: usize,
+    }
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid) };
+    if handle.is_null() {
+        return None;
+    }
+    let read = |address: usize, buffer: *mut c_void, size: usize| -> bool {
+        let mut done = 0usize;
+        (unsafe { ReadProcessMemory(handle, address as *const c_void, buffer, size, &mut done) }
+            != 0)
+            && done == size
+    };
+    let result = (|| {
+        let mut info: BasicInformation = unsafe { std::mem::zeroed() };
+        let mut length = 0u32;
+        let status = unsafe {
+            NtQueryInformationProcess(
+                handle,
+                ProcessBasicInformation,
+                (&mut info as *mut BasicInformation).cast(),
+                size_of::<BasicInformation>() as u32,
+                &mut length,
+            )
+        };
+        if status < 0 || info.peb == 0 || info.unique_process_id != pid as usize {
+            return None;
+        }
+        let mut parameters = 0usize;
+        if !read(info.peb + 0x20, (&mut parameters as *mut usize).cast(), 8) || parameters == 0 {
+            return None;
+        }
+        let (mut environment, mut size) = (0usize, 0usize);
+        if !read(
+            parameters + 0x80,
+            (&mut environment as *mut usize).cast(),
+            8,
+        ) || !read(parameters + 0x3F0, (&mut size as *mut usize).cast(), 8)
+            || environment == 0
+            || !(4..=4 * 1024 * 1024).contains(&size)
+        {
+            return None;
+        }
+        let mut block = vec![0u16; size / 2];
+        if !read(environment, block.as_mut_ptr().cast(), block.len() * 2) {
+            return None;
+        }
+        // A well-formed block ends with an empty entry.
+        block.windows(2).any(|w| w == [0, 0]).then_some(block)
+    })();
+    unsafe {
+        CloseHandle(handle);
+    }
+    result
+}
+#[cfg(target_os = "linux")]
+fn native_environment(pid: u32) -> Option<Vec<u16>> {
+    let bytes = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+    let mut block: Vec<u16> = String::from_utf8_lossy(&bytes).encode_utf16().collect();
+    block.extend([0, 0]);
+    Some(block)
+}
+#[cfg(not(any(all(windows, target_pointer_width = "64"), target_os = "linux")))]
+fn native_environment(_: u32) -> Option<Vec<u16>> {
+    None
+}
+
+/// Whether this process runs elevated. Codex refuses to restart its daemon from an
+/// elevated process on Windows, so a switch must not start in that case.
+#[cfg(windows)]
+pub fn process_is_elevated() -> bool {
+    use windows_sys::Win32::{
+        Foundation::CloseHandle,
+        Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation},
+        System::Threading::{GetCurrentProcess, OpenProcessToken},
+    };
+    let mut token = std::ptr::null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return false;
+    }
+    let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+    let mut length = 0u32;
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TokenElevation,
+            (&mut elevation as *mut TOKEN_ELEVATION).cast(),
+            size_of::<TOKEN_ELEVATION>() as u32,
+            &mut length,
+        )
+    } != 0;
+    unsafe {
+        CloseHandle(token);
+    }
+    ok && elevation.TokenIsElevated != 0
+}
+#[cfg(not(windows))]
+pub fn process_is_elevated() -> bool {
+    false
 }
 
 /// Public for the effective-context resolver. Forced configuration/requirements
@@ -541,6 +706,23 @@ mod tests {
             vec![r"C:\a b\codex.exe", "exec", "-C", r"C:\x y", r#"say "hi""#]
         );
         assert!(split_arguments("").is_empty());
+    }
+    #[test]
+    fn the_environment_of_this_process_can_be_read_back() {
+        let pairs = process_environment(std::process::id());
+        if cfg!(any(
+            all(windows, target_pointer_width = "64"),
+            target_os = "linux"
+        )) {
+            let pairs = pairs.expect("own environment is readable");
+            let path = std::env::var_os("PATH").unwrap();
+            assert!(
+                pairs
+                    .iter()
+                    .any(|(name, value)| name.eq_ignore_ascii_case("PATH") && *value == path)
+            );
+            assert!(pairs.iter().all(|(name, _)| !name.is_empty()));
+        }
     }
     #[test]
     fn scanning_never_fails() {

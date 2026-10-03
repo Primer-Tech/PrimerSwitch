@@ -5,6 +5,7 @@
 //! current auth.json. Terminals reconnect on their own and resume the same thread.
 use crate::{CodexError, VerifiedCodexExecutable};
 use std::{
+    ffi::OsString,
     process::Stdio,
     sync::{Arc, Mutex},
     time::Duration,
@@ -27,7 +28,7 @@ const OUTPUT_LIMIT: usize = 64 * 1024;
 /// reachable daemon; terminals started later will launch one themselves.
 pub async fn daemon_state(executable: &VerifiedCodexExecutable) -> Result<DaemonState, CodexError> {
     Ok(
-        match run(executable, "version", STATUS_TIMEOUT, true).await? {
+        match run(executable, "version", STATUS_TIMEOUT, true, None).await? {
             Some(status) if status == "running" => DaemonState::Running,
             _ => DaemonState::NotRunning,
         },
@@ -36,24 +37,35 @@ pub async fn daemon_state(executable: &VerifiedCodexExecutable) -> Result<Daemon
 
 /// Restart the running daemon so it loads the current auth.json. Callers must check
 /// [`daemon_state`] first: on a stopped daemon this command would start a new one.
-pub async fn restart_daemon(executable: &VerifiedCodexExecutable) -> Result<(), CodexError> {
+/// `environment` should be the running daemon's own environment: the new daemon
+/// inherits it, and agent shell commands in every terminal run with it.
+pub async fn restart_daemon(
+    executable: &VerifiedCodexExecutable,
+    environment: Option<&[(OsString, OsString)]>,
+) -> Result<(), CodexError> {
     // Never kill the CLI midway: the old daemon may already be stopped.
-    match run(executable, "restart", RESTART_TIMEOUT, false).await? {
+    match run(executable, "restart", RESTART_TIMEOUT, false, environment).await? {
         Some(status) if status == "restarted" => Ok(()),
         _ => Err(CodexError::DaemonUnavailable),
     }
 }
 
-/// Run `codex app-server daemon <command>` hidden, with the user's own environment:
-/// a restarted daemon inherits it (Codex normalizes only path variables), as when a
-/// terminal starts it. Returns the reported `status`, or None if the command failed.
+/// Run `codex app-server daemon <command>` hidden. A restarted daemon inherits the
+/// environment of this command (Codex normalizes only path variables): the given one,
+/// or the user's own. Returns the reported `status`, or None if the command failed.
 async fn run(
     executable: &VerifiedCodexExecutable,
     command: &str,
     limit: Duration,
     kill_on_timeout: bool,
+    environment: Option<&[(OsString, OsString)]>,
 ) -> Result<Option<String>, CodexError> {
     let mut process = Command::new(executable.recheck()?);
+    if let Some(environment) = environment {
+        process
+            .env_clear()
+            .envs(environment.iter().map(|(name, value)| (name, value)));
+    }
     process
         .args(["app-server", "daemon", command])
         .stdin(Stdio::null())

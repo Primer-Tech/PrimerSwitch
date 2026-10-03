@@ -189,3 +189,96 @@ fn import_payloads_hybrid_normalization_and_token_times() {
         Some("ws-a")
     );
 }
+fn access_jwt(user: &str, workspace: &str, serial: &str) -> String {
+    let claims = json!({"exp":1_900_000_000,"serial":serial,"https://api.openai.com/auth":{
+        "chatgpt_account_id":workspace,"chatgpt_user_id":user,"chatgpt_account_user_id":format!("{user}__{workspace}")}});
+    format!(
+        "header.{}.signature",
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
+    )
+}
+fn file(id_user: &str, id_ws: &str, access: String, refresh: &str, label: &str) -> Vec<u8> {
+    let mut tokens = tokens_for(id_user, id_ws, "unused", refresh);
+    tokens["access_token"] = access.into();
+    tokens["account_id"] = label.into();
+    serde_json::to_vec(
+        &json!({"auth_mode":"chatgpt","tokens":tokens,"last_refresh":"2026-10-03T11:00:00Z"}),
+    )
+    .unwrap()
+}
+#[test]
+fn refresh_without_id_token_is_recognised_by_the_access_token() {
+    // A's process refreshed after the switch to B; the response had no id_token, so
+    // Codex kept B's id_token: B's id_token + B's label + A's access/refresh tokens.
+    let mixed = file(
+        "user-b",
+        "ws-b",
+        access_jwt("user-a", "ws-a", "2"),
+        "RA2",
+        "ws-b",
+    );
+    let inspection = OpaqueAuth::inspect(&mixed).unwrap();
+    assert!(inspection.hybrid);
+    assert_eq!(
+        inspection.claims.token_owner(),
+        (Some("user-a".into()), Some("ws-a".into()))
+    );
+    assert!(OpaqueAuth::parse(mixed.clone()).is_err());
+    // The tokens go to A, A keeps its own id_token.
+    let saved_a = file(
+        "user-a",
+        "ws-a",
+        access_jwt("user-a", "ws-a", "1"),
+        "RA1",
+        "ws-a",
+    );
+    let merged = merge_rotated_tokens(&saved_a, &mixed).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&merged).unwrap();
+    assert_eq!(value["tokens"]["refresh_token"], "RA2");
+    assert_eq!(value["tokens"]["account_id"], "ws-a");
+    let merged = OpaqueAuth::parse(merged).unwrap();
+    assert_eq!(
+        merged.routing_claims().chatgpt_user_id.as_deref(),
+        Some("user-a")
+    );
+    // Never into B's record.
+    let saved_b = file(
+        "user-b",
+        "ws-b",
+        access_jwt("user-b", "ws-b", "1"),
+        "RB1",
+        "ws-b",
+    );
+    assert!(merge_rotated_tokens(&saved_b, &mixed).is_err());
+    // It cannot be re-labelled into a standalone file without A's id_token.
+    assert!(normalize_hybrid(&mixed).is_err());
+}
+#[test]
+fn two_users_of_one_workspace_are_told_apart_by_the_access_token() {
+    let mixed = file(
+        "user-b",
+        "ws-team",
+        access_jwt("user-a", "ws-team", "2"),
+        "RA2",
+        "ws-team",
+    );
+    assert!(OpaqueAuth::inspect(&mixed).unwrap().hybrid);
+    let clean = file(
+        "user-a",
+        "ws-team",
+        access_jwt("user-a", "ws-team", "1"),
+        "RA1",
+        "ws-team",
+    );
+    let inspection = OpaqueAuth::inspect(&clean).unwrap();
+    assert!(!inspection.hybrid);
+    assert_eq!(inspection.claims.access_expires_at, Some(1_900_000_000));
+    // An opaque (non-JWT) access token falls back to the id_token identity.
+    let opaque = file("user-a", "ws-a", "opaque-token".into(), "RA1", "ws-a");
+    let inspection = OpaqueAuth::inspect(&opaque).unwrap();
+    assert!(!inspection.hybrid);
+    assert_eq!(
+        inspection.claims.token_owner(),
+        (Some("user-a".into()), Some("ws-a".into()))
+    );
+}

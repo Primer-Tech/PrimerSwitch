@@ -179,6 +179,7 @@ struct FakeDaemon {
     during_restart: Mutex<Option<Vec<u8>>>,
     home: PathBuf,
     calls: Mutex<Vec<&'static str>>,
+    environment: Mutex<Option<Vec<(OsString, OsString)>>>,
 }
 #[async_trait]
 impl DaemonControl for FakeDaemon {
@@ -193,9 +194,11 @@ impl DaemonControl for FakeDaemon {
     async fn restart(
         &self,
         executable: Option<&VerifiedCodexExecutable>,
+        environment: Option<&[(OsString, OsString)]>,
     ) -> Result<(), CodexError> {
         assert!(executable.is_none());
         self.calls.lock().unwrap().push("restart");
+        *self.environment.lock().unwrap() = environment.map(<[_]>::to_vec);
         if let Some(bytes) = self.during_restart.lock().unwrap().take() {
             fs::write(self.home.join("auth.json"), bytes).unwrap();
         }
@@ -207,6 +210,12 @@ struct FakeInventory(Mutex<CodexProcessSummary>);
 impl ProcessInventory for FakeInventory {
     fn scan(&self, _: &Path) -> CodexProcessSummary {
         *self.0.lock().unwrap()
+    }
+    fn environment(&self, pid: u32) -> Option<Vec<(OsString, OsString)>> {
+        (pid == 4242).then(|| vec![("PATH".into(), "C:\\venv\\Scripts".into())])
+    }
+    fn elevated(&self) -> bool {
+        self.0.lock().unwrap().other_clients == 99
     }
 }
 #[derive(Default)]
@@ -277,6 +286,7 @@ impl Fixture {
             during_restart: Mutex::new(None),
             home: home.clone(),
             calls: Mutex::new(Vec::new()),
+            environment: Mutex::new(None),
         });
         let inventory = Arc::new(FakeInventory::default());
         let switcher = Arc::new(FakeSwitcher::default());
@@ -467,9 +477,10 @@ async fn hybrid_left_by_an_old_process_during_drain_is_repaired_and_restarted_on
     // tokens into the file that now belongs to B.
     *f.daemon.during_restart.lock().unwrap() = Some(hybrid("user-a", "ws-a", "ws-b", "late"));
     let result = f.switch(&b).await.unwrap();
+    // The second restart probes the daemon first, like the first one.
     assert_eq!(
         *f.daemon.calls.lock().unwrap(),
-        vec!["state", "restart", "restart"]
+        vec!["state", "restart", "state", "restart"]
     );
     assert!(result.daemon_restarted);
     // B is back in auth.json; A's late rotation is kept in A's own record.
@@ -599,10 +610,13 @@ async fn rejected_sign_in_and_foreign_workspace_readings_are_reported_per_accoun
     let mut f = Fixture::new();
     let b = f.add("user-b", "ws-b", "saved");
     let c = f.add("user-c", "ws-c", "saved");
-    f.factory
-        .enqueue(Plan::quota(Err(CodexError::AuthRequired)));
-    let report = f.engine.plan_quota(&b, 500, false).unwrap().run().await;
-    f.engine.finish_quota(report, &f.vault, 510).unwrap();
+    // Two consecutive rejections (one could be a transient refresh failure).
+    for at in [500, 2000] {
+        f.factory
+            .enqueue(Plan::quota(Err(CodexError::AuthRequired)));
+        let report = f.engine.plan_quota(&b, at, true).unwrap().run().await;
+        f.engine.finish_quota(report, &f.vault, at + 10).unwrap();
+    }
     let view = f.view(&b);
     assert!(view.needs_sign_in);
     assert_eq!(view.error, Some(CodexReason::SignInRequired));
@@ -840,6 +854,7 @@ fn snapshot_reports_environment_warnings_and_capabilities() {
         other_clients: 1,
         switcher_running: true,
         daemon_running: true,
+        daemon_pid: Some(7),
     };
     f.engine.observe(&f.vault, 300).unwrap();
     let snapshot = f.engine.snapshot(false, 300);
@@ -930,4 +945,223 @@ fn a_home_that_is_a_git_repo_holding_codex_home_qualifies_but_project_reroutes_d
         paths.qualify(&executable, &workspace, "0.160.0").err(),
         Some(CodexReason::UnsupportedAuth)
     );
+}
+
+fn access_for(user: &str, workspace: &str, serial: &str) -> String {
+    jwt(
+        json!({"exp":4_000_000_000i64,"serial":serial,"https://api.openai.com/auth":{
+        "chatgpt_account_id":workspace,"chatgpt_user_id":user}}),
+    )
+}
+/// A login whose access token carries its own identity claims, as Codex issues them.
+fn auth_jwt(user: &str, workspace: &str, revision: &str) -> Vec<u8> {
+    auth_with(
+        user,
+        workspace,
+        revision,
+        access_for(user, workspace, revision),
+        100,
+    )
+}
+
+#[tokio::test]
+async fn refresh_without_id_token_during_the_drain_never_overwrites_the_new_account() {
+    let mut f = Fixture::new();
+    f.write_active(&auth_jwt("user-a", "ws-a", "initial"));
+    f.engine.observe(&f.vault, 110).unwrap();
+    let b = f.add("user-b", "ws-b", "saved");
+    let saved_b = auth("user-b", "ws-b", "saved");
+    // The old process holding A refreshes; the response has no id_token, so Codex keeps
+    // B's id_token: B's id_token and label with A's access and refresh tokens.
+    let mut mixed: serde_json::Value = serde_json::from_slice(&saved_b).unwrap();
+    mixed["tokens"]["access_token"] = access_for("user-a", "ws-a", "late").into();
+    mixed["tokens"]["refresh_token"] = "refresh-secret-sentinel-a-late".into();
+    *f.daemon.during_restart.lock().unwrap() = Some(serde_json::to_vec(&mixed).unwrap());
+    f.switch(&b).await.unwrap();
+    // B is restored exactly; A received its rotated tokens and kept its own id_token.
+    assert_eq!(f.active(), saved_b);
+    assert_eq!(
+        tokens_of(&f.saved_bytes("ws-b")).0,
+        "refresh-secret-sentinel-saved"
+    );
+    let a = f.saved_bytes("ws-a");
+    assert_eq!(tokens_of(&a).0, "refresh-secret-sentinel-a-late");
+    let a = OpaqueAuth::parse(a).unwrap();
+    assert_eq!(
+        a.routing_claims().chatgpt_user_id.as_deref(),
+        Some("user-a")
+    );
+    assert_eq!(
+        *f.daemon.calls.lock().unwrap(),
+        vec!["state", "restart", "state", "restart"]
+    );
+}
+
+#[tokio::test]
+async fn the_restart_keeps_the_running_daemons_environment() {
+    let mut f = Fixture::new();
+    let b = f.add("user-b", "ws-b", "saved");
+    f.inventory.0.lock().unwrap().daemon_pid = Some(4242);
+    f.switch(&b).await.unwrap();
+    let environment = f.daemon.environment.lock().unwrap().clone().unwrap();
+    assert_eq!(environment[0].0, "PATH");
+}
+
+#[test]
+fn a_rotation_that_changes_the_email_keeps_the_store_loadable() {
+    let f = Fixture::new();
+    let mut renamed: serde_json::Value =
+        serde_json::from_slice(&auth("user-a", "ws-a", "renamed")).unwrap();
+    let claims = json!({"iat":200,"email":"new-address@example.invalid",
+        "https://api.openai.com/auth":{"chatgpt_user_id":"user-a","chatgpt_account_id":"ws-a"}});
+    renamed["tokens"]["id_token"] = jwt(claims).into();
+    let mut f = f;
+    f.write_active(&serde_json::to_vec(&renamed).unwrap());
+    f.engine.observe(&f.vault, 200).unwrap();
+    // Reloading the encrypted store must keep every account.
+    let reloaded = CodexEngine::load(&f.vault);
+    assert!(reloaded.writable);
+    assert_eq!(reloaded.saved.accounts.len(), 1);
+    assert_eq!(
+        reloaded.saved.accounts[0].binding.email.as_deref(),
+        Some("new-address@example.invalid")
+    );
+}
+
+#[test]
+fn a_damaged_record_is_quarantined_instead_of_refusing_every_account() {
+    let mut f = Fixture::new();
+    f.add("user-b", "ws-b", "saved");
+    let mut saved: Saved = f.vault.load(RECORD).unwrap().unwrap();
+    saved.accounts[1].auth = b"{\"broken\":true}".to_vec();
+    f.vault.save(RECORD, &saved).unwrap();
+    let reloaded = CodexEngine::load(&f.vault);
+    assert!(reloaded.writable);
+    assert_eq!(reloaded.saved.accounts.len(), 1);
+    let quarantine: Saved = f.vault.load(QUARANTINE).unwrap().unwrap();
+    assert_eq!(quarantine.accounts.len(), 1);
+}
+
+#[tokio::test]
+async fn one_rejected_refresh_is_not_enough_to_ask_for_a_new_sign_in() {
+    let mut f = Fixture::new();
+    let b = f.add("user-b", "ws-b", "saved");
+    for (attempt, at) in [(1, 500), (2, 2000)] {
+        f.factory
+            .enqueue(Plan::quota(Err(CodexError::AuthRequired)));
+        let report = f.engine.plan_quota(&b, at, true).unwrap().run().await;
+        f.engine.finish_quota(report, &f.vault, at + 5).unwrap();
+        let view = f.view(&b);
+        assert_eq!(view.needs_sign_in, attempt == 2, "attempt {attempt}");
+    }
+    // A successful reading resets the count.
+    f.factory
+        .enqueue(Plan::quota(Ok(quota(Some("ws-b"), 10, 10))));
+    let report = f.engine.plan_quota(&b, 2100, true).unwrap().run().await;
+    f.engine.finish_quota(report, &f.vault, 2105).unwrap();
+    assert!(!f.view(&b).needs_sign_in);
+    assert_eq!(
+        f.engine.saved.accounts[f.engine.account_index(&b).unwrap()].auth_failures,
+        0
+    );
+}
+
+#[tokio::test]
+async fn an_expiring_active_token_does_not_starve_the_other_accounts() {
+    let mut f = Fixture::new();
+    let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#);
+    let expiring = format!(
+        "{header}.{}.sig",
+        URL_SAFE_NO_PAD.encode(br#"{"exp":1000}"#)
+    );
+    f.write_active(&auth_with("user-a", "ws-a", "expiring", expiring, 100));
+    f.engine.observe(&f.vault, 700).unwrap();
+    let a = f.id_of("ws-a");
+    let b = f.add("user-b", "ws-b", "saved");
+    assert_eq!(f.engine.due_quota(700).as_deref(), Some(a.as_str()));
+    assert_eq!(
+        f.engine.plan_quota(&a, 700, false).err(),
+        Some(CodexReason::Busy)
+    );
+    assert_eq!(f.engine.due_quota(701).as_deref(), Some(b.as_str()));
+}
+
+#[tokio::test]
+async fn a_reading_without_an_account_id_is_shown_but_not_trusted_as_proof() {
+    let mut f = Fixture::new();
+    let b = f.add("user-b", "ws-b", "saved");
+    f.factory.enqueue(Plan::quota(Ok(quota(None, 30, 20))));
+    let report = f.engine.plan_quota(&b, 280, false).unwrap().run().await;
+    f.engine.finish_quota(report, &f.vault, 290).unwrap();
+    let view = f.view(&b);
+    assert!(view.quota.is_some());
+    assert!(!view.identity_verified);
+}
+
+#[tokio::test]
+async fn an_unusable_codex_switcher_entry_does_not_stop_the_import() {
+    let mut f = Fixture::new();
+    let token = |user: &str, ws: &str, fedramp: bool| {
+        jwt(json!({"iat":500,"email":format!("{user}@example.invalid"),
+            "https://api.openai.com/auth":{"chatgpt_user_id":user,"chatgpt_account_id":ws,
+            "chatgpt_account_is_fedramp":fedramp}}))
+    };
+    let entry = |name: &str, user: &str, ws: &str, fedramp: bool| {
+        json!({"name":name,"auth_mode":"chat_g_p_t","auth_data":{"type":"chat_g_p_t",
+            "id_token":token(user, ws, fedramp),"access_token":"access-secret-sentinel-x",
+            "refresh_token":format!("refresh-secret-sentinel-{user}"),"account_id":ws}})
+    };
+    let store = json!({"version":1,"accounts":[
+        entry("Gov","user-g","ws-g",true), entry("After","user-c","ws-c",false)]});
+    *f.switcher.0.lock().unwrap() = Some(serde_json::to_vec(&store).unwrap());
+    f.engine.observe(&f.vault, 300).unwrap();
+    f.engine
+        .command(CodexCommand::ImportSwitcher, &f.vault, 300)
+        .await
+        .unwrap();
+    assert_eq!(f.view(&f.id_of("ws-c")).name, "After");
+}
+
+#[test]
+fn owned_homes_never_sync_the_plugin_marketplace() {
+    let home = owned_home().unwrap();
+    let config = fs::read_to_string(home.path().join("config.toml")).unwrap();
+    assert!(config.contains("plugins = false"));
+    let path = home.path().to_owned();
+    let nested = path.join(".tmp").join("plugins").join(".git");
+    fs::create_dir_all(&nested).unwrap();
+    let pack = nested.join("pack.idx");
+    fs::write(&pack, b"x").unwrap();
+    let mut permissions = fs::metadata(&pack).unwrap().permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(&pack, permissions).unwrap();
+    fs::write(path.join("auth.json"), b"secret-sentinel").unwrap();
+    scrub_owned_home(&path);
+    drop(home);
+    assert!(!path.exists());
+}
+
+#[tokio::test]
+async fn an_elevated_app_never_half_switches_while_the_daemon_runs() {
+    let mut f = Fixture::new();
+    let b = f.add("user-b", "ws-b", "saved");
+    let before = f.active();
+    // other_clients == 99 marks the fake as elevated.
+    *f.inventory.0.lock().unwrap() = CodexProcessSummary {
+        other_clients: 99,
+        switcher_running: false,
+        daemon_running: true,
+        daemon_pid: None,
+    };
+    assert_eq!(
+        f.engine.begin_switch(&b, &f.vault, 200).err(),
+        Some(CodexReason::DaemonRestartFailed)
+    );
+    assert_eq!(f.active(), before);
+    assert!(f.engine.switching.is_none());
+    // Without a running daemon there is nothing to restart: the switch proceeds.
+    f.inventory.0.lock().unwrap().daemon_running = false;
+    *f.daemon.state.lock().unwrap() = Ok(DaemonState::NotRunning);
+    f.switch(&b).await.unwrap();
+    assert_eq!(f.active(), auth("user-b", "ws-b", "saved"));
 }

@@ -12,6 +12,7 @@ use provider_codex::*;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ffi::OsString,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -27,11 +28,14 @@ use tempfile::TempDir;
 use zeroize::{Zeroize, Zeroizing};
 
 const RECORD: &str = "codex-state";
+const QUARANTINE: &str = "codex-state-quarantine";
 /// Background reading of the active account. The terminal shows live usage itself.
 pub(crate) const ACTIVE_QUOTA_INTERVAL: i64 = 600;
 /// Inactive accounts only change when their windows reset.
 pub(crate) const INACTIVE_QUOTA_INTERVAL: i64 = 3600;
 const ERROR_RETRY: i64 = 900;
+/// A rejected sign-in is retried rarely; a new sign-in or a manual refresh clears it.
+const SIGN_IN_RETRY: i64 = 6 * 3600;
 const FRESH_SECONDS: i64 = 900;
 /// Leave a nearly expired active token to Codex's own refresh in the background.
 const ACTIVE_EXPIRY_MARGIN: i64 = 600;
@@ -65,10 +69,31 @@ struct SavedAccount {
     needs_sign_in: bool,
     #[serde(default)]
     last_attempt_at: Option<i64>,
+    /// Consecutive readings that ended in an authentication error. One can be a
+    /// transient refresh failure; two in a row mean the sign-in is gone.
+    #[serde(default)]
+    auth_failures: u8,
 }
 impl Drop for SavedAccount {
     fn drop(&mut self) {
         self.auth.zeroize();
+    }
+}
+impl SavedAccount {
+    /// Replace the saved login with a newer copy of the same account's login and keep
+    /// the binding in step with it (claims such as the email can change between token
+    /// generations). Callers have already checked that the owner is unchanged.
+    fn set_auth(&mut self, auth: &OpaqueAuth) -> Result<(), CodexReason> {
+        let binding = Binding::from_auth(auth)?;
+        self.auth.zeroize();
+        self.auth = auth.as_bytes().to_vec();
+        self.auth_kind = auth.kind();
+        self.binding = binding;
+        Ok(())
+    }
+    fn set_merged(&mut self, bytes: Vec<u8>) -> Result<(), CodexReason> {
+        let auth = OpaqueAuth::parse(bytes).map_err(provider_reason)?;
+        self.set_auth(&auth)
     }
 }
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -156,8 +181,11 @@ pub(crate) trait DaemonControl: Send + Sync {
         &self,
         executable: Option<&VerifiedCodexExecutable>,
     ) -> Result<DaemonState, CodexError>;
-    async fn restart(&self, executable: Option<&VerifiedCodexExecutable>)
-    -> Result<(), CodexError>;
+    async fn restart(
+        &self,
+        executable: Option<&VerifiedCodexExecutable>,
+        environment: Option<&[(OsString, OsString)]>,
+    ) -> Result<(), CodexError>;
 }
 struct NativeDaemon;
 #[async_trait]
@@ -171,17 +199,26 @@ impl DaemonControl for NativeDaemon {
     async fn restart(
         &self,
         executable: Option<&VerifiedCodexExecutable>,
+        environment: Option<&[(OsString, OsString)]>,
     ) -> Result<(), CodexError> {
-        restart_daemon(executable.ok_or(CodexError::NotFound)?).await
+        restart_daemon(executable.ok_or(CodexError::NotFound)?, environment).await
     }
 }
 pub(crate) trait ProcessInventory: Send + Sync {
     fn scan(&self, home: &Path) -> CodexProcessSummary;
+    fn environment(&self, pid: u32) -> Option<Vec<(OsString, OsString)>>;
+    fn elevated(&self) -> bool;
 }
 struct NativeInventory;
 impl ProcessInventory for NativeInventory {
     fn scan(&self, home: &Path) -> CodexProcessSummary {
         scan_codex_processes(home)
+    }
+    fn environment(&self, pid: u32) -> Option<Vec<(OsString, OsString)>> {
+        process_environment(pid)
+    }
+    fn elevated(&self) -> bool {
+        process_is_elevated()
     }
 }
 /// lampese "Codex Switcher" (`~/.codex-switcher/accounts.json`, store version 1).
@@ -276,8 +313,20 @@ impl QuotaJob {
         .await;
         let owned = match self.target {
             QuotaTarget::Owned { home, original, .. } => {
-                let rotated = read_private_auth(home.path()).ok().flatten();
-                scrub_owned_home(home);
+                // Codex writes auth.json in place; give a just-exited child's file a
+                // moment instead of losing a rotation to a transient sharing error.
+                let mut rotated = None;
+                for _ in 0..10 {
+                    match read_private_auth(home.path()) {
+                        Ok(bytes) => {
+                            rotated = bytes;
+                            break;
+                        }
+                        Err(_) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+                    }
+                }
+                scrub_owned_home(home.path());
+                drop(home);
                 Some(OwnedResult { original, rotated })
             }
             QuotaTarget::Active(_) => None,
@@ -290,9 +339,10 @@ impl QuotaJob {
         }
     }
 }
-/// Overwrite and remove the private copy of a login before deleting its directory.
-fn scrub_owned_home(home: TempDir) {
-    let auth = home.path().join("auth.json");
+/// Overwrite and remove the private copy of a login, then the whole directory,
+/// including read-only files a Codex child may have created.
+fn scrub_owned_home(home: &Path) {
+    let auth = home.join("auth.json");
     for _ in 0..20 {
         if let Ok(meta) = std::fs::metadata(&auth) {
             let _ = std::fs::write(&auth, vec![0u8; meta.len() as usize]);
@@ -302,7 +352,52 @@ fn scrub_owned_home(home: TempDir) {
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    let _ = home.close();
+    remove_tree(home);
+}
+fn remove_tree(path: &Path) {
+    fn writable(path: &Path, depth: usize) {
+        let Ok(meta) = std::fs::symlink_metadata(path) else {
+            return;
+        };
+        if meta.is_dir() && depth < 64 {
+            if let Ok(entries) = std::fs::read_dir(path) {
+                for entry in entries.flatten() {
+                    writable(&entry.path(), depth + 1);
+                }
+            }
+        } else if meta.permissions().readonly() {
+            let mut permissions = meta.permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            permissions.set_readonly(false);
+            let _ = std::fs::set_permissions(path, permissions);
+        }
+    }
+    writable(path, 0);
+    let _ = std::fs::remove_dir_all(path);
+}
+/// Owned homes left behind by a crash: wipe the ones older than an hour.
+fn remove_stale_owned_homes() {
+    let Ok(parent) = std::env::temp_dir().canonicalize() else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten().take(10_000) {
+        let name = entry.file_name();
+        let stale = entry
+            .metadata()
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age.as_secs() > 3600);
+        if stale
+            && name.to_string_lossy().starts_with("primerswitch-codex-")
+            && entry.file_type().is_ok_and(|t| t.is_dir())
+        {
+            scrub_owned_home(&entry.path());
+        }
+    }
 }
 
 /// The slow part of a switch, run outside the owner lock.
@@ -310,6 +405,9 @@ pub(crate) struct SwitchJob {
     target_id: String,
     executable: Option<VerifiedCodexExecutable>,
     daemon: Arc<dyn DaemonControl>,
+    /// The running daemon's own environment, so the restarted daemon (and the shell
+    /// commands it runs for every terminal) keeps it.
+    environment: Option<Vec<(OsString, OsString)>>,
 }
 pub(crate) struct SwitchOutcome {
     daemon_running: bool,
@@ -320,24 +418,26 @@ impl SwitchJob {
         match self.daemon.state(self.executable.as_ref()).await {
             Ok(DaemonState::Running) => SwitchOutcome {
                 daemon_running: true,
-                restart: Some(self.daemon.restart(self.executable.as_ref()).await),
+                restart: Some(
+                    self.daemon
+                        .restart(self.executable.as_ref(), self.environment.as_deref())
+                        .await,
+                ),
             },
             Ok(DaemonState::NotRunning) => SwitchOutcome {
                 daemon_running: false,
                 restart: None,
             },
+            // The probe itself failed: report it, but never start a daemon blindly.
             Err(error) => SwitchOutcome {
-                daemon_running: true,
+                daemon_running: false,
                 restart: Some(Err(error)),
             },
         }
     }
     /// A second restart after repairing a file that an old process rewrote mid-drain.
     pub(crate) async fn restart_again(&self) -> SwitchOutcome {
-        SwitchOutcome {
-            daemon_running: true,
-            restart: Some(self.daemon.restart(self.executable.as_ref()).await),
-        }
+        self.run().await
     }
     pub(crate) fn target_id(&self) -> &str {
         &self.target_id
@@ -390,7 +490,15 @@ impl CodexEngine {
     pub fn load(vault: &Vault) -> Self {
         let mut engine = Self::empty(false);
         match vault.load::<Saved>(RECORD) {
-            Ok(Some(saved)) if valid_saved(&saved) => {
+            Ok(Some(saved)) if saved.format == 1 && saved.accounts.len() <= 1000 => {
+                let (saved, quarantined) = sanitize(saved);
+                if !quarantined.accounts.is_empty() {
+                    // Keep unreadable records (still encrypted) instead of refusing the store.
+                    let mut kept: Saved = vault.load(QUARANTINE).ok().flatten().unwrap_or_default();
+                    kept.accounts.extend(quarantined.accounts);
+                    let _ = vault.save(QUARANTINE, &kept);
+                    let _ = vault.save(RECORD, &saved);
+                }
                 engine.saved = saved;
             }
             Ok(None) => (),
@@ -486,6 +594,7 @@ impl CodexEngine {
                 quota_read_at: Some(now),
                 needs_sign_in: false,
                 last_attempt_at: Some(now),
+                auth_failures: 0,
             });
             engine.verified_now.insert(id);
         }
@@ -828,7 +937,12 @@ impl CodexEngine {
             // The 0.2.0 candidate's two-step journal is obsolete; its tokens are saved.
             let _ = store.discard_legacy_journal(vault);
         }
-        self.observe(vault, now)?;
+        remove_stale_owned_homes();
+        // A transient read of auth.json must not turn a working setup into "unsupported";
+        // the background tick observes again.
+        if let Err(error) = self.observe(vault, now) {
+            self.error = Some(error);
+        }
         Ok(())
     }
     fn refresh_environment(&mut self) {
@@ -838,7 +952,8 @@ impl CodexEngine {
         };
         let summary = self.processes.scan(&home);
         self.environment = CodexEnvironmentView {
-            daemon_running: Some(summary.daemon_running),
+            daemon_running: cfg!(any(windows, target_os = "linux"))
+                .then_some(summary.daemon_running),
             other_clients: summary.other_clients,
             codex_switcher_running: summary.switcher_running,
         };
@@ -894,17 +1009,18 @@ impl CodexEngine {
         if let Some(index) = existing {
             let account = &mut self.saved.accounts[index];
             if account.auth != auth.as_bytes() {
-                account.auth.zeroize();
-                account.auth = auth.as_bytes().to_vec();
+                account.set_auth(&auth)?;
                 // A login that Codex just refreshed is valid again.
                 account.needs_sign_in = false;
+                account.auth_failures = 0;
                 self.account_errors.remove(&account.id.clone());
+            } else {
+                account.binding = binding;
             }
             if evidence != CodexIdentityEvidence::ClaimsOnly {
                 account.evidence = evidence;
             }
             account.managed_origin |= evidence == CodexIdentityEvidence::ManagedLogin;
-            account.binding = binding;
             return Ok(index);
         }
         if self.saved.accounts.len() >= 1000 {
@@ -930,6 +1046,7 @@ impl CodexEngine {
             quota_read_at: None,
             needs_sign_in: false,
             last_attempt_at: None,
+            auth_failures: 0,
         });
         Ok(self.saved.accounts.len() - 1)
     }
@@ -945,10 +1062,11 @@ impl CodexEngine {
         now: i64,
     ) -> Result<(), CodexReason> {
         let inspection = OpaqueAuth::inspect(bytes).map_err(provider_reason)?;
+        let (user, workspace) = inspection.claims.token_owner();
         let owner = Binding {
-            user: inspection.claims.chatgpt_user_id.clone(),
-            workspace: inspection.claims.chatgpt_account_id.clone(),
-            email: inspection.claims.email.clone(),
+            user,
+            workspace,
+            email: None,
         };
         if let Some(account) = self
             .saved
@@ -957,8 +1075,7 @@ impl CodexEngine {
             .find(|a| a.auth_kind == AuthKind::ManagedChatgpt && a.binding.same_owner(&owner))
         {
             if let Ok(merged) = merge_rotated_tokens(&account.auth, bytes) {
-                account.auth.zeroize();
-                account.auth = merged;
+                account.set_merged(merged)?;
                 account.needs_sign_in = false;
             }
         } else if let Ok(fixed) = normalize_hybrid(bytes) {
@@ -1166,7 +1283,8 @@ impl CodexEngine {
             self.last_login_account = Some(account_id);
             Ok(())
         })();
-        scrub_owned_home(pending.home);
+        scrub_owned_home(pending.home.path());
+        drop(pending.home);
         match complete {
             Ok(()) => {
                 self.login_view = Some(CodexLoginView {
@@ -1256,7 +1374,11 @@ impl CodexEngine {
                 let Ok(auth) = payload.and_then(OpaqueAuth::parse) else {
                     continue;
                 };
-                if self.import_record(auth, item["name"].as_str(), now)? {
+                // A FedRAMP or otherwise unusable entry is skipped, never fatal.
+                if self
+                    .import_record(auth, item["name"].as_str(), now)
+                    .unwrap_or(false)
+                {
                     imported += 1;
                 }
             }
@@ -1286,9 +1408,9 @@ impl CodexEngine {
                 .and_then(|i| i.claims.issued_at);
             let is_active = self.selected_id.as_deref() == Some(&account.id);
             if !is_active && issued.is_some() && issued > saved_issued {
-                account.auth.zeroize();
-                account.auth = auth.as_bytes().to_vec();
+                account.set_auth(&auth)?;
                 account.needs_sign_in = false;
+                account.auth_failures = 0;
             }
             return Ok(false);
         }
@@ -1307,7 +1429,9 @@ impl CodexEngine {
         }
         let eligible = |a: &&SavedAccount| {
             a.auth_kind == AuthKind::ManagedChatgpt
-                && !a.needs_sign_in
+                && (!a.needs_sign_in
+                    || a.last_attempt_at
+                        .is_none_or(|t| now < t || now - t >= SIGN_IN_RETRY))
                 && a.last_attempt_at
                     .is_none_or(|t| now < t || now - t >= ERROR_RETRY.min(ACTIVE_QUOTA_INTERVAL))
         };
@@ -1353,6 +1477,8 @@ impl CodexEngine {
         if self.saved.accounts[index].auth_kind != AuthKind::ManagedChatgpt {
             return Err(CodexReason::UnsupportedAuth);
         }
+        // System and managed layers apply to owned readers too.
+        self.requalify()?;
         let binding = self.saved.accounts[index].binding.clone();
         let installation = self
             .installation
@@ -1373,7 +1499,9 @@ impl CodexEngine {
                     .access_expires_at
                     .is_some_and(|exp| exp - now < ACTIVE_EXPIRY_MARGIN)
             {
-                // Codex refreshes this token within the next minute; read afterwards.
+                // Codex refreshes this token within the next minute; read afterwards,
+                // and let the background turn move on to the other accounts meanwhile.
+                self.saved.accounts[index].last_attempt_at = Some(now);
                 return Err(CodexReason::Busy);
             }
             QuotaTarget::Active(
@@ -1422,11 +1550,12 @@ impl CodexEngine {
             && let Ok(auth) = OpaqueAuth::parse(rotated.to_vec())
             && Binding::from_auth(&auth).is_ok_and(|b| b.same_owner(&report.binding))
         {
-            let account = &mut self.saved.accounts[index];
-            account.auth.zeroize();
-            account.auth = auth.as_bytes().to_vec();
+            self.saved.accounts[index].set_auth(&auth)?;
         }
         let id = report.account_id.clone();
+        if !matches!(report.outcome, Err(CodexError::AuthRequired)) {
+            self.saved.accounts[index].auth_failures = 0;
+        }
         match report.outcome {
             Ok(limits)
                 if limits.account_id.is_some() && limits.account_id != report.binding.workspace =>
@@ -1437,12 +1566,16 @@ impl CodexEngine {
             }
             Ok(limits) => match quota_view(&limits) {
                 Ok(view) => {
+                    // Only a reading that names this workspace proves whose usage it is.
+                    let proven = limits.account_id.is_some();
                     let account = &mut self.saved.accounts[index];
                     account.quota = Some(view);
                     account.quota_read_at = Some(now);
                     account.needs_sign_in = false;
-                    account.evidence = CodexIdentityEvidence::BackendVerified;
-                    self.verified_now.insert(id.clone());
+                    if proven {
+                        account.evidence = CodexIdentityEvidence::BackendVerified;
+                        self.verified_now.insert(id.clone());
+                    }
                     self.account_errors.remove(&id);
                 }
                 Err(error) => {
@@ -1450,11 +1583,25 @@ impl CodexEngine {
                 }
             },
             Err(CodexError::AuthRequired) => {
-                self.saved.accounts[index].needs_sign_in = true;
+                // One 401 can be a transient refresh failure; two in a row mean the
+                // saved sign-in is gone.
+                let account = &mut self.saved.accounts[index];
+                account.auth_failures = account.auth_failures.saturating_add(1);
                 self.verified_now.remove(&id);
-                self.account_errors.insert(id, CodexReason::SignInRequired);
+                if account.auth_failures >= 2 {
+                    account.needs_sign_in = true;
+                    self.account_errors.insert(id, CodexReason::SignInRequired);
+                } else {
+                    self.account_errors
+                        .insert(id, CodexReason::ProviderUnavailable);
+                }
             }
             Err(error) => {
+                if error == CodexError::UnsupportedInstallation {
+                    // Codex was updated or replaced: discover it again.
+                    self.installation = None;
+                    self.discovered_at = None;
+                }
                 self.account_errors.insert(id, provider_reason(error));
             }
         }
@@ -1489,14 +1636,19 @@ impl CodexEngine {
                 .blocked_reason
                 .unwrap_or(CodexReason::IdentityUnverified));
         }
+        let home = self
+            .installation
+            .as_ref()
+            .ok_or(CodexReason::NotInstalled)?
+            .paths
+            .home
+            .clone();
+        // Codex refuses to restart its daemon from an elevated process: switching the
+        // file alone would leave every open terminal on the previous account.
+        if self.processes.elevated() && self.processes.scan(&home).daemon_running {
+            return Err(CodexReason::DaemonRestartFailed);
+        }
         if self.store().is_err() {
-            let home = self
-                .installation
-                .as_ref()
-                .ok_or(CodexReason::NotInstalled)?
-                .paths
-                .home
-                .clone();
             if home.exists() {
                 return Err(CodexReason::UnsupportedStore);
             }
@@ -1529,6 +1681,12 @@ impl CodexEngine {
             stage: CodexSwitchStage::Restarting,
             started_at: now,
         });
+        let environment = self
+            .installation
+            .as_ref()
+            .map(|i| self.processes.scan(&i.paths.home))
+            .and_then(|summary| summary.daemon_pid)
+            .and_then(|pid| self.processes.environment(pid));
         Ok(Some(SwitchJob {
             target_id: id.into(),
             executable: self
@@ -1536,6 +1694,7 @@ impl CodexEngine {
                 .as_ref()
                 .and_then(|i| i.executable.clone()),
             daemon: self.daemon.clone(),
+            environment,
         }))
     }
     /// Keep the login that is about to be replaced: a rotation of a saved account, an
@@ -1543,10 +1702,11 @@ impl CodexEngine {
     fn preserve_outgoing(&mut self, bytes: &[u8], now: i64) -> Result<(), CodexReason> {
         let inspection = OpaqueAuth::inspect(bytes).map_err(|_| CodexReason::UnsupportedAuth)?;
         if inspection.hybrid {
+            let (user, workspace) = inspection.claims.token_owner();
             let owner = Binding {
-                user: inspection.claims.chatgpt_user_id.clone(),
-                workspace: inspection.claims.chatgpt_account_id.clone(),
-                email: inspection.claims.email.clone(),
+                user,
+                workspace,
+                email: None,
             };
             if let Some(account) =
                 self.saved.accounts.iter_mut().find(|a| {
@@ -1554,8 +1714,7 @@ impl CodexEngine {
                 })
             {
                 if let Ok(merged) = merge_rotated_tokens(&account.auth, bytes) {
-                    account.auth.zeroize();
-                    account.auth = merged;
+                    account.set_merged(merged)?;
                 }
             } else {
                 let fixed = normalize_hybrid(bytes).map_err(provider_reason)?;
@@ -1676,21 +1835,29 @@ fn wipe_json(value: &mut serde_json::Value) {
         _ => (),
     }
 }
-fn valid_saved(saved: &Saved) -> bool {
-    if saved.format != 1 || saved.accounts.len() > 1000 {
-        return false;
-    }
+/// Recompute every binding from its login and set aside records whose login no longer
+/// parses, has a duplicate id or an unsafe name.
+fn sanitize(saved: Saved) -> (Saved, Saved) {
+    let mut good = Saved::default();
+    let mut bad = Saved::default();
     let mut ids = BTreeSet::new();
-    saved.accounts.iter().all(|account| {
-        !account.id.is_empty()
+    for mut account in saved.accounts.into_iter() {
+        let auth = OpaqueAuth::parse(account.auth.clone()).ok();
+        let usable = !account.id.is_empty()
             && account.id.len() <= 256
-            && ids.insert(&account.id)
             && safe_text(&account.name).is_some()
-            && OpaqueAuth::parse(account.auth.clone()).is_ok_and(|auth| {
-                auth.kind() == account.auth_kind
-                    && Binding::from_auth(&auth).is_ok_and(|binding| binding == account.binding)
-            })
-    })
+            && !ids.contains(&account.id)
+            && auth
+                .as_ref()
+                .is_some_and(|auth| account.set_auth(auth).is_ok());
+        if usable {
+            ids.insert(account.id.clone());
+            good.accounts.push(account);
+        } else {
+            bad.accounts.push(account);
+        }
+    }
+    (good, bad)
 }
 fn owned_home() -> Result<TempDir, CodexReason> {
     let parent = std::env::temp_dir()
@@ -1704,7 +1871,11 @@ fn owned_home() -> Result<TempDir, CodexReason> {
         .path()
         .canonicalize()
         .map_err(|_| CodexReason::StoreConflict)?;
-    create_private_context(canonical).map_err(store_reason)?;
+    let home = create_private_context(canonical).map_err(store_reason)?;
+    // Codex clones its ~24 MB plugin marketplace into every new home at startup; an
+    // owned sign-in or quota reader needs none of it.
+    std::fs::write(home.join("config.toml"), b"[features]\nplugins = false\n")
+        .map_err(|_| CodexReason::StoreConflict)?;
     Ok(directory)
 }
 pub(crate) fn provider_reason(error: CodexError) -> CodexReason {

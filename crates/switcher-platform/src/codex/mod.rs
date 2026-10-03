@@ -10,7 +10,10 @@ pub use context::{
     write_private_auth,
 };
 pub use generation::StoreGeneration;
-pub use process::{CodexProcessSummary, macos_policy_is_unrestricted, scan_codex_processes};
+pub use process::{
+    CodexProcessSummary, macos_policy_is_unrestricted, process_environment, process_is_elevated,
+    scan_codex_processes,
+};
 pub use store::{CodexAuthSnapshot, CodexFileStore};
 
 pub type CodexResult<T> = std::result::Result<T, CodexStoreError>;

@@ -722,11 +722,13 @@ impl CodexClient {
 /// or a missing login ("...authentication required...") through these errors.
 fn auth_required(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
-    message.contains("sign in again")
-        || message.contains("log in again")
-        || message.contains("authentication required")
-        || message.contains("401 unauthorized")
-        || message.contains("refresh token")
+    // "Proxy Authentication Required" (407) is a network problem, not a lost sign-in.
+    !message.contains("proxy")
+        && (message.contains("sign in again")
+            || message.contains("log in again")
+            || message.contains("account authentication required")
+            || message.contains("401 unauthorized")
+            || message.contains("refresh token"))
 }
 
 /// Typed seam for the runtime owner and fake lifecycle fixtures. No raw RPC/token methods.

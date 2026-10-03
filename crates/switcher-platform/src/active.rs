@@ -393,9 +393,13 @@ mod mac {
     use core_foundation::base::{CFRelease, OSStatus, TCFType};
     use security_framework::os::macos::keychain::SecKeychain;
     use security_framework_sys::{
-        base::{SecAccessRef, SecKeychainItemRef},
+        base::{
+            SecAccessRef, SecKeychainAttribute, SecKeychainAttributeList, SecKeychainItemRef,
+            SecKeychainRef,
+        },
         keychain_item::SecKeychainItemDelete,
     };
+    use std::ffi::c_void;
     use std::ptr;
 
     // The high-level crate does not expose keychain item access ACLs. Preserve
@@ -407,8 +411,15 @@ mod mac {
             item_ref: SecKeychainItemRef,
             access: *mut SecAccessRef,
         ) -> OSStatus;
-        fn SecKeychainItemSetAccess(item_ref: SecKeychainItemRef, access: SecAccessRef)
-        -> OSStatus;
+        fn SecKeychainItemCreateFromContent(
+            item_class: u32,
+            attributes: *mut SecKeychainAttributeList,
+            length: u32,
+            data: *const c_void,
+            keychain: SecKeychainRef,
+            initial_access: SecAccessRef,
+            item: *mut SecKeychainItemRef,
+        ) -> OSStatus;
     }
 
     // Static source inspection of installed public Claude 2.1.287, not native Mac
@@ -460,29 +471,18 @@ mod mac {
             return Err(PlatformError::KeyUnavailable);
         }
 
-        if keychain
-            .add_generic_password(SERVICE, ACCOUNT, bytes)
-            .is_err()
-        {
-            // The delete API is intentionally best-effort in the upstream
-            // wrapper. Re-adding the old value gives the caller a usable
-            // keychain item even when the replacement could not be created.
+        if create_item(&keychain, bytes, access).is_err() {
+            // Re-creating the old value gives the caller a usable keychain
+            // item even when the replacement could not be created.
             restore_item(&keychain, &old_bytes, access);
             return Err(PlatformError::KeyUnavailable);
         }
 
         match keychain.find_generic_password(SERVICE, ACCOUNT) {
             Ok((current, replacement)) if current.as_ref() == bytes => {
-                let status =
-                    unsafe { SecKeychainItemSetAccess(replacement.as_concrete_TypeRef(), access) };
                 drop(replacement);
-                if status == 0 {
-                    release_access(access);
-                    Ok(())
-                } else {
-                    restore_item(&keychain, &old_bytes, access);
-                    Err(PlatformError::KeyUnavailable)
-                }
+                release_access(access);
+                Ok(())
             }
             Ok((_, replacement)) => {
                 delete_item(replacement);
@@ -511,16 +511,59 @@ mod mac {
         if let Ok((_, item)) = keychain.find_generic_password(SERVICE, ACCOUNT) {
             delete_item(item);
         }
-        if keychain
-            .add_generic_password(SERVICE, ACCOUNT, bytes)
-            .is_ok()
-            && let Ok((_, item)) = keychain.find_generic_password(SERVICE, ACCOUNT)
-        {
-            let status = unsafe { SecKeychainItemSetAccess(item.as_concrete_TypeRef(), access) };
-            drop(item);
-            let _ = status;
-        }
+        let _ = create_item(keychain, bytes, access);
         release_access(access);
+    }
+
+    fn create_item(keychain: &SecKeychain, bytes: &[u8], access: SecAccessRef) -> Result<()> {
+        let service = SERVICE.as_bytes();
+        let account = ACCOUNT.as_bytes();
+        let mut attributes = [
+            SecKeychainAttribute {
+                tag: four_char(b"labl"),
+                length: service.len() as u32,
+                data: service.as_ptr().cast_mut().cast(),
+            },
+            SecKeychainAttribute {
+                tag: four_char(b"svce"),
+                length: service.len() as u32,
+                data: service.as_ptr().cast_mut().cast(),
+            },
+            SecKeychainAttribute {
+                tag: four_char(b"acct"),
+                length: account.len() as u32,
+                data: account.as_ptr().cast_mut().cast(),
+            },
+        ];
+        let mut attribute_list = SecKeychainAttributeList {
+            count: attributes.len() as u32,
+            attr: attributes.as_mut_ptr(),
+        };
+        let mut item = ptr::null_mut();
+        let length = u32::try_from(bytes.len()).map_err(|_| PlatformError::KeyUnavailable)?;
+        let status = unsafe {
+            SecKeychainItemCreateFromContent(
+                four_char(b"genp"),
+                &mut attribute_list,
+                length,
+                bytes.as_ptr().cast(),
+                keychain.as_concrete_TypeRef(),
+                access,
+                &mut item,
+            )
+        };
+        if !item.is_null() {
+            unsafe { CFRelease(item.cast()) };
+        }
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(PlatformError::KeyUnavailable)
+        }
+    }
+
+    const fn four_char(bytes: &[u8; 4]) -> u32 {
+        u32::from_be_bytes(*bytes)
     }
 
     fn delete_item(item: impl TCFType<Ref = SecKeychainItemRef>) {

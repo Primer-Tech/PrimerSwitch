@@ -1,52 +1,39 @@
 # Codex accounts in PrimerSwitch
 
-The Codex adapter, native commands and desktop workflow are implemented in source. The 0.2.0 candidate passed the hosted integration, native CI and package qualification runs, but the public release is not published and authenticated/live compatibility is not claimed. This guide describes the qualified source workflow and its restrictions. See the [implementation contract](CODEX_IMPLEMENTATION.md), [pinned research](CODEX_RESEARCH.md) and [evidence ledger](PROGRESS.md).
+PrimerSwitch keeps several ChatGPT sign-ins for the Codex CLI, shows each account's 5-hour and weekly usage, and switches the active one **without closing your terminals**. Research and evidence: [CODEX_RESEARCH.md](CODEX_RESEARCH.md), [PROGRESS.md](PROGRESS.md).
 
-## Set up a separate Codex installation
+## Requirements
 
-PrimerSwitch does not bundle Codex. Install **Codex 0.160.0** from the [official release](https://github.com/openai/codex/releases/tag/rust-v0.160.0). For an npm installation, pin the version:
+- Codex CLI **0.160.0 or newer** (0.x). Install or update it with `npm install -g @openai/codex`. PrimerSwitch finds the native executable on PATH or in the global npm package and checks `codex --version`.
+- The default FILE credential store (`~/.codex/auth.json`, or `$CODEX_HOME/auth.json`). A `cli_auth_credentials_store` other than `file`, a custom `model_provider`, `forced_login_method`/`forced_chatgpt_workspace_id`, a default `profile`, or custom `chatgpt_base_url`/`openai_base_url` make switching ineffective or unsafe; PrimerSwitch then explains what blocks it and never rewrites your configuration.
 
-```sh
-npm install -g @openai/codex@0.160.0
-```
+## How switching works
 
-Restart PrimerSwitch after changing the installation or PATH, open the **Codex** tab and choose **Check setup**. The first adapter accepts a qualified local setup using managed ChatGPT sign-in, the default OpenAI provider and **FILE** credential storage. Native discovery checks the actual executable/version; unknown versions are denied rather than treated as compatible.
+Since 0.160.0 every interactive Codex terminal is a client of one shared **app-server daemon** per `CODEX_HOME`, and that daemon holds the loaded sign-in. When you choose **Switch**:
 
-A different store or policy is not a reason to rewrite your configuration. PrimerSwitch preserves the existing setup and reports restricted capabilities. It does not change `cli_auth_credentials_store` to force compatibility.
+1. PrimerSwitch saves the sign-in that is about to be replaced (Codex rotates tokens on its own, so the latest copy is kept; an unknown login is saved as a new account).
+2. It writes the selected account's sign-in to `auth.json` atomically. Nothing else in the Codex home changes.
+3. If the daemon is running, it runs Codex's official `codex app-server daemon restart`. The daemon finishes running turns first (graceful drain, 60 s by default) and saves its threads; new prompts during the drain are refused with "Server is draining".
+4. Each open terminal shows **Reconnecting…** for a few seconds, resumes the same conversation with your typed input intact, and continues on the new account. A turn that was cut off at the end of the drain continues automatically.
 
-## Add or import an account
+If no daemon is running, only the file is written and the next Codex session uses the new account.
 
-Use **Add account → Add a Codex account**, then finish sign-in in the browser opened by the native app. Codex manages the authorization callback and refresh lifecycle. PrimerSwitch waits for managed completion; there is no code or token to paste. Login runs in a private, owned credential context, so adding or canceling an account leaves the active Codex sign-in unchanged. Saved opaque credentials remain encrypted in the PrimerSwitch vault and never enter the WebView.
+Processes that hold their own sign-in keep the previous account until they restart: the Codex desktop app, IDE extensions, `codex exec`, and terminals started with `--no-daemon`. PrimerSwitch counts them after a switch and says so. A rare race is handled too: if such a process refreshes its old token right after the switch, Codex merges those tokens into the new `auth.json`; PrimerSwitch notices the mixed file, keeps the tokens with their real account and restores the selected one (restarting the daemon again when needed).
 
-Use **Add account → Import current Codex account** to save the supported current sign-in. Close Codex clients first: import also checks for concurrent writers. Parsed token routing claims identify a candidate record; they do **not** establish verified account/workspace ownership. Import does not perform a provider read automatically. For a ChatGPT import, explicitly **Refresh** the selected account to obtain an owner-bound backend reading before relying on its quota or selecting it later. Missing or mismatched proof leaves the account unverified.
+Resumed conversations carry encrypted reasoning that belongs to the previous account. Switching between two personal accounts has been reported to work; if a resumed thread fails after switching between a personal account and a workspace, start a new thread.
 
-API-key imports are represented separately and encrypted. This delivery does not select API-key accounts, read their billing, offer a key-entry login form or present them as ChatGPT subscriptions. Removing a saved account deletes its PrimerSwitch record; it does not log the current Codex client out.
+## Add accounts
 
-## Select an account manually
+- **Sign in with ChatGPT…** opens the browser login in a private, temporary Codex home, so adding an account never changes the active one.
+- **Import current Codex sign-in** saves whatever `codex login` produced. PrimerSwitch also does this by itself: when it sees a login it does not know in `auth.json`, it keeps it as a new account.
+- **Import from Codex Switcher** reads `~/.codex-switcher/accounts.json` from lampese's Codex Switcher (store version 1) and saves its ChatGPT accounts with their names (API-key entries are kept but cannot be selected). If an account exists in both, the copy whose token was issued later wins. Close Codex Switcher afterwards: it also refreshes tokens in the background and force-closes `codex.exe` processes when it switches, so running both makes them invalidate each other's sign-ins.
 
-1. Close Codex applications, CLI/TUI sessions, IDE clients and terminals that are using the affected sign-in. Do not leave a background Codex client refreshing it.
-2. Choose **Select account** on an eligible saved ChatGPT account. Eligibility uses durable managed-login or previously backend-verified ownership evidence plus native capabilities; it does not require a fresh quota reading in the current app session. Imported claims-only records and API keys are ineligible. PrimerSwitch prepares an encrypted transaction and checks the current context, credentials and process inventory.
-3. Acknowledge that the clients are closed, then apply the selection. An expired check requires **Check again**. Canceling the dialog asks native code to discard only its unchanged preparation; a blocked cleanup remains an explicit error.
-4. After an authoritative successful selection, reopen Codex clients. Selection applies to **newly opened clients**; it does not retarget existing sessions or change browser, ChatGPT web/desktop or cloud sign-ins.
+## Usage readings
 
-The native guard checks again around the write, changes only the qualified auth payload, and retains encrypted reconciliation state if the result becomes uncertain. It preserves configuration, profiles, histories, skills and MCP data. It does not kill clients, log out first or blindly restore older credentials over an external sign-in. If the app reports an external change or reconciliation requirement, keep clients closed and check setup again. To adopt an external current login, explicitly import the current account and Refresh it: only a successful independent owner reading and durable refreshed-record save can retire the old journal. Failed proof or a damaged journal remains blocked. Do not treat a canceled dialog or missing success message as proof that active credentials were restored.
+The active account is read every 10 minutes through your Codex home (skipped while its token is about to expire, so Codex refreshes it first). Other accounts are read about once an hour, and sooner after one of their windows resets, each in its own temporary private home; if Codex rotates a token there, the new token is saved. **Refresh** reads one account now; **Refresh all** reads every account. A rejected sign-in marks that account **Sign in again**; it cannot be selected until you sign in once more.
 
-## Read quotas
+PrimerSwitch never sends inference requests, never consumes reset credits and never logs out an account. The active account cannot be deleted; switch to another account first.
 
-**Refresh** reads only the selected managed ChatGPT account through an owned Codex app-server session. This verification can require closing other clients too. A supported proof includes the matching backend account/workspace identity and a non-null `ordinaryUsageAllowed` value. A percentage or reset date cannot substitute for that proof. `false` means included usage is blocked; unavailable/unknown permission is not inferred to be usable.
+## Data and privacy
 
-Current quota corroboration is separate from durable selection eligibility. An account can remain eligible to select after restarting while its quota is unverified for this session; selection must still verify the actual active workspace/backend before completing its journal.
-
-The dashboard retains every native limit group, optional primary/secondary window, supplied duration/reset, plan and string credit balance. Missing windows and unknown reset times remain missing/unknown. Other saved readings are cached; they are not refreshed in parallel. Reset-credit counts are **read-only**: PrimerSwitch sends no dummy inference, consumes no credits/resets and sends no quota emails.
-
-The existing automation settings apply only to **Claude**. Codex automatic selection, reset consumption and priming are absent. Appearance and English/Romanian language preferences remain global.
-
-## Current restrictions and preservation
-
-Keyring, auto and ephemeral auth stores, unsupported auth types, custom providers/endpoints, credential overrides, active/configured profiles, restricted or unknown managed policy, and other Codex versions are denied by this first compatibility adapter. Configuration is preserved rather than bypassed. Broader support requires separate source, fixture, OS and authenticated qualification gates.
-
-Native process inventory is conservative and can block a change when visibility is incomplete. It cannot identify every arbitrarily renamed/copied/wrapped client, or atomically prevent a new client/concurrent writer from starting between checks. Close all relevant clients yourself; post-write external changes require reconciliation rather than a guarantee of rollback.
-
-Enabling Codex retains the existing application data directory, vault master key, Claude account records and persisted settings. Codex accounts use a separate encrypted **codex-state** record; they are not inserted into Claude policy collections or used to rewrite its saved state. Keep the same OS user and existing vault/key storage when updating; see [upgrade preservation](UPGRADES.md). The 0.2.0 candidate's hosted installer, native CI and installed Ubuntu demo evidence are recorded in [PROGRESS.md](PROGRESS.md).
-
-Importing records from another “Codex switcher” requires its **exact product/repository and version**. Current-account import is not a migration importer for an unnamed tool. Background polling, additional versions/stores, device login, API-key selection/billing and provider-specific automation remain future gates in [the Codex plan](FUTURE_CODEX.md).
+Saved sign-ins are encrypted in the PrimerSwitch vault (DPAPI on Windows, Keychain-held key on macOS, Secret Service on Linux) and never reach the window. Temporary homes used for reading inactive accounts are wiped after each reading. Claude accounts, settings and the vault key are unaffected by Codex operations.

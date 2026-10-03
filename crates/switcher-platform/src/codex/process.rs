@@ -459,10 +459,10 @@ mod tests {
         classify(
             &PathBuf::from(image),
             line,
-            &PathBuf::from(r"C:\Users\u\.codex\packages\app-server-daemon"),
+            &PathBuf::from(r"C:\Users\fixture\.codex\packages\app-server-daemon"),
         )
     }
-    const NPM: &str = r"C:\Users\u\AppData\Roaming\npm\node_modules\@openai\codex\node_modules\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\bin\codex.exe";
+    const NPM: &str = r"C:\Users\fixture\AppData\Roaming\npm\node_modules\@openai\codex\node_modules\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\bin\codex.exe";
     #[test]
     fn terminals_reconnect_everything_else_keeps_its_login() {
         // Interactive terminals are daemon clients.
@@ -480,7 +480,7 @@ mod tests {
             Role::OtherClient
         );
         // The daemon, its updater and helpers.
-        let daemon = r"\\?\C:\Users\u\.codex\packages\app-server-daemon\releases\0.160.0-x86_64-pc-windows-msvc\bin\codex.exe";
+        let daemon = r"\\?\C:\Users\fixture\.codex\packages\app-server-daemon\releases\0.160.0-x86_64-pc-windows-msvc\bin\codex.exe";
         assert_eq!(
             role(
                 daemon,

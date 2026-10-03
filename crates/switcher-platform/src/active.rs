@@ -390,10 +390,10 @@ fn is_desired(current: &RawSnapshot, journal: &Journal) -> bool {
 #[cfg(target_os = "macos")]
 mod mac {
     use super::*;
-    use core_foundation::base::{CFRelease, TCFType};
+    use core_foundation::base::{CFRelease, OSStatus, TCFType};
     use security_framework::os::macos::keychain::SecKeychain;
     use security_framework_sys::{
-        base::{OSStatus, SecAccessRef, SecKeychainItemRef},
+        base::{SecAccessRef, SecKeychainItemRef},
         keychain_item::SecKeychainItemDelete,
     };
     use std::ptr;

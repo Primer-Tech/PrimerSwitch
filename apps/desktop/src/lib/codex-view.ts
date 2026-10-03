@@ -230,11 +230,13 @@ function row(
         ? null
         : 'switch',
     canSwitch: codexCanSwitch(snapshot, account),
-    switchReason:
-      blocked ??
-      (!capability.enabled && !account.selected
-        ? codexMessage(capability.blockedReason, locale)
-        : null),
+    // The read-only preview blocks every capability; the page says so itself.
+    switchReason: snapshot.demo
+      ? null
+      : (blocked ??
+        (!capability.enabled && !account.selected
+          ? codexMessage(capability.blockedReason, locale)
+          : null)),
     canSignIn:
       account.needsSignIn && snapshot.capabilities.loginBrowser.enabled,
     canRefresh:

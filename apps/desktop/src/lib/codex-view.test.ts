@@ -314,6 +314,23 @@ describe('Codex adapter: the page', () => {
     );
     expect(view(fixture()).allLimited).toBeNull();
   });
+  it('leaves the read-only reason to the preview instead of a blocked capability', () => {
+    // The native demo blocks every capability as if storage were unavailable.
+    const raw = fixture({ demo: true, nextId: null, order: [] });
+    for (const key of Object.keys(raw.capabilities))
+      raw.capabilities[key as keyof typeof raw.capabilities] =
+        codexCapability('vaultUnavailable');
+    raw.accounts.forEach(
+      (account) => (account.switchable = codexCapability('vaultUnavailable')),
+    );
+    const research = row(raw, 'codex-research');
+    expect(research).toMatchObject({ canSwitch: false, switchReason: null });
+    expect(research.status).toMatchObject({ label: 'Ready', detail: null });
+    // Outside the preview the same block is explained.
+    expect(row({ ...raw, demo: false }, 'codex-research').switchReason).toBe(
+      codexMessage('vaultUnavailable', 'en'),
+    );
+  });
   it('keeps Delete off the active account and says why, as Claude does', () => {
     const page = view(fixture());
     expect(page.active).toMatchObject({

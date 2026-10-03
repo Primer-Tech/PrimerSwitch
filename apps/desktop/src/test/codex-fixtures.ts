@@ -202,6 +202,8 @@ export function codexSnapshot(
     accounts: codexAccounts(),
     selectedId: 'codex-studio',
     nextId: 'codex-research',
+    // Personal is at its 5-hour limit and Studio is active, so only Research ranks.
+    order: ['codex-research'],
     activeModel: null,
     capabilities: {
       loginBrowser: codexCapability(),

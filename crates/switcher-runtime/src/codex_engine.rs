@@ -855,6 +855,13 @@ impl CodexEngine {
             .min_by(|(_, a), (_, b)| compare_candidates(a, b, policy.order))
             .map(|(account, _)| account)
     }
+    /// Every candidate, best first, by the same comparator as `next_candidate`, so the
+    /// first entry is always the next account. The window shows it as the usage order.
+    fn ranked_candidates(&self, policy: &CodexPolicy) -> Vec<&SavedAccount> {
+        let mut ranked: Vec<_> = self.candidates(policy.threshold).collect();
+        ranked.sort_by(|(_, a), (_, b)| compare_candidates(a, b, policy.order));
+        ranked.into_iter().map(|(account, _)| account).collect()
+    }
     /// Decide automatic switching. A switch needs automatic switching on, no switch,
     /// sign-in or cooldown in progress, a fresh reading of the active account at the
     /// threshold (or limited), and a fresh reading of the best target; an older
@@ -967,6 +974,11 @@ impl CodexEngine {
         result.login = self.login_view.clone();
         result.selected_id = self.selected_id.clone();
         result.next_id = self.next_candidate(policy).map(|a| a.id.clone());
+        result.order = self
+            .ranked_candidates(policy)
+            .into_iter()
+            .map(|a| a.id.clone())
+            .collect();
         result.switching = self.switching.clone();
         result.last_switch = self.last_switch.clone();
         result.environment = self.environment.clone();

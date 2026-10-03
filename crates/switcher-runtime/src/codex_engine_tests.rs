@@ -1243,8 +1243,16 @@ impl Fixture {
     fn read(&mut self, id: &str, quota: CodexQuotaView, at: i64) {
         record_reading(&mut self.engine, id, quota, at);
     }
+    /// The next account; every check also proves the usage order starts with it.
     fn next(&self, policy: &CodexPolicy) -> Option<String> {
-        self.engine.snapshot(false, NOW, policy).next_id
+        let snapshot = self.engine.snapshot(false, NOW, policy);
+        assert_eq!(snapshot.order.first(), snapshot.next_id.as_ref());
+        snapshot.next_id
+    }
+    fn order(&self, policy: &CodexPolicy) -> Vec<String> {
+        let snapshot = self.engine.snapshot(false, NOW, policy);
+        assert_eq!(snapshot.order.first(), snapshot.next_id.as_ref());
+        snapshot.order
     }
     fn quota_mut(&mut self, id: &str) -> &mut CodexQuotaView {
         let index = self.engine.account_index(id).unwrap();
@@ -1378,7 +1386,50 @@ fn limited_unread_failed_or_unswitchable_accounts_are_never_next() {
         .unwrap();
     let api = f.engine.saved.accounts[index].id.clone();
     f.read(&api, main_quota(1, 1), NOW);
-    assert_eq!(f.next(&policy), Some(b));
+    assert_eq!(f.next(&policy), Some(b.clone()));
+    assert_eq!(f.order(&policy), vec![b]);
+}
+
+#[test]
+fn the_codex_usage_order_ranks_every_usable_account_with_the_next_one_first() {
+    let mut f = Fixture::new();
+    let a = f.id_of("ws-a");
+    let b = f.add("user-b", "ws-b", "saved");
+    let c = f.add("user-c", "ws-c", "saved");
+    let d = f.add("user-d", "ws-d", "saved");
+    let e = f.add("user-e", "ws-e", "saved");
+    let soonest = CodexPolicy::default();
+    let most_left = CodexPolicy {
+        order: CandidateOrder::MostWeeklyLeft,
+        ..soonest
+    };
+    // Nothing has been read yet, so nothing is ranked.
+    assert!(f.order(&soonest).is_empty());
+    f.read(&a, main_quota_at(1, NOW + 60, 1, NOW + 60), NOW);
+    // b's week resets within the hour (70% used), d's in two days (50%), c's in six
+    // days (20%); e stays unread. The active account a is never part of the order.
+    f.read(&b, main_quota_at(10, NOW + 3600, 70, NOW + 3600), NOW);
+    f.read(&c, main_quota_at(30, NOW + 3600, 20, NOW + 6 * 86400), NOW);
+    f.read(&d, main_quota_at(20, NOW + 3600, 50, NOW + 2 * 86400), NOW);
+    assert_eq!(f.order(&soonest), vec![b.clone(), d.clone(), c.clone()]);
+    assert_eq!(f.order(&most_left), vec![c.clone(), d.clone(), b.clone()]);
+    // A limited account and one whose latest reading failed drop out.
+    f.read(&e, main_quota(100, 10), NOW);
+    f.engine
+        .account_errors
+        .insert(d.clone(), CodexReason::ProviderUnavailable);
+    assert_eq!(f.order(&soonest), vec![b.clone(), c.clone()]);
+    // Without preferred headroom an account stays usable, after those with it.
+    f.read(&b, main_quota_at(91, NOW + 3600, 10, NOW + 3600), NOW);
+    assert_eq!(f.order(&soonest), vec![c.clone(), b.clone()]);
+    // A signed-out account is never ranked.
+    let index = f.engine.account_index(&c).unwrap();
+    f.engine.saved.accounts[index].needs_sign_in = true;
+    assert_eq!(f.order(&soonest), vec![b.clone()]);
+    // The window receives the ranking as `order`, next to `nextId`.
+    let json = serde_json::to_value(f.engine.snapshot(false, NOW, &soonest)).unwrap();
+    assert_eq!(json["order"], json!([b.clone()]));
+    assert_eq!(json["nextId"], json!(b));
 }
 
 #[tokio::test]

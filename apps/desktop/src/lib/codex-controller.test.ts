@@ -110,8 +110,21 @@ describe('Codex contract and redacted IPC', () => {
     delete withoutNext.nextId;
     expect(codexSnapshotSchema.safeParse(withoutNext).success).toBe(false);
     expect(
-      codexSnapshotSchema.safeParse({ ...raw, nextId: null }).success,
+      codexSnapshotSchema.safeParse({ ...raw, nextId: null, order: [] })
+        .success,
     ).toBe(true);
+    // So does the usage order, as a list of account ids.
+    const withoutOrder: Record<string, unknown> = { ...raw };
+    delete withoutOrder.order;
+    expect(codexSnapshotSchema.safeParse(withoutOrder).success).toBe(false);
+    expect(
+      codexSnapshotSchema.safeParse({ ...raw, order: ['codex-research', ''] })
+        .success,
+    ).toBe(false);
+    expect(
+      codexSnapshotSchema.safeParse({ ...raw, order: 'codex-research' })
+        .success,
+    ).toBe(false);
     const withoutSignIn: Record<string, unknown> = { ...raw.accounts[0] };
     delete withoutSignIn.needsSignIn;
     expect(

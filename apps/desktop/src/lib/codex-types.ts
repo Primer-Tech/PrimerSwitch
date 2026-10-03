@@ -135,6 +135,8 @@ export const codexSnapshotSchema = z
     selectedId: id.nullable(),
     /** The account automatic switching uses next, ranked natively. */
     nextId: id.nullable(),
+    /** Every account automatic switching may use, best first; `order[0]` is `nextId`. */
+    order: z.array(id),
     activeModel: text.nullable(),
     capabilities: z
       .object({

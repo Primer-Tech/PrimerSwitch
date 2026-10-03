@@ -53,6 +53,7 @@ else if (codexScenario === 'signin') {
     switchable: codexCapability('signInRequired'),
   });
   codexDemo.nextId = null;
+  codexDemo.order = [];
 } else if (codexScenario === 'limited')
   Object.assign(codexDemo.accounts[0].quota!.limits[0].primary!, {
     usedPercent: 100,
@@ -63,9 +64,16 @@ else if (codexScenario === 'setup')
     availability: 'notInstalled',
     blockedReason: 'notInstalled',
     executableVersion: null,
+    nextId: null,
+    order: [],
   });
 else if (codexScenario === 'empty')
-  Object.assign(codexDemo, { accounts: [], selectedId: null, nextId: null });
+  Object.assign(codexDemo, {
+    accounts: [],
+    selectedId: null,
+    nextId: null,
+    order: [],
+  });
 const codexController = createCodexController({
   call: async (command) => {
     if (command === 'get_codex_snapshot') return codexDemo;

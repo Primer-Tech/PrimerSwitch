@@ -185,8 +185,11 @@ pub struct CodexSnapshot {
     pub accounts: Vec<CodexAccountView>,
     pub selected_id: Option<String>,
     /// The account automatic switching uses next, ranked in Rust by the rules shared
-    /// with Claude; the window's "Next best" card shows exactly this account.
+    /// with Claude; the window's "Next up" card shows exactly this account.
     pub next_id: Option<String>,
+    /// Every account automatic switching may use, best first, ranked with the same
+    /// comparator as `next_id` (so `order[0]` is `next_id`); the window's usage order.
+    pub order: Vec<String>,
     pub active_model: Option<String>,
     pub capabilities: CodexCapabilities,
     pub login: Option<CodexLoginView>,
@@ -241,6 +244,7 @@ impl CodexSnapshot {
             accounts: Vec::new(),
             selected_id: None,
             next_id: None,
+            order: Vec::new(),
             active_model: None,
             capabilities: CodexCapabilities::blocked(CodexReason::NotInstalled),
             login: None,

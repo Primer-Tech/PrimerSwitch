@@ -97,6 +97,45 @@ impl UsageView {
         }
     }
 }
+/// When the windows that block `u` at `threshold` reopen: the latest reset among the
+/// five-hour window and the binding weekly windows (account-wide and the configured
+/// model's scoped row). `None` when nothing blocks or a needed reset time is unknown.
+pub(crate) fn frees_at(u: &UsageResponse, threshold: f64, model: Option<&str>) -> Option<i64> {
+    let mut needed = vec![];
+    if u.five_hour.utilization >= threshold {
+        needed.push(u.five_hour.resets_at);
+    }
+    if u.weekly_utilization() >= threshold {
+        needed.push(u.weekly_all_resets_at());
+    }
+    if let Some(scoped) = u.scoped_limit(model)
+        && scoped.percent >= threshold
+    {
+        needed.push(scoped.resets_at);
+    }
+    if needed.is_empty() {
+        return None;
+    }
+    needed
+        .into_iter()
+        .collect::<Option<Vec<_>>>()?
+        .into_iter()
+        .max()
+}
+
+/// A redacted, language-independent error: `code` is a stable UI catalog key, never
+/// provider or file text. `param` is only ever a fixed name such as an environment
+/// variable; `action` is `autoSwitch` when an automatic switch to `account_id` failed.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ErrorView {
+    pub code: String,
+    pub account_id: Option<String>,
+    pub param: Option<String>,
+    pub action: Option<String>,
+    pub at: i64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResetView {
@@ -121,7 +160,12 @@ pub struct AccountView {
     pub usage_at: Option<i64>,
     pub scoped_at: Option<i64>,
     pub decision_fresh: bool,
+    /// Stable catalog key of the last reading failure for this account.
     pub error: Option<String>,
+    /// Claude rejected the saved sign-in; only a new browser sign-in restores it.
+    pub sign_in_required: bool,
+    /// When an exhausted account's blocking windows reopen (see `frees_at`).
+    pub frees_at: Option<i64>,
     pub subscription_status: Option<String>,
     pub plan_tier: Option<String>,
     pub renewal_day: Option<u8>,
@@ -140,7 +184,11 @@ pub struct Snapshot {
     pub settings: SettingsView,
     pub last_refresh_at: Option<i64>,
     pub busy: bool,
-    pub error: Option<String>,
+    /// Outcome of the last command or background cycle; replaced by the next one.
+    pub error: Option<ErrorView>,
+    /// Session notice that stays until the window dismisses it (for example an
+    /// interrupted switch found at startup).
+    pub notice: Option<ErrorView>,
     pub demo: bool,
     pub consumption_plan: Vec<String>,
 }
@@ -212,6 +260,33 @@ mod tests {
             Some(7000)
         );
         assert_eq!(UsageView::new(&u, None).weekly_model_resets_at, Some(7000));
+    }
+    #[test]
+    fn frees_at_waits_for_every_blocking_window_and_never_guesses() {
+        // Five-hour exhausted alone: the five-hour reset frees the account.
+        let mut u = usage(40.0, 40.0, Some(7000), Some(3000));
+        u.five_hour.utilization = 100.0;
+        assert_eq!(frees_at(&u, 95.0, Some("sonnet")), Some(1000));
+        // Five-hour and the configured model's weekly row both block: the later one wins.
+        let mut u = usage(40.0, 97.0, Some(7000), Some(3000));
+        u.five_hour.utilization = 96.0;
+        assert_eq!(frees_at(&u, 95.0, Some("sonnet")), Some(3000));
+        // The scoped row does not block another model.
+        assert_eq!(frees_at(&u, 95.0, Some("opus")), Some(1000));
+        // Account-wide weekly exhaustion uses the account-wide reset.
+        assert_eq!(
+            frees_at(&usage(99.0, 10.0, Some(7000), Some(3000)), 95.0, None),
+            Some(7000)
+        );
+        // Unknown blocking reset, or nothing blocking, never invents a time.
+        assert_eq!(
+            frees_at(&usage(99.0, 10.0, None, Some(3000)), 95.0, None),
+            None
+        );
+        assert_eq!(
+            frees_at(&usage(10.0, 10.0, Some(7000), Some(3000)), 95.0, None),
+            None
+        );
     }
     #[test]
     fn tied_binding_windows_require_both_reset_times_and_show_the_later_one() {

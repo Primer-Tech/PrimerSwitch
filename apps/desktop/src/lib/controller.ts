@@ -4,7 +4,10 @@ import {
   localizeNativeMessage,
   t,
   type Language,
+  type MessageKey,
 } from './i18n';
+import { en } from './locales/en';
+import { ro } from './locales/ro';
 import {
   nativeBridge,
   type Bridge,
@@ -15,10 +18,93 @@ import {
   loginSchema,
   previewSchema,
   snapshotSchema,
+  type AccountView,
+  type ErrorView,
   type Snapshot,
   type LoginSession,
   type ImportPreview,
 } from './types';
+
+/** Stable Claude runtime error and notice codes; each one is a catalog key. */
+const errorCodes: ReadonlySet<string> = new Set<MessageKey>([
+  'storageError',
+  'vaultUnavailable',
+  'unsupportedContext',
+  'unsupportedEnvironment',
+  'unsupportedSetting',
+  'vaultIntegrity',
+  'missingAccount',
+  'externalChange',
+  'identityError',
+  'providerError',
+  'signInRequired',
+  'activeSessionExpired',
+  'settingsError',
+  'readOnlyError',
+  'loginExpired',
+  'importExpired',
+  'pendingResetError',
+  'cliVersionError',
+  'switchInterrupted',
+  'switchRecoveryPending',
+  'outgoingUnverified',
+]);
+/** Messages that name a fixed variable or settings entry. */
+const namedTemplates = [
+  'unsupportedEnvironment',
+  'unsupportedSetting',
+] as const;
+const safeName = /^[A-Za-z0-9_]{1,64}$/;
+
+/** Catalog text for a runtime error code; unknown codes never display as text. */
+export function codeMessage(
+  code: string | null | undefined,
+  locale: Language,
+  param?: string | null,
+): string {
+  if (!code || !errorCodes.has(code)) return t(locale, 'failedAction');
+  return t(
+    locale,
+    code as MessageKey,
+    param && safeName.test(param) ? { name: param } : {},
+  );
+}
+/** Status text for a snapshot error or notice, naming its account when known. */
+export function errorText(
+  view: ErrorView,
+  accounts: readonly AccountView[],
+  locale: Language,
+): string {
+  const reason = codeMessage(view.code, locale, view.param);
+  const account = view.accountId
+    ? accounts.find((a) => a.id === view.accountId)
+    : undefined;
+  if (!account) return reason;
+  return t(
+    locale,
+    view.action === 'autoSwitch' ? 'autoSwitchFailed' : 'accountError',
+    {
+      name: account.name,
+      reason,
+    },
+  );
+}
+/** Re-renders a native message built from a `{name}` template in `locale`. */
+function namedMessage(text: string, locale: Language): string | null {
+  for (const key of namedTemplates)
+    for (const catalog of [en, ro]) {
+      const [before, after] = catalog[key].split('{name}');
+      const name = text.slice(before.length, text.length - after.length);
+      if (
+        text.length > before.length + after.length &&
+        text.startsWith(before) &&
+        text.endsWith(after) &&
+        safeName.test(name)
+      )
+        return t(locale, key, { name });
+    }
+  return null;
+}
 
 export interface ViewState {
   snapshot: Snapshot | null;
@@ -42,6 +128,10 @@ export function safeError(error: unknown, locale: Language = 'en'): string {
         : '';
   const localized = localizeNativeMessage(text, locale);
   if (isCatalogMessage(text)) return localized;
+  // A bare code (or a variable named by a fixed template) is safe catalog text.
+  if (errorCodes.has(text)) return codeMessage(text, locale);
+  const named = namedMessage(text, locale);
+  if (named) return named;
   if (
     !text ||
     text.length > 350 ||

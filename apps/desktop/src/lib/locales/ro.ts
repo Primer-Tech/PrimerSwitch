@@ -125,29 +125,45 @@ export const ro: Record<keyof typeof en, string> = {
   storageError:
     'Datele locale nu au putut fi citite sau salvate. Fișierele originale sunt păstrate.',
   vaultUnavailable:
-    'Seiful sistemului este blocat, indisponibil sau nu are un backend calificat. Conturile salvate nu au fost modificate.',
+    'Seiful sistemului este blocat, indisponibil sau neacceptat. Conturile salvate nu au fost modificate.',
   unsupportedContext:
     'Acest context Claude folosește o metodă de autentificare sau o politică incompatibilă cu schimbarea conturilor.',
+  unsupportedEnvironment:
+    'Comutarea conturilor nu este disponibilă cât timp variabila de mediu {name} este setată. Elimin-o, apoi repornește PrimerSwitch.',
+  unsupportedSetting:
+    'Comutarea conturilor nu este disponibilă cât timp settings.json din Claude Code conține {name}. Elimină intrarea, apoi repornește PrimerSwitch.',
   vaultIntegrity:
     'Datele criptate nu au putut fi autentificate sau cheia lipsește. Fișierele existente sunt păstrate.',
   missingAccount: 'Contul nu mai este disponibil.',
   externalChange:
-    'Autentificarea Claude s-a schimbat. Reîmprospătează înainte de a continua.',
-  identityError:
-    'Identitatea tokenului nu a putut fi verificată pentru acest cont.',
+    'Autentificarea Claude s-a schimbat. Actualizează înainte de a continua.',
+  identityError: 'Identitatea contului nu a putut fi verificată.',
   providerError:
     'Claude nu a furnizat o citire proaspătă. Reîncearcă mai târziu.',
+  signInRequired:
+    'Claude nu mai acceptă autentificarea salvată a acestui cont. Autentifică-te din nou pentru a-l folosi în continuare.',
+  activeSessionExpired:
+    'Sesiunea Claude Code pentru acest cont a expirat. Folosește Claude Code o dată pentru a o reînnoi sau autentifică-te din nou acolo.',
   settingsError: 'Setările introduse nu sunt valide.',
+  readOnlyError: 'Această vizualizare este doar pentru citire.',
   loginExpired: 'Autentificarea a expirat sau a fost anulată.',
   importExpired: 'Importul nu mai este valid. Selectează din nou dosarul.',
   pendingResetError:
-    'Cererea de reset anterioară trebuie reconciliată înainte de o nouă încercare.',
+    'Cererea anterioară de resetare trebuie confirmată înainte de o nouă încercare.',
   cliVersionError:
     'Versiunea Claude Code nu a putut fi detectată. Instalează o versiune recunoscută.',
   browserError: 'Browserul nu a putut fi deschis. Reîncearcă autentificarea.',
   loginCodeError: 'Codul de autentificare nu este valid.',
   folderError: 'Dosarul nu a putut fi selectat.',
   folderNotLocal: 'Dosarul selectat nu este local.',
+  switchInterrupted:
+    'O comutare anterioară a fost întreruptă. Autentificarea curentă din Claude Code a rămas neschimbată; comută din nou dacă este nevoie.',
+  switchRecoveryPending:
+    'O comutare anterioară nu a putut fi finalizată încă. PrimerSwitch o finalizează înainte de următoarea comutare.',
+  outgoingUnverified:
+    'Autentificarea din Claude Code a acestui cont expirase, așa că nu a putut fi verificată la comutare. A fost păstrată și se verifică la următoarea actualizare.',
+  accountError: '{name}: {reason}',
+  autoSwitchFailed: 'Comutarea automată pe {name} nu a reușit. {reason}',
   navigation: 'Navigare',
   accounts: 'Conturi',
   localAccounts: 'Gestionare locală a conturilor',

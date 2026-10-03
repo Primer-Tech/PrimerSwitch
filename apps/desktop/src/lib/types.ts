@@ -5,6 +5,20 @@ const percent = z.number().finite().nonnegative();
 const windowSchema = z
   .object({ utilization: percent, resetsAt: timestamp })
   .strict();
+/** Redacted runtime error: a catalog key, never provider or file text. */
+export const errorViewSchema = z
+  .object({
+    code: z.string().regex(/^[A-Za-z]{1,64}$/),
+    accountId: z.string().nullable(),
+    // Only ever a fixed environment-variable or settings name.
+    param: z
+      .string()
+      .regex(/^[A-Za-z0-9_]{1,64}$/)
+      .nullable(),
+    action: z.enum(['autoSwitch']).nullable(),
+    at: z.number().int(),
+  })
+  .strict();
 export const settingsSchema = z
   .object({
     pollInterval: z
@@ -50,7 +64,10 @@ export const accountSchema = z
     usageAt: timestamp,
     scopedAt: timestamp.optional(),
     decisionFresh: z.boolean().optional(),
+    // Stable error code of the last failed reading.
     error: z.string().nullable(),
+    signInRequired: z.boolean().optional(),
+    freesAt: timestamp.optional(),
     subscriptionStatus: z.string().nullable(),
     planTier: z.string().nullable(),
     renewalDay: z.number().int().min(1).max(31).nullable(),
@@ -77,13 +94,15 @@ export const snapshotSchema = z
     settings: settingsSchema,
     lastRefreshAt: timestamp,
     busy: z.boolean(),
-    error: z.string().nullable(),
+    error: errorViewSchema.nullable(),
+    notice: errorViewSchema.nullable().optional(),
     demo: z.boolean(),
     consumptionPlan: z.array(z.string()).optional(),
   })
   .strict();
 export type Snapshot = z.infer<typeof snapshotSchema>;
 export type AccountView = z.infer<typeof accountSchema>;
+export type ErrorView = z.infer<typeof errorViewSchema>;
 export type Settings = z.infer<typeof settingsSchema>;
 export type LoginSession = { id: string; url: string };
 export type ImportPreview = {

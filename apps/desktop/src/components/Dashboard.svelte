@@ -1,8 +1,8 @@
 <script lang="ts">
   import { language, t } from '../lib/i18n';
   import { age, countdown, date, percentage } from '../lib/format';
-  import { safeError } from '../lib/controller';
-  import type { Snapshot, AccountView } from '../lib/types';
+  import { errorText, safeError } from '../lib/controller';
+  import type { Snapshot, AccountView, ErrorView } from '../lib/types';
   import Icon from './Icon.svelte';
   import ProviderTabs from './ProviderTabs.svelte';
   import QuotaBar from './QuotaBar.svelte';
@@ -54,6 +54,31 @@
       .map((id) => snapshot?.accounts.find((a) => a.id === id))
       .filter((a): a is AccountView => !!a),
   );
+  // A background error repeats on every tick while it lasts: once dismissed it stays
+  // hidden until it clears or a different one appears. Notices are per occurrence.
+  const errorKey = (view: ErrorView) =>
+    `${view.code}|${view.accountId ?? ''}|${view.action ?? ''}`;
+  let dismissedError = $state<string | null>(null),
+    dismissedNotice = $state<string | null>(null);
+  let statusError = $derived(
+    snapshot?.error && errorKey(snapshot.error) !== dismissedError
+      ? snapshot.error
+      : null,
+  );
+  let notice = $derived(
+    snapshot?.notice &&
+      `${errorKey(snapshot.notice)}|${snapshot.notice.at}` !== dismissedNotice
+      ? snapshot.notice
+      : null,
+  );
+  $effect(() => {
+    if (snapshot && !snapshot.busy && !snapshot.error) dismissedError = null;
+  });
+  function dismissError() {
+    // A rejected action is reported twice (reply and snapshot): dismiss both.
+    if (snapshot?.error) dismissedError = errorKey(snapshot.error);
+    ondismiss();
+  }
   let addOpen = $state(false),
     addButton: HTMLButtonElement;
   function add(action: () => void) {
@@ -124,13 +149,29 @@
           >{t($language, 'demoNotice')}</span
         >
       </div>{/if}
-    {#if error || snapshot?.error}<div class="error-notice" role="alert">
-        <span>{safeError(error ?? snapshot?.error, $language)}</span
-        >{#if error}<button
-            aria-label={t($language, 'dismissMessage')}
-            class="icon-button"
-            onclick={ondismiss}>×</button
-          >{/if}
+    {#if error || statusError}<div class="error-notice" role="alert">
+        <span
+          >{error
+            ? safeError(error, $language)
+            : errorText(
+                statusError!,
+                snapshot?.accounts ?? [],
+                $language,
+              )}</span
+        ><button
+          aria-label={t($language, 'dismissMessage')}
+          class="icon-button"
+          onclick={dismissError}>×</button
+        >
+      </div>{/if}
+    {#if notice}<div class="error-notice info-notice" role="status">
+        <span>{errorText(notice, snapshot?.accounts ?? [], $language)}</span
+        ><button
+          aria-label={t($language, 'dismissMessage')}
+          class="icon-button"
+          onclick={() =>
+            (dismissedNotice = `${errorKey(notice!)}|${notice!.at}`)}>×</button
+        >
       </div>{/if}
     {#if pending || snapshot?.busy}<div class="pending-notice" role="status">
         <span class="spinner" aria-hidden="true"></span>{operation?.startsWith(
@@ -563,3 +604,11 @@
     </footer>
   </div>
 </div>
+
+<style>
+  .info-notice {
+    color: var(--text);
+    background: var(--surface);
+    border-color: color-mix(in srgb, var(--accent) 35%, var(--line));
+  }
+</style>

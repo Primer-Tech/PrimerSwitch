@@ -20,12 +20,20 @@ use std::{
     time::Duration,
 };
 use switcher_core::*;
-use switcher_platform::{ActiveSnapshot, ActiveStore, CliPaths, Vault, app_data_dir};
+use switcher_platform::{
+    ActiveSnapshot, ActiveStore, CliPaths, PlatformError, Recovery, Vault, app_data_dir,
+};
 use tokio::sync::{Mutex, broadcast};
 
 const RECORD: &str = "runtime-state";
 const USAGE_MAX_AGE: i64 = 900;
 const SCOPED_MAX_AGE: i64 = 1800;
+/// Once Claude rejects a saved refresh token, background polling retries it at most
+/// daily; an explicit refresh, a switch attempt or a new sign-in retries at once.
+const SIGN_IN_RETRY: i64 = 86_400;
+/// A repeated automatic-switch failure for the same target and cause notifies at most
+/// this often; every failure still updates the in-app status.
+const SWITCH_FAILURE_NOTICE: i64 = 1800;
 
 pub trait Clock: Send + Sync {
     fn now(&self) -> i64;
@@ -36,39 +44,63 @@ impl Clock for SystemClock {
         chrono::Utc::now().timestamp()
     }
 }
+/// English texts equal the renderer catalog values for `code()` exactly, and
+/// `message("ro")` equals the Romanian catalog, so a rejected command and a snapshot
+/// error always resolve to the same catalog entry.
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum RuntimeError {
-    #[error("Local data could not be read or saved. Original files were preserved.")]
+    #[error("Local data could not be read or saved. Original files are retained.")]
     Storage,
     #[error(
-        "The system credential store is locked, unavailable, or has no qualified backend. Saved accounts were preserved."
+        "The system vault is locked, unavailable or unsupported. Saved accounts have not been changed."
     )]
     UnavailableStorage,
     #[error(
         "This Claude context uses an authentication method or policy that does not support account switching."
     )]
     UnsupportedContext,
+    /// Fixed variable name from the platform's reviewed list, never its value.
     #[error(
-        "The encrypted data could not be authenticated or its key is missing. Existing files were preserved."
+        "Account switching is unavailable while the environment variable {0} is set. Remove it, then restart PrimerSwitch."
+    )]
+    UnsupportedEnvironment(&'static str),
+    /// Fixed settings key or variable name, never its value.
+    #[error(
+        "Account switching is unavailable while Claude Code's settings.json contains {0}. Remove that entry, then restart PrimerSwitch."
+    )]
+    UnsupportedSetting(&'static str),
+    #[error(
+        "Encrypted data could not be authenticated, or its key is missing. Existing files are retained."
     )]
     VaultIntegrity,
-    #[error("This account is no longer available.")]
+    #[error("The account is no longer available.")]
     MissingAccount,
-    #[error("Claude authentication changed externally. Refresh before continuing.")]
+    #[error("The Claude login changed. Refresh before continuing.")]
     ExternalChange,
-    #[error("Token ownership could not be verified for this account.")]
+    #[error("The account identity could not be verified.")]
     Identity,
     #[error("Claude did not provide a fresh reading. Try again later.")]
     Provider,
-    #[error("These settings are not valid.")]
+    /// Claude rejected this account's saved sign-in (refresh token or token).
+    #[error(
+        "Claude no longer accepts this account's saved sign-in. Sign in again to keep using it."
+    )]
+    SignInRequired,
+    /// The active account's own Claude Code token was refused. The CLI owns it and
+    /// renews it; PrimerSwitch never refreshes the active account.
+    #[error(
+        "Claude Code's session for this account has expired. Use Claude Code once to renew it, or sign in again there."
+    )]
+    ActiveSessionExpired,
+    #[error("The settings are not valid.")]
     Settings,
     #[error("This view is read-only.")]
     ReadOnly,
-    #[error("This login expired or was cancelled.")]
+    #[error("The login expired or was canceled.")]
     Login,
-    #[error("This import is no longer valid. Select the folder again.")]
+    #[error("The import is no longer valid. Select the folder again.")]
     Import,
-    #[error("The previous reset request requires reconciliation before another attempt.")]
+    #[error("The previous reset request must be confirmed before another attempt.")]
     PendingReset,
     #[error("The Claude Code version could not be detected. Install a recognized version.")]
     CliVersion,
@@ -80,35 +112,163 @@ impl RuntimeError {
             return self.to_string();
         }
         match self {
-            Self::Storage=>"Datele locale nu au putut fi citite sau salvate. Fișierele originale sunt păstrate.",
-            Self::UnavailableStorage=>"Seiful sistemului este blocat, indisponibil sau nu are un backend calificat. Conturile salvate nu au fost modificate.",
-            Self::UnsupportedContext=>"Acest context Claude folosește o metodă de autentificare sau o politică incompatibilă cu schimbarea conturilor.",
-            Self::VaultIntegrity=>"Datele criptate nu au putut fi autentificate sau cheia lipsește. Fișierele existente sunt păstrate.",
-            Self::MissingAccount=>"Contul nu mai este disponibil.",
-            Self::ExternalChange=>"Autentificarea Claude s-a schimbat. Reîmprospătează înainte de a continua.",
-            Self::Identity=>"Identitatea tokenului nu a putut fi verificată pentru acest cont.",
-            Self::Provider=>"Claude nu a furnizat o citire proaspătă. Reîncearcă mai târziu.",
-            Self::Settings=>"Setările introduse nu sunt valide.",
-            Self::ReadOnly=>"Această vizualizare este doar pentru citire.",
-            Self::Login=>"Autentificarea a expirat sau a fost anulată.",
-            Self::Import=>"Importul nu mai este valid. Selectează din nou dosarul.",
-            Self::PendingReset=>"Cererea de reset anterioară trebuie reconciliată înainte de o nouă încercare.",
-            Self::CliVersion=>"Versiunea Claude Code nu a putut fi detectată. Instalează o versiune recunoscută.",
-        }.into()
+            Self::Storage=>"Datele locale nu au putut fi citite sau salvate. Fișierele originale sunt păstrate.".into(),
+            Self::UnavailableStorage=>"Seiful sistemului este blocat, indisponibil sau neacceptat. Conturile salvate nu au fost modificate.".into(),
+            Self::UnsupportedContext=>"Acest context Claude folosește o metodă de autentificare sau o politică incompatibilă cu schimbarea conturilor.".into(),
+            Self::UnsupportedEnvironment(name)=>format!("Comutarea conturilor nu este disponibilă cât timp variabila de mediu {name} este setată. Elimin-o, apoi repornește PrimerSwitch."),
+            Self::UnsupportedSetting(name)=>format!("Comutarea conturilor nu este disponibilă cât timp settings.json din Claude Code conține {name}. Elimină intrarea, apoi repornește PrimerSwitch."),
+            Self::VaultIntegrity=>"Datele criptate nu au putut fi autentificate sau cheia lipsește. Fișierele existente sunt păstrate.".into(),
+            Self::MissingAccount=>"Contul nu mai este disponibil.".into(),
+            Self::ExternalChange=>"Autentificarea Claude s-a schimbat. Actualizează înainte de a continua.".into(),
+            Self::Identity=>"Identitatea contului nu a putut fi verificată.".into(),
+            Self::Provider=>"Claude nu a furnizat o citire proaspătă. Reîncearcă mai târziu.".into(),
+            Self::SignInRequired=>"Claude nu mai acceptă autentificarea salvată a acestui cont. Autentifică-te din nou pentru a-l folosi în continuare.".into(),
+            Self::ActiveSessionExpired=>"Sesiunea Claude Code pentru acest cont a expirat. Folosește Claude Code o dată pentru a o reînnoi sau autentifică-te din nou acolo.".into(),
+            Self::Settings=>"Setările introduse nu sunt valide.".into(),
+            Self::ReadOnly=>"Această vizualizare este doar pentru citire.".into(),
+            Self::Login=>"Autentificarea a expirat sau a fost anulată.".into(),
+            Self::Import=>"Importul nu mai este valid. Selectează din nou dosarul.".into(),
+            Self::PendingReset=>"Cererea anterioară de resetare trebuie confirmată înainte de o nouă încercare.".into(),
+            Self::CliVersion=>"Versiunea Claude Code nu a putut fi detectată. Instalează o versiune recunoscută.".into(),
+        }
+    }
+    /// Stable renderer catalog key; the renderer never needs the message text.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Storage => "storageError",
+            Self::UnavailableStorage => "vaultUnavailable",
+            Self::UnsupportedContext => "unsupportedContext",
+            Self::UnsupportedEnvironment(_) => "unsupportedEnvironment",
+            Self::UnsupportedSetting(_) => "unsupportedSetting",
+            Self::VaultIntegrity => "vaultIntegrity",
+            Self::MissingAccount => "missingAccount",
+            Self::ExternalChange => "externalChange",
+            Self::Identity => "identityError",
+            Self::Provider => "providerError",
+            Self::SignInRequired => "signInRequired",
+            Self::ActiveSessionExpired => "activeSessionExpired",
+            Self::Settings => "settingsError",
+            Self::ReadOnly => "readOnlyError",
+            Self::Login => "loginExpired",
+            Self::Import => "importExpired",
+            Self::PendingReset => "pendingResetError",
+            Self::CliVersion => "cliVersionError",
+        }
+    }
+    /// The only interpolated value: a fixed variable or settings name.
+    pub fn param(&self) -> Option<&'static str> {
+        match self {
+            Self::UnsupportedEnvironment(name) | Self::UnsupportedSetting(name) => Some(name),
+            _ => None,
+        }
+    }
+    fn view(&self, account: Option<String>, action: Option<&str>, at: i64) -> ErrorView {
+        ErrorView {
+            code: self.code().into(),
+            account_id: account,
+            param: self.param().map(str::to_owned),
+            action: action.map(str::to_owned),
+            at,
+        }
     }
 }
 
-impl From<switcher_platform::PlatformError> for RuntimeError {
-    fn from(e: switcher_platform::PlatformError) -> Self {
+/// Every parameterless error, for mapping persisted text back to a stable code.
+const KNOWN_ERRORS: [RuntimeError; 16] = [
+    RuntimeError::Storage,
+    RuntimeError::UnavailableStorage,
+    RuntimeError::UnsupportedContext,
+    RuntimeError::VaultIntegrity,
+    RuntimeError::MissingAccount,
+    RuntimeError::ExternalChange,
+    RuntimeError::Identity,
+    RuntimeError::Provider,
+    RuntimeError::SignInRequired,
+    RuntimeError::ActiveSessionExpired,
+    RuntimeError::Settings,
+    RuntimeError::ReadOnly,
+    RuntimeError::Login,
+    RuntimeError::Import,
+    RuntimeError::PendingReset,
+    RuntimeError::CliVersion,
+];
+/// Texts persisted by earlier releases, before codes replaced them.
+const LEGACY_ERROR_TEXT: [(&str, &str); 14] = [
+    (
+        "Local data could not be read or saved. Original files were preserved.",
+        "storageError",
+    ),
+    (
+        "The system credential store is locked, unavailable, or has no qualified backend. Saved accounts were preserved.",
+        "vaultUnavailable",
+    ),
+    (
+        "Seiful sistemului este blocat, indisponibil sau nu are un backend calificat. Conturile salvate nu au fost modificate.",
+        "vaultUnavailable",
+    ),
+    (
+        "The encrypted data could not be authenticated or its key is missing. Existing files were preserved.",
+        "vaultIntegrity",
+    ),
+    ("This account is no longer available.", "missingAccount"),
+    (
+        "Claude authentication changed externally. Refresh before continuing.",
+        "externalChange",
+    ),
+    (
+        "Autentificarea Claude s-a schimbat. Reîmprospătează înainte de a continua.",
+        "externalChange",
+    ),
+    (
+        "Token ownership could not be verified for this account.",
+        "identityError",
+    ),
+    (
+        "Identitatea tokenului nu a putut fi verificată pentru acest cont.",
+        "identityError",
+    ),
+    ("These settings are not valid.", "settingsError"),
+    ("This login expired or was cancelled.", "loginExpired"),
+    (
+        "This import is no longer valid. Select the folder again.",
+        "importExpired",
+    ),
+    (
+        "The previous reset request requires reconciliation before another attempt.",
+        "pendingResetError",
+    ),
+    (
+        "Cererea de reset anterioară trebuie reconciliată înainte de o nouă încercare.",
+        "pendingResetError",
+    ),
+];
+/// Maps a stored reading error (a code, or a message from an older release) to a
+/// stable code. Unknown text is never displayed; it reads as a provider failure.
+fn error_code(text: &str) -> &'static str {
+    KNOWN_ERRORS
+        .iter()
+        .find(|e| e.code() == text || e.message("en") == text || e.message("ro") == text)
+        .map(RuntimeError::code)
+        .or_else(|| {
+            LEGACY_ERROR_TEXT
+                .iter()
+                .find(|(legacy, _)| *legacy == text)
+                .map(|(_, code)| *code)
+        })
+        .unwrap_or("providerError")
+}
+
+impl From<PlatformError> for RuntimeError {
+    fn from(e: PlatformError) -> Self {
         match e {
-            switcher_platform::PlatformError::Conflict => Self::ExternalChange,
-            switcher_platform::PlatformError::KeyUnavailable
-            | switcher_platform::PlatformError::UnsupportedSecretService => {
+            PlatformError::Conflict => Self::ExternalChange,
+            PlatformError::KeyUnavailable | PlatformError::UnsupportedSecretService => {
                 Self::UnavailableStorage
             }
-            switcher_platform::PlatformError::UnsupportedContext => Self::UnsupportedContext,
-            switcher_platform::PlatformError::Authentication
-            | switcher_platform::PlatformError::KeyLost => Self::VaultIntegrity,
+            PlatformError::UnsupportedContext => Self::UnsupportedContext,
+            PlatformError::UnsupportedEnvironment(name) => Self::UnsupportedEnvironment(name),
+            PlatformError::UnsupportedSetting(name) => Self::UnsupportedSetting(name),
+            PlatformError::Authentication | PlatformError::KeyLost => Self::VaultIntegrity,
             _ => Self::Storage,
         }
     }
@@ -123,8 +283,20 @@ impl From<ClientError> for RuntimeError {
 struct Reading {
     scoped_at: Option<i64>,
     complete: bool,
+    /// Stable error code; records from older releases may hold a message instead
+    /// (`error_code` maps both).
     error: Option<String>,
     priming_attempt_at: Option<i64>,
+    /// The CLI's newer OAuth blob for this account, captured instead of being lost
+    /// when it could not be verified while switching away (its access token had
+    /// expired). Stored encrypted with the record; adopted only after its owner is
+    /// proven, never sent over IPC.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unverified_oauth: Option<Value>,
+    /// Claude rejected the saved refresh token. Background refreshes back off to
+    /// `SIGN_IN_RETRY` until a new sign-in or an explicit refresh succeeds.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    sign_in_required: bool,
 }
 #[derive(Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -163,12 +335,20 @@ struct Engine {
     spacing: bool,
     active_id: Option<String>,
     active_model: Option<String>,
-    fingerprint: Option<String>,
+    /// Owner of the CLI login last observed. Only an owner change (another account's
+    /// login or a logout) invalidates proofs; unrelated CLI writes and token rotations
+    /// by the CLI do not.
+    identity_fingerprint: Option<String>,
     pending_login: Option<PendingLogin>,
     login_intent: Arc<AtomicU64>,
     preview: Option<Preview>,
     revision: u64,
-    error: Option<String>,
+    error: Option<ErrorView>,
+    notice: Option<ErrorView>,
+    /// Attribution for the error of the command now running (account / action).
+    failed_account: Option<String>,
+    failed_action: Option<&'static str>,
+    last_switch_failure: Option<(String, &'static str, i64)>,
     demo: bool,
     exhausted: bool,
     last_exhausted_notice: Option<i64>,
@@ -213,7 +393,7 @@ enum Command {
     Tick(bool),
 }
 enum Output {
-    Snapshot(Snapshot),
+    Snapshot(Box<Snapshot>),
     Login(LoginSession),
     Preview(ImportPreview),
 }
@@ -255,7 +435,16 @@ impl RuntimeHandle {
         clock: Arc<dyn Clock>,
         spacing: bool,
     ) -> Result<Self, RuntimeError> {
-        active.recover(&vault)?;
+        let now = clock.now();
+        // An interrupted switch never makes the window unusable. Recovery restores or
+        // completes it when only its own writes are present, sets the journal aside
+        // when another writer owns the login, and otherwise keeps it to retry before
+        // the next switch. Startup always continues and reports what it found.
+        let notice = match active.recover(&vault) {
+            Ok(Recovery::SetAside) => Some(notice_view("switchInterrupted", None, now)),
+            Ok(Recovery::Clean | Recovery::Completed | Recovery::RolledBack) => None,
+            Err(_) => Some(notice_view("switchRecoveryPending", None, now)),
+        };
         let mut saved = vault.load::<Persisted>(RECORD)?.unwrap_or_default();
         saved
             .settings
@@ -271,7 +460,7 @@ impl RuntimeHandle {
         let codex = CodexEngine::load(&vault);
         let codex_intent = codex.intent.clone();
         let (codex_snapshots, _) = broadcast::channel(64);
-        let codex_snapshot = codex.snapshot(false, clock.now());
+        let codex_snapshot = codex.snapshot(false, now);
         let mut engine = Engine {
             codex,
             saved,
@@ -282,19 +471,27 @@ impl RuntimeHandle {
             spacing,
             active_id: None,
             active_model: None,
-            fingerprint: None,
+            identity_fingerprint: None,
             pending_login: None,
             login_intent: login_intent.clone(),
             preview: None,
             revision: 0,
             error: None,
+            notice,
+            failed_account: None,
+            failed_action: None,
+            last_switch_failure: None,
             demo: false,
             exhausted: false,
             last_exhausted_notice: None,
             last_full_at: None,
             notifications: notifications.clone(),
         };
-        engine.observe_active()?;
+        // An unreadable CLI file (for example mid-write) is a reading failure the next
+        // cycle retries, not a reason to open an empty window.
+        if let Err(error) = engine.observe_active() {
+            engine.error = Some(error.view(None, None, now));
+        }
         let snapshot = engine.snapshot(false);
         Ok(Self {
             inner: Arc::new(Inner {
@@ -351,8 +548,7 @@ impl RuntimeHandle {
                 Reading {
                     scoped_at: Some(now),
                     complete: true,
-                    error: None,
-                    priming_attempt_at: None,
+                    ..Reading::default()
                 },
             );
         }
@@ -370,12 +566,16 @@ impl RuntimeHandle {
             spacing: false,
             active_id: Some("demo-0".into()),
             active_model: Some("sonnet".into()),
-            fingerprint: None,
+            identity_fingerprint: None,
             pending_login: None,
             login_intent: login_intent.clone(),
             preview: None,
             revision: 0,
             error: None,
+            notice: None,
+            failed_account: None,
+            failed_action: None,
+            last_switch_failure: None,
             demo: true,
             exhausted: false,
             last_exhausted_notice: None,
@@ -428,7 +628,8 @@ impl RuntimeHandle {
             engine.active_model = None;
             engine.demo = false;
             engine.codex.unavailable();
-            engine.error = Some(error.message(&engine.saved.settings.language));
+            let now = engine.clock.now();
+            engine.error = Some(error.view(None, None, now));
             handle.publish(&mut engine, false);
         }
         handle
@@ -510,7 +711,7 @@ impl RuntimeHandle {
         if coalesce.is_some_and(|generation| {
             generation != self.inner.refresh_generation.load(Ordering::Acquire)
         }) {
-            return Ok(Output::Snapshot(self.get_snapshot()));
+            return Ok(Output::Snapshot(Box::new(self.get_snapshot())));
         }
         let account_refresh = if let Command::RefreshAccount(id, generation) = &command {
             if self
@@ -523,14 +724,17 @@ impl RuntimeHandle {
                 .unwrap_or(0)
                 != *generation
             {
-                return Ok(Output::Snapshot(self.get_snapshot()));
+                return Ok(Output::Snapshot(Box::new(self.get_snapshot())));
             }
             Some(id.clone())
         } else {
             None
         };
         let full = matches!(command, Command::RefreshAll | Command::Tick(true));
-        engine.error = None;
+        // The previous outcome stays visible while busy and is replaced at the end, so
+        // a persistent background failure does not flicker on every tick.
+        engine.failed_account = None;
+        engine.failed_action = None;
         self.publish(&mut engine, true);
         let result = engine.command(command).await;
         *self
@@ -543,9 +747,15 @@ impl RuntimeHandle {
             Ok(()) => result,
             Err(e) => Err(e),
         };
-        if let Err(e) = &result {
-            engine.error = Some(e.message(&engine.saved.settings.language));
-        }
+        let now = engine.clock.now();
+        engine.error = match &result {
+            Err(e) => {
+                let account = engine.failed_account.take();
+                let action = engine.failed_action.take();
+                Some(e.view(account, action, now))
+            }
+            Ok(_) => None,
+        };
         self.publish(&mut engine, false);
         if full {
             self.inner
@@ -570,20 +780,20 @@ impl RuntimeHandle {
         }
         match result {
             Ok(Some(output)) => Ok(output),
-            Ok(None) => Ok(Output::Snapshot(self.get_snapshot())),
+            Ok(None) => Ok(Output::Snapshot(Box::new(self.get_snapshot()))),
             Err(e) => Err(e),
         }
     }
     async fn snapshot_command(&self, command: Command) -> Result<Snapshot, RuntimeError> {
         match self.run(command, None).await? {
-            Output::Snapshot(s) => Ok(s),
+            Output::Snapshot(s) => Ok(*s),
             _ => unreachable!(),
         }
     }
     pub async fn refresh_all(&self) -> Result<Snapshot, RuntimeError> {
         let generation = self.inner.refresh_generation.load(Ordering::Acquire);
         match self.run(Command::RefreshAll, Some(generation)).await? {
-            Output::Snapshot(s) => Ok(s),
+            Output::Snapshot(s) => Ok(*s),
             _ => unreachable!(),
         }
     }
@@ -719,19 +929,28 @@ impl Engine {
             })
             .map(|a| a.id.clone());
         if self
-            .fingerprint
+            .identity_fingerprint
             .as_ref()
-            .is_some_and(|fp| fp != &live.fingerprint)
+            .is_some_and(|fp| fp != &live.identity_fingerprint)
         {
-            for a in &mut self.saved.accounts {
-                a.identity_verified = false;
-            }
-            for r in self.saved.readings.values_mut() {
-                r.complete = false;
+            // Another account's login or a logout. Only the previous active account (the
+            // CLI may have rotated its tokens unseen) and the new one (the CLI owns its
+            // token now) lose their proofs; every other account's reading stays valid.
+            // Unrelated CLI writes and token rotations by the CLI never get here.
+            for id in [self.active_id.clone(), active.clone()]
+                .into_iter()
+                .flatten()
+            {
+                if let Some(a) = self.saved.accounts.iter_mut().find(|a| a.id == id) {
+                    a.identity_verified = false;
+                }
+                if let Some(r) = self.saved.readings.get_mut(&id) {
+                    r.complete = false;
+                }
             }
         }
         self.active_id = active;
-        self.fingerprint = Some(live.fingerprint);
+        self.identity_fingerprint = Some(live.identity_fingerprint);
         self.active_model = self.active_store()?.paths.default_model()?;
         Ok(())
     }
@@ -792,6 +1011,7 @@ impl Engine {
                         || u.weekly_utilization_for_model(self.active_model.as_deref())
                             >= self.saved.settings.threshold
                 });
+                let reading = self.saved.readings.get(&a.id);
                 AccountView {
                     id: a.id.clone(),
                     name: safe_label(&a.name),
@@ -803,12 +1023,18 @@ impl Engine {
                     identity_verified: a.identity_verified,
                     usage: usage.map(|u| UsageView::new(u, self.active_model.as_deref())),
                     usage_at: a.last_usage_at,
-                    scoped_at: self.saved.readings.get(&a.id).and_then(|r| r.scoped_at),
+                    scoped_at: reading.and_then(|r| r.scoped_at),
                     decision_fresh: self.fresh(a),
-                    error: self.saved.readings.get(&a.id).and_then(|r| {
-                        r.error
-                            .as_deref()
-                            .map(|text| safe_error_text(text, &self.saved.settings.language))
+                    error: reading
+                        .and_then(|r| r.error.as_deref())
+                        .map(|text| error_code(text).to_owned()),
+                    sign_in_required: reading.is_some_and(|r| r.sign_in_required),
+                    frees_at: usage.filter(|_| exhausted).and_then(|u| {
+                        frees_at(
+                            u,
+                            self.saved.settings.threshold,
+                            self.active_model.as_deref(),
+                        )
                     }),
                     subscription_status: a.subscription_status.as_deref().map(safe_label),
                     plan_tier: a.plan_tier.as_deref().map(safe_label),
@@ -840,6 +1066,7 @@ impl Engine {
             last_refresh_at: self.saved.last_refresh_at,
             busy,
             error: self.error.clone(),
+            notice: self.notice.clone(),
             demo: self.demo,
             consumption_plan: plan,
         }
@@ -946,9 +1173,82 @@ impl Engine {
             body,
         });
     }
+    /// Notification label for an account: its email, else its saved name.
+    fn label(&self, id: &str) -> String {
+        self.saved
+            .accounts
+            .iter()
+            .find(|a| a.id == id)
+            .map_or_else(String::new, |a| safe_label(a.email().unwrap_or(&a.name)))
+    }
+    fn ro(&self) -> bool {
+        self.saved.settings.language == "ro"
+    }
+    /// True while a sign-in-required account waits for its daily background retry.
+    fn sign_in_backoff(&self, a: &StoredAccount, now: i64) -> bool {
+        self.saved
+            .readings
+            .get(&a.id)
+            .is_some_and(|r| r.sign_in_required)
+            && recent(a.refresh_fail_at, now, SIGN_IN_RETRY)
+    }
 }
 fn recent(at: Option<i64>, now: i64, age: i64) -> bool {
     at.is_some_and(|at| at <= now + 30 && now.saturating_sub(at) <= age)
+}
+fn notice_view(code: &str, account: Option<String>, at: i64) -> ErrorView {
+    ErrorView {
+        code: code.into(),
+        account_id: account,
+        param: None,
+        action: None,
+        at,
+    }
+}
+/// Rounded-up, coarse duration for notifications ("2h 10m" / "2 h 10 min").
+fn duration_text(seconds: i64, ro: bool) -> String {
+    let minutes = seconds.max(0).saturating_add(59) / 60;
+    let (days, hours, minutes) = (minutes / 1440, (minutes / 60) % 24, minutes % 60);
+    match (days, hours, ro) {
+        (0, 0, false) => format!("{}m", minutes.max(1)),
+        (0, 0, true) => format!("{} min", minutes.max(1)),
+        (0, _, false) => format!("{hours}h {minutes}m"),
+        (0, _, true) => format!("{hours} h {minutes} min"),
+        (_, _, false) => format!("{days}d {hours}h"),
+        (1, _, true) => format!("1 zi {hours} h"),
+        (_, _, true) if days < 20 => format!("{days} zile {hours} h"),
+        (_, _, true) => format!("{days} de zile {hours} h"),
+    }
+}
+/// Local wall-clock time, with the weekday when it is not today.
+fn local_time_text(at: i64, now: i64, ro: bool) -> String {
+    use chrono::{Datelike, Local, TimeZone};
+    const RO_DAYS: [&str; 7] = [
+        "luni",
+        "marți",
+        "miercuri",
+        "joi",
+        "vineri",
+        "sâmbătă",
+        "duminică",
+    ];
+    let (Some(time), Some(today)) = (
+        Local.timestamp_opt(at, 0).single(),
+        Local.timestamp_opt(now, 0).single(),
+    ) else {
+        return String::new();
+    };
+    let clock = time.format("%H:%M").to_string();
+    if time.date_naive() == today.date_naive() {
+        clock
+    } else if ro {
+        format!(
+            "{} {clock}",
+            RO_DAYS[time.weekday().num_days_from_monday() as usize]
+        )
+    } else {
+        format!("{} {clock}", time.format("%a"))
+    }
 }
 fn same_owner(a: &StoredAccount, identity: &Value) -> bool {
     a.account_uuid().is_some()
@@ -964,8 +1264,10 @@ fn safe_label(value: &str) -> String {
 }
 
 impl Engine {
+    /// `expected` is the identity fingerprint captured before an awaited request: the
+    /// result applies only if nobody logged into another account meanwhile.
     fn ensure_context(&mut self, expected: &str) -> Result<(), RuntimeError> {
-        if self.live()?.fingerprint != expected {
+        if self.live()?.identity_fingerprint != expected {
             self.observe_active()?;
             return Err(RuntimeError::ExternalChange);
         }
@@ -979,7 +1281,11 @@ impl Engine {
     ) -> Result<(), RuntimeError> {
         let profile = self.client()?.profile(token).await;
         self.ensure_context(expected)?;
-        let profile = profile.map_err(|_| RuntimeError::Identity)?;
+        let profile = profile.map_err(|error| match error {
+            // A refused token is a sign-in problem, not an ownership mismatch.
+            ClientError::Unauthorized => RuntimeError::SignInRequired,
+            _ => RuntimeError::Provider,
+        })?;
         let i = self.index(id)?;
         if !same_owner(&self.saved.accounts[i], &profile.identity) {
             self.saved.accounts[i].identity_verified = false;
@@ -990,9 +1296,16 @@ impl Engine {
         profile.apply(&mut self.saved.accounts[i], self.clock.now());
         Ok(())
     }
-    async fn adopt_active(&mut self, id: &str, expected: &str) -> Result<String, RuntimeError> {
+    /// Adopts the CLI's current OAuth blob for the active account once its owner is
+    /// proven. Returns the access token and the auth fingerprint of the adopted state,
+    /// which a following switch must still find in place.
+    async fn adopt_active(
+        &mut self,
+        id: &str,
+        expected: &str,
+    ) -> Result<(String, String), RuntimeError> {
         let live = self.live()?;
-        if live.fingerprint != expected {
+        if live.identity_fingerprint != expected {
             return Err(RuntimeError::ExternalChange);
         }
         let i = self.index(id)?;
@@ -1015,7 +1328,14 @@ impl Engine {
                 86400,
             );
         if needs_profile {
-            self.verify_profile(id, &token, expected).await?;
+            self.verify_profile(id, &token, expected)
+                .await
+                .map_err(|error| match error {
+                    // The CLI owns the active token and renews it on its next use;
+                    // PrimerSwitch never refreshes it, so this is not a lost sign-in.
+                    RuntimeError::SignInRequired => RuntimeError::ActiveSessionExpired,
+                    other => other,
+                })?;
         }
         self.ensure_context(expected)?;
         // Only the CLI OAuth blob is adopted; saved credential extensions survive.
@@ -1029,14 +1349,22 @@ impl Engine {
             self.saved.accounts[i].credentials["claudeAiOauth"] =
                 live.credentials["claudeAiOauth"].clone();
             self.saved.accounts[i].saved_at = self.clock.now();
+            // A newer proven CLI blob supersedes any captured copy and sign-in prompt.
+            if let Some(r) = self.saved.readings.get_mut(id) {
+                r.unverified_oauth = None;
+                r.sign_in_required = false;
+            }
             self.persist()?;
         }
-        Ok(token)
+        Ok((token, live.fingerprint))
     }
+    /// Refreshes an inactive account's saved token when it expires. `user` marks an
+    /// explicit refresh or switch, which may retry a sign-in Claude already refused.
     async fn refresh_inactive(
         &mut self,
         id: &str,
         forced: bool,
+        user: bool,
         expected: &str,
     ) -> Result<(), RuntimeError> {
         self.ensure_context(expected)?;
@@ -1046,6 +1374,24 @@ impl Engine {
             return Err(RuntimeError::ExternalChange);
         }
         let now = self.clock.now();
+        let reading = self.saved.readings.get(id).cloned().unwrap_or_default();
+        // Claude refused this account's refresh token: background work stops asking
+        // until the daily retry instead of failing every cycle.
+        if !user && self.sign_in_backoff(&self.saved.accounts[i], now) {
+            return Err(RuntimeError::SignInRequired);
+        }
+        // A temporary failure holds further refresh attempts for 15 minutes.
+        let cooling =
+            !reading.sign_in_required && recent(self.saved.accounts[i].refresh_fail_at, now, 900);
+        // The CLI blob captured while switching away is newer than the saved copy (the
+        // CLI rotated it), so it is resolved first and adopted only once proven.
+        if !cooling
+            && let Some(candidate) = reading.unverified_oauth
+            && self.resolve_candidate(id, candidate, expected).await?
+        {
+            return Ok(());
+        }
+        let i = self.index(id)?;
         if !forced
             && self.saved.accounts[i]
                 .expires_at_ms()
@@ -1053,12 +1399,12 @@ impl Engine {
         {
             return Ok(());
         }
-        if recent(self.saved.accounts[i].refresh_fail_at, now, 900) {
+        if cooling {
             return Err(RuntimeError::Provider);
         }
         let refresh = self.saved.accounts[i]
             .refresh_token()
-            .ok_or(RuntimeError::Identity)?
+            .ok_or(RuntimeError::SignInRequired)?
             .to_owned();
         let result = self.client()?.refresh_token(&refresh).await;
         let i = self.index(id)?;
@@ -1066,17 +1412,111 @@ impl Engine {
             Ok(tokens) => {
                 tokens.apply_account(&mut self.saved.accounts[i], self.clock.now());
                 self.saved.accounts[i].identity_verified = false;
+                self.saved
+                    .readings
+                    .entry(id.into())
+                    .or_default()
+                    .sign_in_required = false;
                 self.persist()?;
                 self.ensure_context(expected)?;
                 Ok(())
             }
+            Err(error) => {
+                self.saved.accounts[i].refresh_fail_at = Some(now);
+                let refused = error == ClientError::InvalidGrant;
+                if refused {
+                    self.saved
+                        .readings
+                        .entry(id.into())
+                        .or_default()
+                        .sign_in_required = true;
+                }
+                self.persist()?;
+                self.ensure_context(expected)?;
+                Err(if refused {
+                    RuntimeError::SignInRequired
+                } else {
+                    RuntimeError::Provider
+                })
+            }
+        }
+    }
+    /// Tries the CLI blob captured while switching away. Returns `true` once its owner
+    /// is proven and it replaced the saved copy, `false` when it is unusable or proves
+    /// to belong to someone else (it is then discarded and the saved copy decides).
+    async fn resolve_candidate(
+        &mut self,
+        id: &str,
+        candidate: Value,
+        expected: &str,
+    ) -> Result<bool, RuntimeError> {
+        let Some(refresh) = candidate
+            .get("refreshToken")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+        else {
+            return self.discard_candidate(id);
+        };
+        let result = self.client()?.refresh_token(&refresh).await;
+        let now = self.clock.now();
+        let tokens = match result {
+            Ok(tokens) => tokens,
+            Err(ClientError::InvalidGrant) => {
+                self.discard_candidate(id)?;
+                self.ensure_context(expected)?;
+                return Ok(false);
+            }
             Err(_) => {
+                let i = self.index(id)?;
                 self.saved.accounts[i].refresh_fail_at = Some(now);
                 self.persist()?;
                 self.ensure_context(expected)?;
-                Err(RuntimeError::Provider)
+                return Err(RuntimeError::Provider);
             }
+        };
+        // The refresh consumed the captured refresh token: its successor is durable
+        // (still unverified) before any other request.
+        let mut blob = json!({ "claudeAiOauth": candidate });
+        tokens.apply(&mut blob, now);
+        let refreshed = blob["claudeAiOauth"].take();
+        self.saved
+            .readings
+            .entry(id.into())
+            .or_default()
+            .unverified_oauth = Some(refreshed.clone());
+        self.persist()?;
+        self.ensure_context(expected)?;
+        let profile = self.client()?.profile(tokens.access_token.as_str()).await;
+        self.ensure_context(expected)?;
+        let i = self.index(id)?;
+        match profile {
+            Ok(profile) if same_owner(&self.saved.accounts[i], &profile.identity) => {
+                let account = &mut self.saved.accounts[i];
+                if !account.credentials.is_object() {
+                    account.credentials = json!({});
+                }
+                account.credentials["claudeAiOauth"] = refreshed;
+                account.saved_at = now;
+                account.refresh_fail_at = None;
+                profile.apply(account, now);
+                let reading = self.saved.readings.entry(id.into()).or_default();
+                reading.unverified_oauth = None;
+                reading.sign_in_required = false;
+                self.persist()?;
+                Ok(true)
+            }
+            // Never adopted into an account it is not proven to belong to.
+            Ok(_) | Err(ClientError::Unauthorized) => self.discard_candidate(id),
+            Err(_) => Err(RuntimeError::Provider),
         }
+    }
+    fn discard_candidate(&mut self, id: &str) -> Result<bool, RuntimeError> {
+        if let Some(reading) = self.saved.readings.get_mut(id) {
+            reading.unverified_oauth = None;
+        }
+        self.persist()?;
+        Ok(false)
     }
     fn endpoint_allowed(&self, id: &str, force: bool) -> bool {
         let Ok(i) = self.index(id) else {
@@ -1133,7 +1573,7 @@ impl Engine {
         if matches!(result, Err(ClientError::Unauthorized)) && self.active_id.as_deref() != Some(id)
         {
             // One bounded retry; rotated tokens are durable before another request.
-            self.refresh_inactive(id, true, expected).await?;
+            self.refresh_inactive(id, true, false, expected).await?;
             let i = self.index(id)?;
             let token = self.saved.accounts[i]
                 .access_token()
@@ -1169,7 +1609,7 @@ impl Engine {
         force: bool,
         fast: bool,
     ) -> Result<(), RuntimeError> {
-        let expected = self.live()?.fingerprint;
+        let expected = self.live()?.identity_fingerprint;
         let active = self.active_id.as_deref() == Some(id);
         let i = self.index(id)?;
         if self.saved.accounts[i].provider != ProviderId::Claude {
@@ -1177,9 +1617,9 @@ impl Engine {
         }
         let result: Result<(), RuntimeError> = async {
             let token = if active {
-                self.adopt_active(id, &expected).await?
+                self.adopt_active(id, &expected).await?.0
             } else {
-                self.refresh_inactive(id, false, &expected).await?;
+                self.refresh_inactive(id, false, force, &expected).await?;
                 let i = self.index(id)?;
                 let token = self.saved.accounts[i]
                     .access_token()
@@ -1280,8 +1720,7 @@ impl Engine {
         }
         .await;
         if let Err(error) = &result {
-            self.saved.readings.entry(id.into()).or_default().error =
-                Some(error.message(&self.saved.settings.language));
+            self.saved.readings.entry(id.into()).or_default().error = Some(error.code().into());
         }
         self.persist()?;
         result
@@ -1299,30 +1738,32 @@ impl Engine {
                 if a.provider == ProviderId::Claude
                     && self.active_id.as_deref() != Some(&a.id)
                     && (force || !a.identity_verified || !recent(a.last_usage_at, now, 900))
+                    // A refused sign-in waits for its daily retry or an explicit refresh.
+                    && (force || !self.sign_in_backoff(a, now))
                 {
                     ids.push(a.id.clone());
                 }
             }
         }
-        let mut last_error = None;
+        let mut active_error = None;
         for (index, id) in ids.iter().enumerate() {
             if index > 0 && self.spacing {
                 tokio::time::sleep(Duration::from_secs(8)).await;
             }
-            if let Err(error) = self.poll_account(id, force, !ordinary).await {
-                last_error = Some(error);
+            let was_active = self.active_id.as_deref() == Some(id);
+            if let Err(error) = self.poll_account(id, force, !ordinary).await
+                && was_active
+            {
+                active_error = Some((id.clone(), error));
             }
         }
         self.saved.last_refresh_at = Some(self.clock.now());
         // Freshness failures keep cached figures visible but suspend decisions.
         self.automate(!ordinary).await?;
-        if self.active_id.as_ref().is_some_and(|id| {
-            self.saved
-                .readings
-                .get(id)
-                .is_some_and(|r| r.error.is_some())
-        }) && let Some(error) = last_error
-        {
+        // Inactive failures stay on their own rows; the active account's failure is
+        // reported with its account so the status names it.
+        if let Some((id, error)) = active_error {
+            self.failed_account = Some(id);
             return Err(error);
         }
         Ok(())
@@ -1334,7 +1775,7 @@ impl Engine {
         require_usable: bool,
     ) -> Result<(), RuntimeError> {
         self.observe_active()?;
-        let expected = self.live()?.fingerprint;
+        let expected = self.live()?.identity_fingerprint;
         self.index(id)?;
         if self.active_id.as_deref() == Some(id) {
             return Ok(());
@@ -1353,10 +1794,14 @@ impl Engine {
                 usage: target.last_usage.clone(),
                 is_active: false,
             };
+            let now = self.clock.now();
+            // An ordinary preflight just re-read the main and model windows, so both must
+            // be that recent. A strict fast tick re-reads only the main windows (by
+            // inference; it never sends metadata), so model rows keep the normal
+            // freshness rule instead of a 120-second one no fast tick can meet.
             if !self.fresh(&target)
-                || !recent(target.last_usage_at, self.clock.now(), 120)
-                || (self.active_model.is_some()
-                    && !recent(reading.scoped_at, self.clock.now(), 120))
+                || !recent(target.last_usage_at, now, 120)
+                || (!fast && self.active_model.is_some() && !recent(reading.scoped_at, now, 120))
                 || !is_usable(
                     &info,
                     self.saved.settings.threshold,
@@ -1366,21 +1811,12 @@ impl Engine {
                 return Err(RuntimeError::Provider);
             }
         }
-        // Capture and verify outgoing CLI rotation immediately before CAS switching.
-        if let Some(outgoing) = self.active_id.clone() {
-            self.adopt_active(&outgoing, &expected).await?;
-        }
-        self.ensure_context(&expected)?;
-        self.active_store()?.switch_checked(
-            &target.credentials,
-            &target.oauth_account,
-            &expected,
-            self.vault.as_ref().ok_or(RuntimeError::Storage)?,
-        )?;
+        self.capture_and_switch(&target, &expected).await?;
         let live = self.live()?;
         self.active_id = Some(id.into());
-        self.fingerprint = Some(live.fingerprint);
+        self.identity_fingerprint = Some(live.identity_fingerprint);
         self.exhausted = false;
+        let i = self.index(id)?;
         self.saved.accounts[i].identity_verified = true;
         self.persist()?;
         self.notify(format!(
@@ -1390,6 +1826,96 @@ impl Engine {
         ));
         // The next cycle reads the new active token; old action lists are discarded.
         Ok(())
+    }
+    /// Captures the outgoing account's newest CLI blob, then switches only if the
+    /// login is still exactly what was captured. A token the CLI rotates in between is
+    /// captured once more instead of failing the switch.
+    async fn capture_and_switch(
+        &mut self,
+        target: &StoredAccount,
+        expected: &str,
+    ) -> Result<(), RuntimeError> {
+        let mut retried = false;
+        loop {
+            let captured = self.capture_outgoing(expected).await?;
+            self.ensure_context(expected)?;
+            let vault = self.vault.as_ref().ok_or(RuntimeError::Storage)?;
+            match self.active_store()?.switch_checked(
+                &target.credentials,
+                &target.oauth_account,
+                &captured,
+                vault,
+            ) {
+                Ok(()) => break,
+                Err(PlatformError::Conflict)
+                    if !retried && self.live()?.identity_fingerprint == expected =>
+                {
+                    retried = true;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        // A completed switch resolves an earlier interrupted one.
+        if self.notice.as_ref().is_some_and(|n| {
+            matches!(
+                n.code.as_str(),
+                "switchInterrupted" | "switchRecoveryPending"
+            )
+        }) {
+            self.notice = None;
+        }
+        Ok(())
+    }
+    /// Preserves the outgoing account's CLI blob before it is replaced and returns the
+    /// auth fingerprint the switch must still find. Rotated tokens are never lost: a
+    /// proven blob is adopted; one Claude refuses to verify (its access token expired
+    /// while the CLI was idle) is kept as a candidate and resolved later.
+    async fn capture_outgoing(&mut self, expected: &str) -> Result<String, RuntimeError> {
+        let live = self.live()?;
+        if live.identity_fingerprint != expected {
+            return Err(RuntimeError::ExternalChange);
+        }
+        let Some(outgoing) = self.active_id.clone() else {
+            return Ok(live.fingerprint);
+        };
+        let i = self.index(&outgoing)?;
+        // Nothing to capture when the CLI holds no blob, or exactly the saved one that
+        // was proven when it was saved: no verification request an expired token fails.
+        let blob = live
+            .credentials
+            .get("claudeAiOauth")
+            .filter(|v| !v.is_null());
+        if blob.is_none() || blob == self.saved.accounts[i].credentials.get("claudeAiOauth") {
+            return Ok(live.fingerprint);
+        }
+        match self.adopt_active(&outgoing, expected).await {
+            Ok((_, captured)) => Ok(captured),
+            Err(RuntimeError::ActiveSessionExpired) => {
+                let live = self.live()?;
+                if live.identity_fingerprint != expected {
+                    return Err(RuntimeError::ExternalChange);
+                }
+                if let Some(blob) = live
+                    .credentials
+                    .get("claudeAiOauth")
+                    .filter(|v| v.is_object())
+                {
+                    self.saved
+                        .readings
+                        .entry(outgoing.clone())
+                        .or_default()
+                        .unverified_oauth = Some(blob.clone());
+                    self.persist()?;
+                }
+                self.notice = Some(notice_view(
+                    "outgoingUnverified",
+                    Some(outgoing),
+                    self.clock.now(),
+                ));
+                Ok(live.fingerprint)
+            }
+            Err(error) => Err(error),
+        }
     }
     fn resolve_priming_by_inference(&mut self, id: &str) -> Result<(), RuntimeError> {
         let i = self.index(id)?;
@@ -1483,13 +2009,12 @@ impl Engine {
                     .last_usage
                     .as_ref()
                     .and_then(UsageResponse::weekly_all_resets_at);
-                self.notify(
-                    self.t(
-                        "The weekly window was started.",
-                        "Fereastra săptămânală a fost pornită.",
-                    )
-                    .into(),
-                );
+                let label = self.label(id);
+                self.notify(if self.ro() {
+                    format!("Fereastra săptămânală a fost pornită pentru {label}.")
+                } else {
+                    format!("The weekly window was started for {label}.")
+                });
             }
             Ok(_) => {
                 self.saved.accounts[i].priming_pending_for = None;
@@ -1520,33 +2045,104 @@ impl Engine {
         }
         Ok(())
     }
+    /// Decision inputs: fresh usage only, reset offers only when read within 120 s, and
+    /// no active reading unless every account is known (unknown inactive budget must
+    /// not let last-resort exhaustion be assumed).
+    fn decision_infos(&self, now: i64, offers_any_age: bool) -> Vec<AccountUsageInfo> {
+        let mut infos = self.infos(true);
+        let all_fresh = infos.iter().all(|i| i.usage.is_some());
+        for info in &mut infos {
+            if !offers_any_age && !recent(info.account.reset_status_at, now, 120) {
+                info.account.reset_status = None;
+            }
+            if !all_fresh && info.is_active {
+                info.usage = None;
+            }
+        }
+        infos
+    }
+    /// Accounts whose reset offers need a fresh read before deciding: unresolved claims,
+    /// and accounts whose cached offer would produce an action now. Merely holding a
+    /// grant no longer costs a usage request every cycle; the decision itself still
+    /// uses only offers read within 120 seconds.
+    fn reset_revalidation_targets(&self, now: i64) -> Vec<String> {
+        let mut targets: Vec<String> = self
+            .saved
+            .accounts
+            .iter()
+            .filter(|a| {
+                a.provider == ProviderId::Claude && a.pending_reset_claim.is_some() && self.fresh(a)
+            })
+            .map(|a| a.id.clone())
+            .collect();
+        for action in decide_resets(
+            &self.decision_infos(now, true),
+            self.saved.settings.threshold,
+            self.active_model.as_deref(),
+            now,
+        ) {
+            if !targets.contains(&action.account_id) {
+                targets.push(action.account_id);
+            }
+        }
+        targets
+    }
+    /// Records an automatic switch failure for the status line and notifies about it,
+    /// at most every `SWITCH_FAILURE_NOTICE` seconds for the same target and cause.
+    fn switch_failed(&mut self, target: &str, error: &RuntimeError, now: i64) {
+        self.failed_account = Some(target.into());
+        self.failed_action = Some("autoSwitch");
+        if self
+            .last_switch_failure
+            .as_ref()
+            .is_some_and(|(last, code, at)| {
+                last == target
+                    && *code == error.code()
+                    && now.saturating_sub(*at) < SWITCH_FAILURE_NOTICE
+            })
+        {
+            return;
+        }
+        self.last_switch_failure = Some((target.into(), error.code(), now));
+        let label = self.label(target);
+        let reason = error.message(&self.saved.settings.language);
+        self.notify(if self.ro() {
+            format!("Comutarea automată pe {label} nu a reușit. {reason}")
+        } else {
+            format!("Could not switch to {label} automatically. {reason}")
+        });
+    }
     async fn automate(&mut self, fast: bool) -> Result<(), RuntimeError> {
         let now = self.clock.now();
         if self.saved.settings.auto_use_resets_enabled {
-            let candidates: Vec<_> = self
+            if !fast {
+                for id in self.reset_revalidation_targets(now) {
+                    let i = self.index(&id)?;
+                    if recent(self.saved.accounts[i].reset_status_at, now, 120)
+                        || !self.endpoint_allowed(&id, true)
+                    {
+                        continue;
+                    }
+                    let expected = self.live()?.identity_fingerprint;
+                    match self.metadata(&id, &expected).await {
+                        Ok(_) => {}
+                        Err(RuntimeError::ExternalChange) => {
+                            return Err(RuntimeError::ExternalChange);
+                        }
+                        // One account's failed read only skips that account's resets;
+                        // its cooldown is recorded and the rest of automation continues.
+                        Err(_) => {}
+                    }
+                }
+            }
+            let pending: Vec<String> = self
                 .saved
                 .accounts
                 .iter()
-                .filter(|a| {
-                    self.fresh(a)
-                        && (a.pending_reset_claim.is_some()
-                            || a.reset_status
-                                .as_ref()
-                                .is_some_and(|s| !s.grants.is_empty()))
-                })
+                .filter(|a| a.pending_reset_claim.is_some() && self.fresh(a))
                 .map(|a| a.id.clone())
                 .collect();
-            for id in &candidates {
-                let i = self.index(id)?;
-                if !fast
-                    && !recent(self.saved.accounts[i].reset_status_at, now, 120)
-                    && self.endpoint_allowed(id, true)
-                {
-                    let expected = self.live()?.fingerprint;
-                    self.metadata(id, &expected).await?;
-                }
-            }
-            for id in candidates {
+            for id in pending {
                 let i = self.index(&id)?;
                 let Some(pending) = self.saved.accounts[i].pending_reset_claim.clone() else {
                     continue;
@@ -1555,33 +2151,27 @@ impl Engine {
                     .reset_status
                     .as_ref()
                     .is_some_and(|s| !s.grants.iter().any(|g| g.id == pending.grant_id));
-                if missing
+                if !(missing
                     && recent(self.saved.accounts[i].reset_status_at, now, 120)
                     && self.saved.accounts[i]
                         .last_reset_attempt_at
-                        .is_none_or(|last| now.saturating_sub(last) >= 300)
-                    && self.claim(&id, &pending.grant_id, true).await?
-                    && self.active_id.as_deref() == Some(&id)
+                        .is_none_or(|last| now.saturating_sub(last) >= 300))
                 {
+                    continue;
+                }
+                let reset = match self.claim(&id, &pending.grant_id, true).await {
+                    Ok(reset) => reset,
+                    Err(RuntimeError::ExternalChange) => {
+                        return Err(RuntimeError::ExternalChange);
+                    }
+                    Err(_) => false,
+                };
+                if reset && self.active_id.as_deref() == Some(&id) {
                     return Ok(());
                 }
             }
-        }
-        let mut infos = self.infos(true);
-        // Reset offers need an independently fresh metadata observation. Unknown
-        // inactive budget prevents last-resort exhaustion from being assumed.
-        let all_fresh = infos.iter().all(|i| i.usage.is_some());
-        for info in &mut infos {
-            if !recent(info.account.reset_status_at, now, 120) {
-                info.account.reset_status = None;
-            }
-            if !all_fresh && info.is_active {
-                info.usage = None;
-            }
-        }
-        if self.saved.settings.auto_use_resets_enabled {
             for action in decide_resets(
-                &infos,
+                &self.decision_infos(now, false),
                 self.saved.settings.threshold,
                 self.active_model.as_deref(),
                 now,
@@ -1590,12 +2180,23 @@ impl Engine {
                 if !self.fresh(&self.saved.accounts[i]) {
                     continue;
                 }
-                if action.switch_first {
-                    self.switch_to(&action.account_id, fast, false).await?;
+                // Last resort: an enabled reset may switch to the account holding it
+                // even when ordinary automatic switching is off (B17).
+                if action.switch_first
+                    && let Err(error) = self.switch_to(&action.account_id, fast, false).await
+                {
+                    self.switch_failed(&action.account_id, &error, now);
+                    return Err(error);
                 }
-                let reset = self
-                    .claim(&action.account_id, &action.grant_id, fast)
-                    .await?;
+                let reset = match self.claim(&action.account_id, &action.grant_id, fast).await {
+                    Ok(reset) => reset,
+                    Err(RuntimeError::ExternalChange) => {
+                        return Err(RuntimeError::ExternalChange);
+                    }
+                    // A refused or unrevalidated claim on one account never blocks the
+                    // remaining actions or the switch below.
+                    Err(_) => false,
+                };
                 if reset && self.active_id.as_deref() == Some(&action.account_id) {
                     return Ok(());
                 }
@@ -1621,8 +2222,11 @@ impl Engine {
             self.saved.settings.threshold,
             self.active_model.as_deref(),
         ) {
-            if self.saved.settings.auto_switch_enabled {
-                self.switch_to(&candidate, fast, true).await?;
+            if self.saved.settings.auto_switch_enabled
+                && let Err(error) = self.switch_to(&candidate, fast, true).await
+            {
+                self.switch_failed(&candidate, &error, now);
+                return Err(error);
             }
         } else if infos.iter().all(|i| i.usage.is_some()) {
             self.exhausted = true;
@@ -1633,27 +2237,43 @@ impl Engine {
                 self.last_exhausted_notice = Some(now);
                 let earliest = infos
                     .iter()
-                    .filter_map(|i| i.usage.as_ref().and_then(UsageResponse::earliest_reset))
+                    .filter_map(|i| {
+                        let usage = i.usage.as_ref()?;
+                        let at = frees_at(
+                            usage,
+                            self.saved.settings.threshold,
+                            self.active_model.as_deref(),
+                        )?;
+                        Some((at, i.account.id.clone()))
+                    })
                     .min();
-                self.notify(if earliest.is_some() {
-                    self.t(
-                        "All accounts are at their limits. Waiting for their windows to reopen.",
-                        "Toate conturile sunt la limită. Așteptăm redeschiderea ferestrelor.",
-                    )
-                    .into()
-                } else {
-                    self.t(
+                let ro = self.ro();
+                let mut body = self
+                    .t(
                         "All accounts are at their limits.",
                         "Toate conturile sunt la limită.",
                     )
-                    .into()
-                });
+                    .to_owned();
+                if let Some((at, id)) = earliest {
+                    let (label, wait, time) = (
+                        self.label(&id),
+                        duration_text(at.saturating_sub(now), ro),
+                        local_time_text(at, now, ro),
+                    );
+                    body.push(' ');
+                    body.push_str(&if ro {
+                        format!("Primul se eliberează {label}, în {wait} ({time}).")
+                    } else {
+                        format!("{label} frees up first, in {wait} ({time}).")
+                    });
+                }
+                self.notify(body);
             }
         }
         Ok(())
     }
     async fn claim(&mut self, id: &str, grant: &str, fast: bool) -> Result<bool, RuntimeError> {
-        let expected = self.live()?.fingerprint;
+        let expected = self.live()?.identity_fingerprint;
         let i = self.index(id)?;
         if !self.fresh(&self.saved.accounts[i]) {
             return Err(RuntimeError::Provider);
@@ -1690,16 +2310,7 @@ impl Engine {
         {
             return Err(RuntimeError::Provider);
         }
-        let mut infos = self.infos(true);
-        let all_fresh = infos.iter().all(|i| i.usage.is_some());
-        for info in &mut infos {
-            if !recent(info.account.reset_status_at, now, 120) {
-                info.account.reset_status = None;
-            }
-            if !all_fresh && info.is_active {
-                info.usage = None;
-            }
-        }
+        let infos = self.decision_infos(now, false);
         if replay
             && self.saved.accounts[i]
                 .last_reset_attempt_at
@@ -1755,16 +2366,12 @@ impl Engine {
         self.persist()?;
         self.ensure_context(&expected)?;
         if success {
-            self.notify(format!(
-                "{} {} — {}",
-                self.t("Reset used on", "Reset folosit pe"),
-                safe_label(
-                    self.saved.accounts[i]
-                        .email()
-                        .unwrap_or(&self.saved.accounts[i].name)
-                ),
-                self.t("limits refilled", "limite umplute")
-            ));
+            let label = self.label(id);
+            self.notify(if self.ro() {
+                format!("Resetare folosită pentru {label}: limitele sunt din nou disponibile.")
+            } else {
+                format!("Reset used on {label}: its limits are available again.")
+            });
         }
         Ok(success)
     }
@@ -1778,7 +2385,7 @@ impl Engine {
             .ok_or(RuntimeError::Identity)?
             .to_owned();
         let profile = self.client()?.profile(&token).await?;
-        self.ensure_context(&live.fingerprint)?;
+        self.ensure_context(&live.identity_fingerprint)?;
         let mut account = StoredAccount::new(
             live.identity
                 .get("emailAddress")
@@ -1816,6 +2423,13 @@ impl Engine {
                 existing.subscription_started_at = incoming.subscription_started_at;
                 existing.plan_tier = incoming.plan_tier;
                 existing.profile_checked_at = incoming.profile_checked_at;
+                existing.refresh_fail_at = None;
+                // A new proven sign-in supersedes a captured blob and a sign-in prompt.
+                if let Some(reading) = self.saved.readings.get_mut(&existing.id) {
+                    reading.unverified_oauth = None;
+                    reading.sign_in_required = false;
+                    reading.error = None;
+                }
             }
             // A replayed legacy import must never replace newer rotations, renewal,
             // cached observations, or unresolved operations in the encrypted vault.
@@ -1980,29 +2594,6 @@ fn safe_reset_text(text: &str, locale: &str) -> String {
         "A historical reset result was preserved.".into()
     }
 }
-fn safe_error_text(text: &str, locale: &str) -> String {
-    let errors = [
-        RuntimeError::Storage,
-        RuntimeError::UnavailableStorage,
-        RuntimeError::UnsupportedContext,
-        RuntimeError::VaultIntegrity,
-        RuntimeError::MissingAccount,
-        RuntimeError::ExternalChange,
-        RuntimeError::Identity,
-        RuntimeError::Provider,
-        RuntimeError::Settings,
-        RuntimeError::ReadOnly,
-        RuntimeError::Login,
-        RuntimeError::Import,
-        RuntimeError::PendingReset,
-        RuntimeError::CliVersion,
-    ];
-    errors
-        .iter()
-        .find(|e| e.message("en") == text || e.message("ro") == text)
-        .unwrap_or(&RuntimeError::Provider)
-        .message(locale)
-}
 
 #[cfg(test)]
 mod tests {
@@ -2030,6 +2621,8 @@ mod tests {
         hook: StdMutex<Option<Hook>>,
         pause: StdMutex<Option<Pause>>,
         usage: StdMutex<Value>,
+        /// Usage reads whose bearer token contains the marker keep failing.
+        failing_usage: StdMutex<Vec<(&'static str, ClientError)>>,
     }
     impl Default for Fake {
         fn default() -> Self {
@@ -2041,6 +2634,7 @@ mod tests {
                 usage: StdMutex::new(
                     json!({"five_hour":{"utilization":20,"resets_at":10000},"seven_day":{"utilization":20,"resets_at":90000},"limits":[],"cedar_ember":{"grants":[]}}),
                 ),
+                failing_usage: StdMutex::new(vec![]),
             }
         }
     }
@@ -2082,9 +2676,26 @@ mod tests {
                     return replies.pop_front().unwrap().1;
                 }
             }
+            if url == USAGE_URL
+                && let Some((_, error)) = self
+                    .failing_usage
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|(marker, _)| token.contains(marker))
+            {
+                return Err(error.clone());
+            }
             match url.as_str() {
                 PROFILE_URL => {
-                    let owner = if token.contains("token-b") { "b" } else { "a" };
+                    // Fixture tokens name their owner: `token-<owner>-...`.
+                    let owner = token
+                        .split("token-")
+                        .nth(1)
+                        .and_then(|rest| rest.split('-').next())
+                        .filter(|owner| !owner.is_empty())
+                        .unwrap_or("a")
+                        .to_owned();
                     Ok(response(
                         200,
                         json!({"account":{"uuid":owner,"email":format!("{owner}@example.invalid")},"organization":{"uuid":format!("org-{owner}"),"subscription_status":"active","rate_limit_tier":"max"}}),
@@ -2360,7 +2971,7 @@ mod tests {
         let snapshot = unavailable.get_snapshot();
         assert!(!snapshot.demo);
         assert!(snapshot.accounts.is_empty());
-        assert!(snapshot.error.unwrap().contains("does not support"));
+        assert_eq!(snapshot.error.unwrap().code, "unsupportedContext");
         assert!(
             RuntimeError::UnsupportedContext
                 .message("ro")
@@ -2369,6 +2980,18 @@ mod tests {
         assert_eq!(
             unavailable.import_current().await.unwrap_err(),
             RuntimeError::ReadOnly
+        );
+        // A blocking environment variable is named (never its value) instead of an
+        // unexplained empty window.
+        let blocked =
+            RuntimeHandle::unavailable(RuntimeError::UnsupportedEnvironment("ANTHROPIC_API_KEY"));
+        let error = blocked.get_snapshot().error.unwrap();
+        assert_eq!(error.code, "unsupportedEnvironment");
+        assert_eq!(error.param.as_deref(), Some("ANTHROPIC_API_KEY"));
+        assert!(
+            RuntimeError::UnsupportedEnvironment("ANTHROPIC_API_KEY")
+                .message("ro")
+                .contains("ANTHROPIC_API_KEY")
         );
     }
     #[tokio::test]
@@ -2453,14 +3076,24 @@ mod tests {
     }
     #[tokio::test]
     async fn external_writer_during_profile_cannot_poison_saved_account() {
+        // Another account's login while the owner check awaits: nothing is adopted.
         let fake = Arc::new(Fake::default());
         let (temp, handle, _clock, paths) =
             fixture(vec![account("a", 1000)], Some("a"), 1000, fake.clone());
-        let credentials = paths.credentials_file.clone();
+        let (credentials, config) = (
+            paths.credentials_file.clone(),
+            paths.global_config_file.clone(),
+        );
         *fake.hook.lock().unwrap() = Some(Box::new(move |_| {
             std::fs::write(
                 credentials,
                 serde_json::to_vec(&json!({"claudeAiOauth":{"accessToken":"external-token"}}))
+                    .unwrap(),
+            )
+            .unwrap();
+            std::fs::write(
+                config,
+                serde_json::to_vec(&json!({"oauthAccount":{"accountUuid":"external-owner"}}))
                     .unwrap(),
             )
             .unwrap();
@@ -2474,6 +3107,47 @@ mod tests {
         assert_eq!(saved.accounts[0].access_token(), Some("token-a-SENTINEL"));
         assert!(!saved.accounts[0].identity_verified);
         assert_eq!(count(&fake, INFERENCE_URL), 0);
+    }
+    #[tokio::test]
+    async fn cli_token_rotation_during_the_owner_check_is_adopted_only_once_verified() {
+        // The CLI rotates the active account's token while its owner is checked. That
+        // is not an external login: the read continues with the token it proved, and
+        // the rotated token is adopted only after its own owner check.
+        let fake = Arc::new(Fake::default());
+        let (temp, handle, clock, paths) = fixture(
+            vec![account("a", 1000), account("b", 1000)],
+            Some("a"),
+            1000,
+            fake.clone(),
+        );
+        let credentials = paths.credentials_file.clone();
+        *fake.hook.lock().unwrap() = Some(Box::new(move |_| {
+            std::fs::write(
+                credentials,
+                serde_json::to_vec(&json!({"claudeAiOauth":{"accessToken":"token-a-rotated-SENTINEL","refreshToken":"refresh-a-rotated-SENTINEL"}}))
+                    .unwrap(),
+            )
+            .unwrap();
+        }));
+        handle.tick(true).await.unwrap();
+        let vault = Vault::with_key(temp.path().join("vault"), [7; 32]).unwrap();
+        let saved = vault.load::<Persisted>(RECORD).unwrap().unwrap();
+        let a = saved.accounts.iter().find(|a| a.id == "a").unwrap();
+        assert_eq!(a.access_token(), Some("token-a-SENTINEL"));
+        let snapshot = handle.get_snapshot();
+        assert!(snapshot.accounts.iter().all(|a| a.decision_fresh));
+        clock.0.store(1300, Ordering::SeqCst);
+        let profiles = count(&fake, PROFILE_URL);
+        handle.tick(true).await.unwrap();
+        assert_eq!(count(&fake, PROFILE_URL), profiles + 1);
+        let saved = vault.load::<Persisted>(RECORD).unwrap().unwrap();
+        let a = saved.accounts.iter().find(|a| a.id == "a").unwrap();
+        assert_eq!(a.access_token(), Some("token-a-rotated-SENTINEL"));
+        assert_eq!(a.refresh_token(), Some("refresh-a-rotated-SENTINEL"));
+        // The other account's reading was never invalidated by the rotation.
+        let b = handle.get_snapshot();
+        let b = b.accounts.iter().find(|a| a.id == "b").unwrap();
+        assert!(b.identity_verified && b.decision_fresh && b.error.is_none());
     }
     #[tokio::test]
     async fn mismatched_profile_blocks_manual_switch_without_active_writes() {
@@ -2695,7 +3369,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push_back((INFERENCE_URL, Err(ClientError::Transport)));
-            let expected = engine.live().unwrap().fingerprint;
+            let expected = engine.live().unwrap().identity_fingerprint;
             engine.prime("b", &expected).await.unwrap();
         }
         let vault = Vault::with_key(temp.path().join("vault"), [7; 32]).unwrap();
@@ -2705,7 +3379,7 @@ mod tests {
         clock.0.store(1030, Ordering::SeqCst);
         {
             let mut engine = handle.inner.owner.lock().await;
-            let expected = engine.live().unwrap().fingerprint;
+            let expected = engine.live().unwrap().identity_fingerprint;
             engine.prime("b", &expected).await.unwrap();
         }
         assert_eq!(count(&fake, INFERENCE_URL), 1);
@@ -2717,7 +3391,7 @@ mod tests {
                 .unwrap()
                 .seven_day
                 .resets_at = Some(90000);
-            let expected = engine.live().unwrap().fingerprint;
+            let expected = engine.live().unwrap().identity_fingerprint;
             engine.prime("b", &expected).await.unwrap();
             assert_eq!(engine.saved.accounts[0].primed_for_reset_at, Some(900));
             assert_eq!(engine.saved.accounts[0].priming_pending_for, None);
@@ -2834,7 +3508,7 @@ mod tests {
                 ..UsageLimit::default()
             },
         ]);
-        let expected = engine.live().unwrap().fingerprint;
+        let expected = engine.live().unwrap().identity_fingerprint;
         engine.prime("b", &expected).await.unwrap();
         let usage = engine.saved.accounts[0].last_usage.as_ref().unwrap();
         assert_eq!(usage.weekly_utilization(), 20.0);
@@ -3063,7 +3737,8 @@ mod tests {
             ro.accounts[0].resets.last_outcome.as_deref(),
             Some("reset deja folosit")
         );
-        assert!(ro.accounts[0].error.as_ref().unwrap().contains("proaspătă"));
+        // Untrusted legacy text becomes a stable, language-independent code.
+        assert_eq!(ro.accounts[0].error.as_deref(), Some("providerError"));
         let mut settings: Settings = ro.settings.into();
         settings.language = "en".into();
         let en = handle.update_settings(settings).await.unwrap();
@@ -3071,18 +3746,67 @@ mod tests {
             en.accounts[0].resets.last_outcome.as_deref(),
             Some("reset already used")
         );
-        assert!(
-            en.accounts[0]
-                .error
-                .as_ref()
-                .unwrap()
-                .contains("fresh reading")
-        );
+        assert_eq!(en.accounts[0].error.as_deref(), Some("providerError"));
+        // Messages persisted by earlier releases keep their meaning.
+        for (text, code) in [
+            (
+                "Token ownership could not be verified for this account.",
+                "identityError",
+            ),
+            (
+                "Autentificarea Claude s-a schimbat. Reîmprospătează înainte de a continua.",
+                "externalChange",
+            ),
+            (
+                "Claude did not provide a fresh reading. Try again later.",
+                "providerError",
+            ),
+            ("signInRequired", "signInRequired"),
+        ] {
+            assert_eq!(error_code(text), code);
+        }
         assert!(!RuntimeError::Storage.message("ro").contains('?'));
         assert_eq!(
             RuntimeError::Storage.message("en"),
             RuntimeError::Storage.to_string()
         );
+    }
+    /// Rejected commands reach the renderer as `message(locale)` text, which it maps
+    /// back to catalog keys; snapshot errors carry the keys themselves. Both only work
+    /// if every message equals its catalog value exactly in both languages.
+    #[test]
+    fn runtime_error_texts_equal_the_renderer_catalog_entries() {
+        let locales = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../apps/desktop/src/lib/locales");
+        let catalog = |file: &str| std::fs::read_to_string(locales.join(file)).unwrap();
+        let (en, ro) = (catalog("en.ts"), catalog("ro.ts"));
+        let entry = |source: &str, key: &str| -> String {
+            let start = source
+                .find(&format!("\n  {key}:"))
+                .unwrap_or_else(|| panic!("catalog key {key} is missing"));
+            let rest = &source[start + key.len() + 4..];
+            let rest = rest.trim_start();
+            let quote = rest.chars().next().unwrap();
+            let body = &rest[1..];
+            body[..body.find(quote).unwrap()].replace("\\'", "'")
+        };
+        let mut errors = KNOWN_ERRORS.to_vec();
+        errors.push(RuntimeError::UnsupportedEnvironment("ANTHROPIC_API_KEY"));
+        errors.push(RuntimeError::UnsupportedSetting("apiKeyHelper"));
+        for error in errors {
+            for (source, locale) in [(&en, "en"), (&ro, "ro")] {
+                let mut expected = entry(source, error.code());
+                if let Some(name) = error.param() {
+                    expected = expected.replace("{name}", name);
+                }
+                assert_eq!(
+                    error.message(locale),
+                    expected,
+                    "{} ({locale})",
+                    error.code()
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -3153,5 +3877,736 @@ mod tests {
             Some(CodexReason::VaultUnavailable)
         );
         assert!(fake.calls.lock().unwrap().is_empty());
+    }
+
+    // Reliability regressions from the review of daily multi-account use.
+    fn infer(five: &str, seven: &str) -> HttpResponse {
+        HttpResponse {
+            status: 200,
+            body: json!({"usage":{"input_tokens":1,"output_tokens":1}}),
+            headers: BTreeMap::from([
+                (
+                    "anthropic-ratelimit-unified-5h-utilization".into(),
+                    five.into(),
+                ),
+                (
+                    "anthropic-ratelimit-unified-7d-utilization".into(),
+                    seven.into(),
+                ),
+                (
+                    "anthropic-ratelimit-unified-5h-reset".into(),
+                    "10000".into(),
+                ),
+                (
+                    "anthropic-ratelimit-unified-7d-reset".into(),
+                    "90000".into(),
+                ),
+            ]),
+        }
+    }
+    fn read_json(path: &std::path::Path) -> Value {
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+    /// Claude Code rewrites its own bookkeeping in both files at any time: startup
+    /// counters and project statistics in `~/.claude.json`, MCP tokens next to its login.
+    fn touch_cli(paths: &CliPaths) {
+        for (path, key) in [
+            (&paths.global_config_file, "numStartups"),
+            (&paths.credentials_file, "mcpOAuth"),
+        ] {
+            let mut value = read_json(path);
+            value[key] = json!(value[key].as_i64().unwrap_or(0) + 1);
+            std::fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+        }
+    }
+    fn saved_record(temp: &tempfile::TempDir) -> Persisted {
+        Vault::with_key(temp.path().join("vault"), [7; 32])
+            .unwrap()
+            .load::<Persisted>(RECORD)
+            .unwrap()
+            .unwrap()
+    }
+    fn view(handle: &RuntimeHandle, id: &str) -> AccountView {
+        handle
+            .get_snapshot()
+            .accounts
+            .into_iter()
+            .find(|a| a.id == id)
+            .unwrap()
+    }
+    fn owner_reply(owner: &str) -> (&'static str, Result<HttpResponse, ClientError>) {
+        (
+            PROFILE_URL,
+            Ok(response(
+                200,
+                json!({"account":{"uuid":owner},"organization":{"uuid":format!("org-{owner}")}}),
+            )),
+        )
+    }
+    fn grant(usable_now: bool, ends_at: Option<i64>) -> ResetStatus {
+        ResetStatus {
+            grants: vec![ResetGrant {
+                id: "g".into(),
+                resets_left: 1,
+                usable_now,
+                ends_at,
+                ..ResetGrant::default()
+            }],
+            ..ResetStatus::default()
+        }
+    }
+    #[tokio::test]
+    async fn ordinary_tick_switches_automatically_at_the_threshold() {
+        let fake = Arc::new(Fake::default());
+        let (_temp, handle, clock, _paths) = fixture(
+            vec![account("a", 1000), account("b", 1000)],
+            Some("a"),
+            1000,
+            fake.clone(),
+        );
+        handle.tick(true).await.unwrap();
+        handle
+            .inner
+            .owner
+            .lock()
+            .await
+            .saved
+            .settings
+            .auto_switch_enabled = true;
+        clock.0.store(1300, Ordering::SeqCst);
+        fake.replies
+            .lock()
+            .unwrap()
+            .push_back((INFERENCE_URL, Ok(infer("0.96", "0.2"))));
+        handle.tick(true).await.unwrap();
+        assert_eq!(handle.get_snapshot().active_id.as_deref(), Some("b"));
+    }
+    #[tokio::test]
+    async fn unrelated_cli_writes_never_invalidate_readings_or_block_auto_switch() {
+        let fake = Arc::new(Fake::default());
+        let (_temp, handle, clock, paths) = fixture(
+            vec![account("a", 1000), account("b", 1000)],
+            Some("a"),
+            1000,
+            fake.clone(),
+        );
+        handle.tick(true).await.unwrap();
+        handle
+            .inner
+            .owner
+            .lock()
+            .await
+            .saved
+            .settings
+            .auto_switch_enabled = true;
+        clock.0.store(1300, Ordering::SeqCst);
+        let profiles = count(&fake, PROFILE_URL);
+        touch_cli(&paths);
+        fake.replies
+            .lock()
+            .unwrap()
+            .push_back((INFERENCE_URL, Ok(infer("0.96", "0.2"))));
+        handle.tick(true).await.unwrap();
+        let snapshot = handle.get_snapshot();
+        assert_eq!(snapshot.active_id.as_deref(), Some("b"));
+        assert!(snapshot.error.is_none());
+        let a = view(&handle, "a");
+        assert!(a.identity_verified && a.error.is_none());
+        // No account had to prove its owner again.
+        assert_eq!(count(&fake, PROFILE_URL), profiles);
+        // The switch patched only the login and kept the CLI's own keys.
+        let config = read_json(&paths.global_config_file);
+        assert_eq!(config["numStartups"], 1);
+        assert_eq!(config["keep"], true);
+        assert_eq!(config["oauthAccount"]["accountUuid"], "b");
+        let auth = read_json(&paths.credentials_file);
+        assert_eq!(auth["mcpOAuth"], 1);
+        assert_eq!(auth["claudeAiOauth"]["accessToken"], "token-b-SENTINEL");
+    }
+    #[tokio::test]
+    async fn another_accounts_login_invalidates_only_the_previous_and_new_active_accounts() {
+        let fake = Arc::new(Fake::default());
+        let (_temp, handle, _clock, paths) = fixture(
+            vec![account("a", 1000), account("b", 1000), account("c", 1000)],
+            Some("a"),
+            1000,
+            fake.clone(),
+        );
+        handle.tick(true).await.unwrap();
+        assert!(
+            handle
+                .get_snapshot()
+                .accounts
+                .iter()
+                .all(|a| a.identity_verified && a.decision_fresh)
+        );
+        // Claude Code is logged into b outside PrimerSwitch.
+        let b = account("b", 1000);
+        std::fs::write(
+            &paths.credentials_file,
+            serde_json::to_vec(&b.credentials).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            &paths.global_config_file,
+            serde_json::to_vec(&json!({"oauthAccount":b.oauth_account,"keep":true})).unwrap(),
+        )
+        .unwrap();
+        let mut engine = handle.inner.owner.lock().await;
+        engine.observe_active().unwrap();
+        assert_eq!(engine.active_id.as_deref(), Some("b"));
+        for id in ["a", "b"] {
+            let i = engine.index(id).unwrap();
+            assert!(!engine.saved.accounts[i].identity_verified);
+            assert!(!engine.saved.readings[id].complete);
+        }
+        let c = engine.index("c").unwrap();
+        assert!(engine.fresh(&engine.saved.accounts[c]));
+    }
+    #[tokio::test]
+    async fn fast_tick_auto_switch_works_with_a_configured_default_model() {
+        let fake = Arc::new(Fake::default());
+        let (_temp, handle, clock, paths) = fixture(
+            vec![account("a", 1000), account("b", 1000)],
+            Some("a"),
+            1000,
+            fake.clone(),
+        );
+        std::fs::write(&paths.settings_file, br#"{"model":"opus"}"#).unwrap();
+        handle.tick(true).await.unwrap();
+        handle
+            .inner
+            .owner
+            .lock()
+            .await
+            .saved
+            .settings
+            .auto_switch_enabled = true;
+        clock.0.store(1300, Ordering::SeqCst);
+        fake.replies
+            .lock()
+            .unwrap()
+            .push_back((INFERENCE_URL, Ok(infer("0.96", "0.2"))));
+        let (inferences, usage) = (count(&fake, INFERENCE_URL), count(&fake, USAGE_URL));
+        handle.tick(false).await.unwrap();
+        let snapshot = handle.get_snapshot();
+        assert_eq!(snapshot.active_id.as_deref(), Some("b"));
+        assert!(snapshot.error.is_none());
+        // One read of the active account and one revalidation of the target, both by
+        // inference: the strict fast tick still sends no metadata request.
+        assert_eq!(count(&fake, INFERENCE_URL), inferences + 2);
+        assert_eq!(count(&fake, USAGE_URL), usage);
+    }
+    #[tokio::test]
+    async fn switching_away_after_restart_never_rechecks_an_unchanged_expired_cli_token() {
+        let fake = Arc::new(Fake::default());
+        let mut a = account("a", 1000);
+        a.credentials["claudeAiOauth"]["expiresAt"] = json!(500_000);
+        let (_temp, handle, _clock, paths) =
+            fixture(vec![a, account("b", 1000)], Some("a"), 1000, fake.clone());
+        // Any owner check of the CLI's expired token would be refused.
+        fake.replies.lock().unwrap().push_back(owner_reply("b"));
+        fake.replies
+            .lock()
+            .unwrap()
+            .push_back((PROFILE_URL, Ok(response(401, Value::Null))));
+        handle.switch_account("b").await.unwrap();
+        let snapshot = handle.get_snapshot();
+        assert_eq!(snapshot.active_id.as_deref(), Some("b"));
+        assert!(snapshot.notice.is_none());
+        // Only the target's owner was checked.
+        assert_eq!(count(&fake, PROFILE_URL), 1);
+        assert_eq!(
+            read_json(&paths.credentials_file)["claudeAiOauth"]["accessToken"],
+            "token-b-SENTINEL"
+        );
+    }
+    #[tokio::test]
+    async fn an_unverifiable_rotated_cli_token_is_kept_when_switching_away_and_adopted_once_proven()
+    {
+        let fake = Arc::new(Fake::default());
+        let (temp, handle, clock, paths) = fixture(
+            vec![account("a", 1000), account("b", 1000)],
+            Some("a"),
+            1000,
+            fake.clone(),
+        );
+        // While PrimerSwitch was closed the CLI rotated a's token, which then expired.
+        let cli = json!({"accessToken":"token-a-cli-SENTINEL","refreshToken":"refresh-a-cli-SENTINEL","expiresAt":500_000});
+        std::fs::write(
+            &paths.credentials_file,
+            serde_json::to_vec(&json!({"preserve":true,"claudeAiOauth":cli})).unwrap(),
+        )
+        .unwrap();
+        fake.replies.lock().unwrap().push_back(owner_reply("b"));
+        fake.replies
+            .lock()
+            .unwrap()
+            .push_back((PROFILE_URL, Ok(response(401, Value::Null))));
+        handle.switch_account("b").await.unwrap();
+        let snapshot = handle.get_snapshot();
+        assert_eq!(snapshot.active_id.as_deref(), Some("b"));
+        let notice = snapshot.notice.clone().unwrap();
+        assert_eq!(
+            (notice.code.as_str(), notice.account_id.as_deref()),
+            ("outgoingUnverified", Some("a"))
+        );
+        assert!(
+            !serde_json::to_string(&snapshot)
+                .unwrap()
+                .contains("SENTINEL")
+        );
+        // The saved copy is kept; the CLI's newer blob is preserved, not adopted.
+        let record = saved_record(&temp);
+        let a = record.accounts.iter().find(|a| a.id == "a").unwrap();
+        assert_eq!(a.access_token(), Some("token-a-SENTINEL"));
+        assert_eq!(record.readings["a"].unverified_oauth.as_ref(), Some(&cli));
+        // On a's next read the preserved blob is refreshed, proven and adopted.
+        clock.0.store(1300, Ordering::SeqCst);
+        fake.replies.lock().unwrap().push_back((
+            TOKEN_URL,
+            Ok(response(
+                200,
+                json!({"access_token":"token-a-renewed-SENTINEL","refresh_token":"refresh-a-renewed-SENTINEL","expires_in":28800}),
+            )),
+        ));
+        handle.tick(true).await.unwrap();
+        let refreshed_with = fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|c| c.url == TOKEN_URL)
+            .map(|c| c.body.as_ref().unwrap()["refresh_token"].clone());
+        assert_eq!(refreshed_with, Some(json!("refresh-a-cli-SENTINEL")));
+        let record = saved_record(&temp);
+        let a = record.accounts.iter().find(|a| a.id == "a").unwrap();
+        assert_eq!(a.access_token(), Some("token-a-renewed-SENTINEL"));
+        assert_eq!(a.refresh_token(), Some("refresh-a-renewed-SENTINEL"));
+        assert!(record.readings["a"].unverified_oauth.is_none());
+        let a = view(&handle, "a");
+        assert!(a.identity_verified && a.error.is_none());
+    }
+    #[tokio::test]
+    async fn an_outgoing_cli_token_owned_by_another_account_still_blocks_the_switch() {
+        let fake = Arc::new(Fake::default());
+        let (_temp, handle, _clock, paths) = fixture(
+            vec![account("a", 1000), account("b", 1000)],
+            Some("a"),
+            1000,
+            fake.clone(),
+        );
+        std::fs::write(
+            &paths.credentials_file,
+            serde_json::to_vec(&json!({"claudeAiOauth":{"accessToken":"token-x-SENTINEL"}}))
+                .unwrap(),
+        )
+        .unwrap();
+        let before = std::fs::read(&paths.credentials_file).unwrap();
+        fake.replies.lock().unwrap().push_back(owner_reply("b"));
+        fake.replies
+            .lock()
+            .unwrap()
+            .push_back(owner_reply("intruder"));
+        assert_eq!(
+            handle.switch_account("b").await.unwrap_err(),
+            RuntimeError::Identity
+        );
+        assert_eq!(std::fs::read(&paths.credentials_file).unwrap(), before);
+        assert_eq!(handle.get_snapshot().active_id.as_deref(), Some("a"));
+    }
+    #[tokio::test]
+    async fn holding_a_grant_alone_costs_no_reset_preflight_and_never_blocks_switching() {
+        let fake = Arc::new(Fake::default());
+        let (_temp, handle, clock, _paths) = fixture(
+            vec![account("a", 1000), account("b", 1000)],
+            Some("a"),
+            1000,
+            fake.clone(),
+        );
+        handle.tick(true).await.unwrap();
+        {
+            let mut e = handle.inner.owner.lock().await;
+            e.saved.settings.auto_switch_enabled = true;
+            e.saved.settings.auto_use_resets_enabled = true;
+            let i = e.index("b").unwrap();
+            e.saved.accounts[i].reset_status = Some(grant(false, None));
+            e.saved.accounts[i].reset_status_at = Some(1000);
+        }
+        clock.0.store(1300, Ordering::SeqCst);
+        fake.replies
+            .lock()
+            .unwrap()
+            .push_back((INFERENCE_URL, Ok(infer("0.96", "0.2"))));
+        let usage = count(&fake, USAGE_URL);
+        handle.tick(true).await.unwrap();
+        assert_eq!(handle.get_snapshot().active_id.as_deref(), Some("b"));
+        // Only the switch target's own revalidation; no read just for the banked grant.
+        assert_eq!(count(&fake, USAGE_URL), usage + 1);
+    }
+    #[tokio::test]
+    async fn a_failed_reset_revalidation_skips_only_that_account() {
+        let fake = Arc::new(Fake::default());
+        let (_temp, handle, clock, _paths) = fixture(
+            vec![account("a", 1000), account("b", 1000), account("c", 1000)],
+            Some("a"),
+            1000,
+            fake.clone(),
+        );
+        handle.tick(true).await.unwrap();
+        {
+            let mut e = handle.inner.owner.lock().await;
+            e.saved.settings.auto_switch_enabled = true;
+            e.saved.settings.auto_use_resets_enabled = true;
+            // c holds an offer expiring within three hours and sits at its real limit,
+            // so the expiry guard wants to use it.
+            let i = e.index("c").unwrap();
+            e.saved.accounts[i]
+                .last_usage
+                .as_mut()
+                .unwrap()
+                .five_hour
+                .utilization = 100.0;
+            e.saved.accounts[i].reset_status = Some(grant(true, Some(4900)));
+            e.saved.accounts[i].reset_status_at = Some(1000);
+        }
+        clock.0.store(1300, Ordering::SeqCst);
+        fake.failing_usage.lock().unwrap().push((
+            "token-c",
+            ClientError::RateLimited {
+                retry_after: Some(60),
+            },
+        ));
+        fake.replies
+            .lock()
+            .unwrap()
+            .push_back((INFERENCE_URL, Ok(infer("0.96", "0.2"))));
+        handle.tick(true).await.unwrap();
+        assert_eq!(handle.get_snapshot().active_id.as_deref(), Some("b"));
+        assert!(
+            !fake
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.url.ends_with("/reset_rate_limits"))
+        );
+        let engine = handle.inner.owner.lock().await;
+        let c = engine.index("c").unwrap();
+        assert!(engine.saved.accounts[c].rate_limited_until.is_some());
+    }
+    #[tokio::test]
+    async fn a_failed_automatic_switch_notifies_once_and_names_its_target() {
+        let fake = Arc::new(Fake::default());
+        let (_temp, handle, clock, _paths) = fixture(
+            vec![account("a", 1000), account("b", 1000)],
+            Some("a"),
+            1000,
+            fake.clone(),
+        );
+        handle.tick(true).await.unwrap();
+        handle
+            .inner
+            .owner
+            .lock()
+            .await
+            .saved
+            .settings
+            .auto_switch_enabled = true;
+        let mut notices = handle.notifications();
+        clock.0.store(1300, Ordering::SeqCst);
+        // The target cannot be revalidated, so the switch must not happen.
+        fake.failing_usage.lock().unwrap().push((
+            "token-b",
+            ClientError::RateLimited {
+                retry_after: Some(60),
+            },
+        ));
+        fake.replies
+            .lock()
+            .unwrap()
+            .push_back((INFERENCE_URL, Ok(infer("0.96", "0.2"))));
+        assert_eq!(handle.tick(true).await.unwrap_err(), RuntimeError::Provider);
+        let snapshot = handle.get_snapshot();
+        assert_eq!(snapshot.active_id.as_deref(), Some("a"));
+        let error = snapshot.error.unwrap();
+        assert_eq!(error.code, "providerError");
+        assert_eq!(error.account_id.as_deref(), Some("b"));
+        assert_eq!(error.action.as_deref(), Some("autoSwitch"));
+        let notice = notices.try_recv().unwrap();
+        assert!(notice.body.contains("b@example.invalid"));
+        assert!(notice.body.contains("automatically"));
+        // A repeat for the same target and cause stays in the window for 30 minutes.
+        let mut engine = handle.inner.owner.lock().await;
+        engine.switch_failed("b", &RuntimeError::Provider, 1400);
+        assert!(notices.try_recv().is_err());
+        engine.switch_failed("b", &RuntimeError::Provider, 1300 + SWITCH_FAILURE_NOTICE);
+        assert!(notices.try_recv().is_ok());
+    }
+    #[tokio::test]
+    async fn the_all_exhausted_notification_names_who_frees_up_first_and_when() {
+        let fake = Arc::new(Fake::default());
+        let (_temp, handle, clock, _paths) = fixture(
+            vec![account("a", 1000), account("b", 1000)],
+            Some("a"),
+            1000,
+            fake.clone(),
+        );
+        handle.tick(true).await.unwrap();
+        {
+            let mut e = handle.inner.owner.lock().await;
+            let i = e.index("b").unwrap();
+            let five = &mut e.saved.accounts[i].last_usage.as_mut().unwrap().five_hour;
+            five.utilization = 99.0;
+            five.resets_at = Some(5000);
+        }
+        let mut notices = handle.notifications();
+        clock.0.store(1300, Ordering::SeqCst);
+        fake.replies
+            .lock()
+            .unwrap()
+            .push_back((INFERENCE_URL, Ok(infer("0.96", "0.2"))));
+        handle.tick(true).await.unwrap();
+        let body = notices.try_recv().unwrap().body;
+        assert!(body.starts_with("All accounts are at their limits."));
+        assert!(body.contains("b@example.invalid frees up first, in 1h 2m"));
+        assert_eq!(view(&handle, "b").frees_at, Some(5000));
+        assert_eq!(view(&handle, "a").frees_at, Some(10000));
+    }
+    #[tokio::test]
+    async fn the_weekly_window_notification_names_the_account() {
+        let fake = Arc::new(Fake::default());
+        let (_temp, handle, _clock, _paths) =
+            fixture(vec![account("b", 1000)], None, 1000, fake.clone());
+        handle.tick(true).await.unwrap();
+        let mut notices = handle.notifications();
+        let mut engine = handle.inner.owner.lock().await;
+        engine.saved.settings.auto_start_window_enabled = true;
+        engine.saved.accounts[0].expected_weekly_reset_at = Some(900);
+        let expected = engine.live().unwrap().identity_fingerprint;
+        engine.prime("b", &expected).await.unwrap();
+        assert_eq!(
+            notices.try_recv().unwrap().body,
+            "The weekly window was started for b@example.invalid."
+        );
+    }
+    #[tokio::test]
+    async fn a_refused_refresh_token_asks_to_sign_in_again_and_stops_background_retries() {
+        let fake = Arc::new(Fake::default());
+        let mut b = account("b", 1000);
+        b.credentials["claudeAiOauth"]["expiresAt"] = json!(0);
+        let (_temp, handle, clock, _paths) =
+            fixture(vec![account("a", 1000), b], Some("a"), 1000, fake.clone());
+        let refused = || {
+            (
+                TOKEN_URL,
+                Ok(response(400, json!({"error":"invalid_grant"}))),
+            )
+        };
+        fake.replies.lock().unwrap().push_back(refused());
+        handle.tick(true).await.unwrap();
+        let b = view(&handle, "b");
+        assert!(b.sign_in_required);
+        assert_eq!(b.error.as_deref(), Some("signInRequired"));
+        assert!(!b.decision_fresh);
+        assert_eq!(count(&fake, TOKEN_URL), 1);
+        // Background cycles stop asking instead of failing every 15 minutes...
+        for now in [1300, 2200, 40_000] {
+            clock.0.store(now, Ordering::SeqCst);
+            handle.tick(true).await.unwrap();
+        }
+        assert_eq!(count(&fake, TOKEN_URL), 1);
+        // ...apart from one retry a day.
+        clock.0.store(1000 + SIGN_IN_RETRY + 1, Ordering::SeqCst);
+        fake.replies.lock().unwrap().push_back(refused());
+        handle.tick(true).await.unwrap();
+        assert_eq!(count(&fake, TOKEN_URL), 2);
+        assert!(view(&handle, "b").sign_in_required);
+        // An explicit refresh retries at once; success clears the state.
+        handle.refresh_account("b").await.unwrap();
+        assert_eq!(count(&fake, TOKEN_URL), 3);
+        let b = view(&handle, "b");
+        assert!(!b.sign_in_required && b.error.is_none() && b.identity_verified);
+    }
+    #[tokio::test]
+    async fn a_new_sign_in_clears_the_sign_in_state() {
+        let fake = Arc::new(Fake::default());
+        let (_temp, handle, _clock, _paths) = fixture(
+            vec![account("a", 1000), account("b", 1000)],
+            Some("a"),
+            1000,
+            fake,
+        );
+        let mut engine = handle.inner.owner.lock().await;
+        let reading = engine.saved.readings.get_mut("b").unwrap();
+        reading.sign_in_required = true;
+        reading.error = Some("signInRequired".into());
+        reading.unverified_oauth = Some(json!({"accessToken":"stale"}));
+        let mut fresh = account("b", 1000);
+        fresh.id = "new-id".into();
+        engine.merge_account(fresh, true);
+        let reading = &engine.saved.readings["b"];
+        assert!(!reading.sign_in_required);
+        assert!(reading.error.is_none() && reading.unverified_oauth.is_none());
+        assert_eq!(engine.saved.accounts.len(), 2);
+    }
+    #[tokio::test]
+    async fn a_background_failure_of_the_active_account_names_it_until_it_clears() {
+        let fake = Arc::new(Fake::default());
+        let (_temp, handle, clock, _paths) = fixture(
+            vec![account("a", 1000), account("b", 1000)],
+            Some("a"),
+            1000,
+            fake.clone(),
+        );
+        handle.tick(true).await.unwrap();
+        clock.0.store(1300, Ordering::SeqCst);
+        fake.replies
+            .lock()
+            .unwrap()
+            .push_back((INFERENCE_URL, Err(ClientError::Transport)));
+        fake.failing_usage
+            .lock()
+            .unwrap()
+            .push(("token-a", ClientError::Transport));
+        assert_eq!(handle.tick(true).await.unwrap_err(), RuntimeError::Provider);
+        let error = handle.get_snapshot().error.unwrap();
+        assert_eq!(
+            (error.code.as_str(), error.account_id.as_deref()),
+            ("providerError", Some("a"))
+        );
+        assert_eq!(error.action, None);
+        fake.failing_usage.lock().unwrap().clear();
+        clock.0.store(1600, Ordering::SeqCst);
+        handle.tick(true).await.unwrap();
+        assert!(handle.get_snapshot().error.is_none());
+    }
+    #[tokio::test]
+    async fn a_leftover_switch_journal_never_makes_the_runtime_unopenable() {
+        let fake = Arc::new(Fake::default());
+        let (temp, handle, _clock, paths) = fixture(
+            vec![account("a", 1000), account("b", 1000)],
+            Some("a"),
+            1000,
+            fake.clone(),
+        );
+        drop(handle);
+        // An interrupted switch that never wrote, then Claude Code's own writes.
+        let auth = std::fs::read(&paths.credentials_file).unwrap();
+        let config = std::fs::read(&paths.global_config_file).unwrap();
+        let journal = json!({
+            "version": 1, "context": paths.context_id, "backend": "File",
+            "auth": {"before": auth, "after": b"{}".to_vec()},
+            "config": {"before": config, "after": b"{}".to_vec()},
+            "stage": "Prepared"
+        });
+        let vault = Vault::with_key(temp.path().join("vault"), [7; 32]).unwrap();
+        vault
+            .save(&format!("switch-{}", paths.context_id), &journal)
+            .unwrap();
+        touch_cli(&paths);
+        let reopened = RuntimeHandle::from_parts(
+            vault,
+            ActiveStore::file(paths.clone()),
+            ClaudeClient::with_transport("2.1.287", fake.clone()).unwrap(),
+            Arc::new(FakeClock(AtomicI64::new(1000))),
+        )
+        .unwrap();
+        let snapshot = reopened.get_snapshot();
+        assert_eq!(snapshot.accounts.len(), 2);
+        assert_eq!(snapshot.active_id.as_deref(), Some("a"));
+        assert!(snapshot.notice.is_none() && snapshot.error.is_none());
+        reopened.switch_account("b").await.unwrap();
+        assert_eq!(read_json(&paths.global_config_file)["numStartups"], 1);
+    }
+    #[tokio::test]
+    async fn an_inapplicable_journal_is_set_aside_with_a_notice_and_the_window_stays_usable() {
+        let fake = Arc::new(Fake::default());
+        let (temp, handle, _clock, paths) = fixture(
+            vec![account("a", 1000), account("b", 1000)],
+            Some("a"),
+            1000,
+            fake.clone(),
+        );
+        drop(handle);
+        // A journal whose two sides both differ from the current login: another writer
+        // owns it now, so recovery must neither apply nor wait for it.
+        let other = |owner: &str| {
+            (
+                serde_json::to_vec(
+                    &json!({"claudeAiOauth":{"accessToken":format!("{owner}-token")}}),
+                )
+                .unwrap(),
+                serde_json::to_vec(&json!({"oauthAccount":{"accountUuid":owner}})).unwrap(),
+            )
+        };
+        let ((auth_before, config_before), (auth_after, config_after)) = (other("x"), other("y"));
+        let journal = json!({
+            "version": 1, "context": paths.context_id, "backend": "File",
+            "auth": {"before": auth_before, "after": auth_after},
+            "config": {"before": config_before, "after": config_after},
+            "stage": "AuthWritten"
+        });
+        let vault = Vault::with_key(temp.path().join("vault"), [7; 32]).unwrap();
+        let name = format!("switch-{}", paths.context_id);
+        vault.save(&name, &journal).unwrap();
+        let login = (
+            std::fs::read(&paths.credentials_file).unwrap(),
+            std::fs::read(&paths.global_config_file).unwrap(),
+        );
+        let reopened = RuntimeHandle::from_parts(
+            vault,
+            ActiveStore::file(paths.clone()),
+            ClaudeClient::with_transport("2.1.287", fake.clone()).unwrap(),
+            Arc::new(FakeClock(AtomicI64::new(1000))),
+        )
+        .unwrap();
+        let snapshot = reopened.get_snapshot();
+        assert_eq!(snapshot.accounts.len(), 2);
+        assert_eq!(snapshot.active_id.as_deref(), Some("a"));
+        assert_eq!(snapshot.notice.unwrap().code, "switchInterrupted");
+        assert_eq!(
+            (
+                std::fs::read(&paths.credentials_file).unwrap(),
+                std::fs::read(&paths.global_config_file).unwrap()
+            ),
+            login
+        );
+        let vault = Vault::with_key(temp.path().join("vault"), [7; 32]).unwrap();
+        assert!(vault.load::<Value>(&name).unwrap().is_none());
+        assert_eq!(
+            vault
+                .load::<Value>(&format!("{name}-set-aside-1"))
+                .unwrap()
+                .unwrap()["stage"],
+            "AuthWritten"
+        );
+        // Switching works, and a completed switch clears the notice.
+        reopened.switch_account("b").await.unwrap();
+        assert!(reopened.get_snapshot().notice.is_none());
+    }
+    #[tokio::test]
+    async fn an_unreadable_cli_file_at_startup_reports_an_error_instead_of_an_empty_window() {
+        let fake = Arc::new(Fake::default());
+        let (temp, handle, _clock, paths) =
+            fixture(vec![account("a", 1000)], Some("a"), 1000, fake.clone());
+        drop(handle);
+        let config = std::fs::read(&paths.global_config_file).unwrap();
+        std::fs::write(&paths.global_config_file, b"{\"partially written").unwrap();
+        let reopened = RuntimeHandle::from_parts(
+            Vault::with_key(temp.path().join("vault"), [7; 32]).unwrap(),
+            ActiveStore::file(paths.clone()),
+            ClaudeClient::with_transport("2.1.287", fake.clone()).unwrap(),
+            Arc::new(FakeClock(AtomicI64::new(1000))),
+        )
+        .unwrap();
+        let snapshot = reopened.get_snapshot();
+        assert_eq!(snapshot.accounts.len(), 1);
+        assert_eq!(snapshot.error.unwrap().code, "storageError");
+        std::fs::write(&paths.global_config_file, config).unwrap();
+        reopened.tick(true).await.unwrap();
+        let snapshot = reopened.get_snapshot();
+        assert_eq!(snapshot.active_id.as_deref(), Some("a"));
+        assert!(snapshot.error.is_none());
     }
 }

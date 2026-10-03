@@ -2,7 +2,7 @@
   import { language, t, subscriptionLabel } from '../lib/i18n';
   import Ring from './Ring.svelte';
   import { age, date, countdown, percentage } from '../lib/format';
-  import { safeError } from '../lib/controller';
+  import { codeMessage, safeError } from '../lib/controller';
   import type { AccountView } from '../lib/types';
   let {
     account,
@@ -188,7 +188,7 @@
         >{t($language, 'automationWaiting')}</small
       >{/if}
     {#if account.error}<small class="warning-text"
-        >{safeError(account.error, $language)}{account.usage
+        >{codeMessage(account.error, $language)}{account.usage
           ? ' ' + t($language, 'lastReadingKept')
           : ''}</small
       >{/if}

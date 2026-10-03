@@ -12,13 +12,17 @@ import { snapshot, account } from './test/fixtures';
 import type { Bridge } from './lib/bridge';
 import { language, t } from './lib/i18n';
 function setup(raw = snapshot()) {
+  let emit: (snapshot: unknown) => void = () => {};
   const call = vi.fn<Bridge['call']>().mockResolvedValue(raw);
   const controller = createController({
     call,
-    subscribe: async () => () => {},
+    subscribe: async (callback) => {
+      emit = callback;
+      return () => {};
+    },
   });
   render(App, { controller });
-  return { call, controller };
+  return { call, controller, emit: (next: unknown) => emit(next) };
 }
 async function details(name = 'Personal') {
   await fireEvent.click(
@@ -193,7 +197,7 @@ describe('desktop workflows', () => {
       snapshot({
         accounts: [
           account('a', { usage: null, usageAt: null }),
-          account('b', { error: 'Reading failed.', usageAt: 1 }),
+          account('b', { error: 'providerError', usageAt: 1 }),
         ],
       }),
     );
@@ -293,6 +297,68 @@ describe('desktop workflows', () => {
     expect(
       screen.getByRole('button', { name: 'Deschide setările' }),
     ).toBeVisible();
+  });
+  it('names the account in background errors and keeps a dismissed one hidden', async () => {
+    const failing = {
+      code: 'providerError',
+      accountId: 'a',
+      param: null,
+      action: null,
+      at: 5,
+    };
+    const { emit } = setup(snapshot({ error: failing }));
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(`Studio: ${t('en', 'providerError')}`);
+    await fireEvent.click(
+      within(alert).getByRole('button', { name: 'Dismiss message' }),
+    );
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    // The same failure on the next background cycle stays dismissed...
+    emit(snapshot({ revision: 2, error: { ...failing, at: 9 } }));
+    await waitFor(() =>
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument(),
+    );
+    // ...while a different one is shown, naming its account.
+    emit(
+      snapshot({
+        revision: 3,
+        error: {
+          code: 'providerError',
+          accountId: 'b',
+          param: null,
+          action: 'autoSwitch',
+          at: 12,
+        },
+      }),
+    );
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      t('en', 'autoSwitchFailed', {
+        name: 'Personal',
+        reason: t('en', 'providerError'),
+      }),
+    );
+  });
+  it('shows a dismissable notice for an interrupted switch found at startup', async () => {
+    setup(
+      snapshot({
+        notice: {
+          code: 'switchInterrupted',
+          accountId: null,
+          param: null,
+          action: null,
+          at: 3,
+        },
+      }),
+    );
+    const text = await screen.findByText(t('en', 'switchInterrupted'));
+    await fireEvent.click(
+      within(text.parentElement!).getByRole('button', {
+        name: 'Dismiss message',
+      }),
+    );
+    expect(
+      screen.queryByText(t('en', 'switchInterrupted')),
+    ).not.toBeInTheDocument();
   });
   it('updates local countdowns without provider commands', async () => {
     vi.useFakeTimers();

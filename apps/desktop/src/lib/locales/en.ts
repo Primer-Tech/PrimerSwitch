@@ -127,23 +127,40 @@ export const en = {
     'The system vault is locked, unavailable or unsupported. Saved accounts have not been changed.',
   unsupportedContext:
     'This Claude context uses an authentication method or policy that does not support account switching.',
+  unsupportedEnvironment:
+    'Account switching is unavailable while the environment variable {name} is set. Remove it, then restart PrimerSwitch.',
+  unsupportedSetting:
+    "Account switching is unavailable while Claude Code's settings.json contains {name}. Remove that entry, then restart PrimerSwitch.",
   vaultIntegrity:
     'Encrypted data could not be authenticated, or its key is missing. Existing files are retained.',
   missingAccount: 'The account is no longer available.',
   externalChange: 'The Claude login changed. Refresh before continuing.',
   identityError: 'The account identity could not be verified.',
   providerError: 'Claude did not provide a fresh reading. Try again later.',
+  signInRequired:
+    "Claude no longer accepts this account's saved sign-in. Sign in again to keep using it.",
+  activeSessionExpired:
+    "Claude Code's session for this account has expired. Use Claude Code once to renew it, or sign in again there.",
   settingsError: 'The settings are not valid.',
+  readOnlyError: 'This view is read-only.',
   loginExpired: 'The login expired or was canceled.',
   importExpired: 'The import is no longer valid. Select the folder again.',
   pendingResetError:
-    'The previous reset request must be reconciled before another attempt.',
+    'The previous reset request must be confirmed before another attempt.',
   cliVersionError:
     'The Claude Code version could not be detected. Install a recognized version.',
-  browserError: 'The browser could not be opened. Try signing in again.',
-  loginCodeError: 'The authorization code is not valid.',
-  folderError: 'The folder could not be selected.',
+  browserError: 'Could not open the browser. Try signing in again.',
+  loginCodeError: 'The sign-in code is invalid.',
+  folderError: 'Could not select the folder.',
   folderNotLocal: 'The selected folder is not local.',
+  switchInterrupted:
+    'A previous account switch was interrupted. The current Claude Code login was left unchanged; switch again if needed.',
+  switchRecoveryPending:
+    'A previous account switch could not be completed yet. PrimerSwitch finishes it before the next switch.',
+  outgoingUnverified:
+    "Claude Code's sign-in for this account had expired, so it could not be verified while switching away. It was kept and is checked on the next update.",
+  accountError: '{name}: {reason}',
+  autoSwitchFailed: 'Could not switch to {name} automatically. {reason}',
   navigation: 'Navigation',
   accounts: 'Accounts',
   localAccounts: 'Local account manager',

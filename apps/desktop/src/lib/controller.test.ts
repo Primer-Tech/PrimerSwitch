@@ -1,9 +1,16 @@
 import { get } from 'svelte/store';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createController, safeError, type Controller } from './controller';
+import {
+  codeMessage,
+  createController,
+  errorText,
+  safeError,
+  type Controller,
+} from './controller';
 import { snapshot } from '../test/fixtures';
 import { snapshotSchema, defaults } from './types';
 import type { Bridge } from './bridge';
+import { t } from './i18n';
 
 const controllers: Controller[] = [];
 afterEach(() => {
@@ -158,6 +165,78 @@ describe('redacted IPC and runtime reconciliation', () => {
     expect(call).toHaveBeenLastCalledWith('apply_legacy_import', {
       previewId: 'preview-1',
     });
+  });
+  it('maps stable error codes and fixed variable names to catalog text', () => {
+    expect(safeError('providerError', 'ro')).toBe(t('ro', 'providerError'));
+    // Rust replies equal the catalog, so wording about sign-ins is not swallowed.
+    expect(safeError(t('en', 'signInRequired'), 'ro')).toBe(
+      t('ro', 'signInRequired'),
+    );
+    expect(safeError(t('ro', 'identityError'), 'en')).toBe(
+      t('en', 'identityError'),
+    );
+    // A blocking variable is named even when its name contains "TOKEN".
+    const blocked = t('en', 'unsupportedEnvironment', {
+      name: 'ANTHROPIC_AUTH_TOKEN',
+    });
+    expect(safeError(blocked, 'ro')).toBe(
+      t('ro', 'unsupportedEnvironment', { name: 'ANTHROPIC_AUTH_TOKEN' }),
+    );
+    expect(
+      safeError(
+        t('en', 'unsupportedEnvironment', { name: 'leaked secret value' }),
+        'en',
+      ),
+    ).toBe(t('en', 'failedAction'));
+    expect(codeMessage('notACatalogKey', 'en')).toBe(t('en', 'failedAction'));
+    expect(codeMessage('unsupportedSetting', 'en', 'apiKeyHelper')).toContain(
+      'apiKeyHelper',
+    );
+    const accounts = snapshot().accounts;
+    expect(
+      errorText(
+        {
+          code: 'providerError',
+          accountId: 'a',
+          param: null,
+          action: null,
+          at: 1,
+        },
+        accounts,
+        'en',
+      ),
+    ).toBe(`Studio: ${t('en', 'providerError')}`);
+    expect(
+      errorText(
+        {
+          code: 'providerError',
+          accountId: 'b',
+          param: null,
+          action: 'autoSwitch',
+          at: 1,
+        },
+        accounts,
+        'ro',
+      ),
+    ).toBe(
+      t('ro', 'autoSwitchFailed', {
+        name: 'Personal',
+        reason: t('ro', 'providerError'),
+      }),
+    );
+    expect(
+      snapshotSchema.safeParse(
+        snapshot({
+          error: {
+            code: 'provider error <b>',
+            accountId: null,
+            param: null,
+            action: null,
+            at: 1,
+          },
+        }),
+      ).success,
+    ).toBe(false);
   });
   it('enforces all default settings and valid bounds', () => {
     expect(defaults).toEqual({

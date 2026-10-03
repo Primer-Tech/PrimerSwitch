@@ -492,6 +492,10 @@ impl RuntimeHandle {
         if let Err(error) = engine.observe_active() {
             engine.error = Some(error.view(None, None, now));
         }
+        // The notice concerns the login that is active now: name it in the status.
+        if let Some(notice) = engine.notice.as_mut() {
+            notice.account_id = engine.active_id.clone();
+        }
         let snapshot = engine.snapshot(false);
         Ok(Self {
             inner: Arc::new(Inner {
@@ -4564,7 +4568,11 @@ mod tests {
         let snapshot = reopened.get_snapshot();
         assert_eq!(snapshot.accounts.len(), 2);
         assert_eq!(snapshot.active_id.as_deref(), Some("a"));
-        assert_eq!(snapshot.notice.unwrap().code, "switchInterrupted");
+        let notice = snapshot.notice.unwrap();
+        assert_eq!(
+            (notice.code.as_str(), notice.account_id.as_deref()),
+            ("switchInterrupted", Some("a"))
+        );
         assert_eq!(
             (
                 std::fs::read(&paths.credentials_file).unwrap(),

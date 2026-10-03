@@ -433,6 +433,10 @@ mod mac {
             .find_generic_password(SERVICE, ACCOUNT)
             .map_err(|_| PlatformError::Conflict)?;
         let old_bytes = old_password.to_owned();
+        // Release the buffer returned by SecKeychainFindGenericPassword before
+        // deleting the item; Security.framework can otherwise wait on the
+        // content allocation while the keychain record is being replaced.
+        drop(old_password);
         item.delete();
 
         if keychain

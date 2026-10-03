@@ -30,9 +30,21 @@ Resumed conversations carry encrypted reasoning that belongs to the previous acc
 
 ## Usage readings
 
-The active account is read every 10 minutes through your Codex home (skipped while its token is about to expire, so Codex refreshes it first). Other accounts are read about once an hour, and sooner after one of their windows resets, each in its own temporary private home; if Codex rotates a token there, the new token is saved. **Refresh** reads one account now; **Refresh all** reads every account. Two rejected readings in a row mark that account **Sign in again** (one can be a temporary refresh failure); it cannot be selected until you sign in once more, and it is retried only every six hours meanwhile. The temporary homes disable Codex's plugin-marketplace sync, so a reading downloads nothing extra.
+The active account is read through your Codex home at the check interval from Settings (5 minutes by default), and every minute while it is within 10 points of the switch threshold or at a limit with automatic switching on; a reading is skipped while its token is about to expire, so Codex refreshes it first. Other accounts are read about once an hour, and sooner after one of their windows resets, each in its own temporary private home; if Codex rotates a token there, the new token is saved. **Refresh** reads one account now; **Refresh all** reads every account. Two rejected readings in a row mark that account **Sign in again** (one can be a temporary refresh failure); it cannot be selected until you sign in once more, and it is retried only every six hours meanwhile. The temporary homes disable Codex's plugin-marketplace sync, so a reading downloads nothing extra.
 
 PrimerSwitch never sends inference requests, never consumes reset credits and never logs out an account. The active account cannot be deleted; switch to another account first.
+
+## Automatic switching
+
+Automatic switching, the switch threshold, the check interval and the weekly reset order in Settings apply to Claude and Codex alike (owner decision, 2026-10-03). Starting the weekly window and using resets stay Claude-only. With automatic switching on, each background check (every minute) decides after its reading: when the active account's reading is fresh (it named this account during this session and is at most 15 minutes old) and either main window, 5-hour or weekly, is at the threshold or Codex reports a limit, PrimerSwitch switches to the next account with exactly the seamless switch described above, so open terminals reconnect. It re-reads the target first when the target's reading is older than 15 minutes. It never switches while a switch or sign-in is running or while the saved accounts are read-only, switches at most once every 10 minutes, and does nothing when no other account is usable. A notification names the new account, why it switched and what open terminals do. A failed automatic switch notifies at most every 30 minutes, and so does the case where every account is at its limit, with the account that frees up first when that is known.
+
+## Which account is next
+
+Rust ranks the Codex accounts with the same rules as Claude, and the **Next best** card shows that account. An account can be next when it is a saved ChatGPT sign-in that can be switched to, its latest reading succeeded, and both main windows are below the threshold with no limit reported (a spent window, a reached-limit flag or blocked included usage). Accounts with both windows at least 5 points below the threshold come first. Then, with **Use the account whose weekly limit resets soonest first** on (the default), the account whose weekly limit resets soonest (to the hour) goes first, which spends quota that would otherwise expire unused; with it off, the account with the most weekly usage left goes first, then the soonest weekly reset. Remaining ties go to the lower 5-hour usage, then a stable order.
+
+## Credits beyond the plan
+
+When an account keeps working on purchased credits, Codex reports more than 100% used. PrimerSwitch shows the real number, fills the bar to 100% and adds **Using credits** to that window when the account has credits. Such an account counts as limited: it is never next, and when it is the active account automatic switching moves to a usable one, so credits are not spent while included usage is available on another account.
 
 ## Data and privacy
 

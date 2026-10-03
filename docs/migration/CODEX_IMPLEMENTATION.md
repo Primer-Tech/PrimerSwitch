@@ -8,7 +8,7 @@ Add a real Codex provider in the same branded desktop app, English by default wi
 
 Deliver isolated managed browser login, import of a supported current CLI login, encrypted saved accounts, guarded manual selection for newly opened clients, provider-native quotas and account deletion. Start with qualified FILE-mode managed ChatGPT contexts. Other modes are preserved/represented or clearly refused; never change the user's storage mode to force compatibility. API-key billing, keyring/auto/ephemeral writes, managed-policy exceptions and other versions need their own gates. Device login is optional only if the pinned stable schema and fake lifecycle are implemented. Existing switcher import waits for its actual name/version.
 
-Adding an account uses a private owned CODEX_HOME so the active login is unchanged. Codex owns OAuth/refresh. No separate OpenAI refresh HTTP implementation, external internal-only chatgptAuthTokens API, dummy inference/quota completion, automatic credit consumption or email nudge. No Codex automatic switching or inherited Claude reset/priming policy in this delivery.
+Adding an account uses a private owned CODEX_HOME so the active login is unchanged. Codex owns OAuth/refresh. No separate OpenAI refresh HTTP implementation, external internal-only chatgptAuthTokens API, dummy inference/quota completion, automatic credit consumption or email nudge. No Codex automatic switching or inherited Claude reset/priming policy in this delivery. Update (owner decision, 2026-10-03): Codex now shares Claude's automatic switching, threshold, check interval and weekly reset order ([CODEX_USAGE.md](CODEX_USAGE.md)); priming, reset redemption and credit consumption remain excluded.
 
 ## Rust ownership and data preservation
 
@@ -26,7 +26,7 @@ Keep Claude's strict DTO unchanged. Add CodexSnapshot with revision, provider, a
 
 Quota retains every native limitId, optional primary/secondary duration/reset, plan, string credit balance, nullable ordinaryUsageAllowed and credit availability. Missing windows stay absent. Do not force Codex into Claude's five-hour/weekly/model/reset fields. Read quotas only through the owned Codex app-server session, initially active/explicit and manual rather than many competing inactive refreshers.
 
-UI owns separate strict schemas/controller, provider selector, Codex dashboard and managed-login/switch dialogs. Keep approved dark branding and global appearance/language. Label existing automation controls Claude-only. Native commands/events use explicit codex prefixes. get_codex_snapshot is cache-only; polling it never invokes provider I/O. Poll managed login completion separately, with cancellation/generation checks, without holding the runtime mutex for browser wait.
+UI owns separate strict schemas/controller, provider selector, Codex dashboard and managed-login/switch dialogs. Keep approved dark branding and global appearance/language. Settings says which automation controls apply to Codex (shared since 2026-10-03) and which stay Claude-only. Native commands/events use explicit codex prefixes. get_codex_snapshot is cache-only; polling it never invokes provider I/O. Poll managed login completion separately, with cancellation/generation checks, without holding the runtime mutex for browser wait.
 
 ## Parallel work packages
 

@@ -52,6 +52,7 @@ OAuth fields live under `credentials.claudeAiOauth`; access/refresh tokens, expi
 | Automatic switching | Enabled | `autoSwitchEnabled` |
 | Start reopened weekly window | Enabled | `autoStartWindowEnabled` |
 | Automatically use banked resets | Enabled | `autoUseResetsEnabled` |
+| Weekly reset order | Soonest weekly reset first (added later; on is the original order) | `preferSoonestWeeklyReset`, default on; records saved before it existed load as on (B13) |
 | Appearance | System | `appearance`: `system`, `light`, `dark` |
 | Near-limit band and cadence | Threshold minus 3 points; 30 seconds | Active-only tick unless all accounts were found exhausted |
 | Inactive usage cadence | 900 seconds | Persisted usage age avoids a startup burst |
@@ -62,7 +63,7 @@ OAuth fields live under `credentials.claudeAiOauth`; access/refresh tokens, expi
 | Metadata 429 cooldown | `min(60 × 2^(n−1), 900)` seconds | Respect a larger numeric `Retry-After` |
 | Repeated exhausted notification | At most once per 1,800 seconds | Earliest main-window reset across accounts |
 
-Preserve these Claude policy defaults in the replacement. The owner explicitly selected English as the new default language and dark as the initial appearance; existing explicit appearance settings remain preserved. Settings must be validated in Rust. Import out-of-range preferences by reporting/clamping them to supported UI ranges, rather than accepting arbitrary persisted values. Future provider settings must be independent.
+Preserve these Claude policy defaults in the replacement. The owner explicitly selected English as the new default language and dark as the initial appearance; existing explicit appearance settings remain preserved. Settings must be validated in Rust. Import out-of-range preferences by reporting/clamping them to supported UI ranges, rather than accepting arbitrary persisted values. Provider settings stay independent, with one owner decision (2026-10-03): automatic switching, the threshold, the check interval and the weekly reset order also drive Codex ([CODEX_USAGE.md](CODEX_USAGE.md)), with these Claude defaults, while priming and banked resets stay Claude-only.
 
 ### B03 — Subscription and renewal
 
@@ -152,6 +153,8 @@ Select a nonactive usable account by:
 If none has headroom, still select a usable account. Preserve this fallback. Add stable account-ID ordering only as a final tie-breaker; the source does not specify a total order for exact ties.
 
 The consumption plan includes all usable accounts, including active, in the same order. A healthy active account is not proactively switched merely because another resets sooner.
+
+Owner option (2026-10-03): `preferSoonestWeeklyReset`, default on, keeps exactly this order. Off, step 2 becomes the lowest model-aware weekly usage (most weekly left), then the earliest weekly reset hour bucket; preferred headroom, the five-hour tie-break, the fallback, the ID tie-breaker and the plan's inclusion of the active account are unchanged. Records saved before the option existed load it as on and are not rewritten, so the Claude default is unchanged. Codex accounts are ranked with the same comparator.
 
 ### B14 — Poll orchestration and automatic switching
 

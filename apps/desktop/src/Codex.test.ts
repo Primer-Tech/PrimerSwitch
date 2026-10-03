@@ -294,6 +294,55 @@ describe('Codex accounts page', () => {
     expect(next.getByText(t('ro', 'codexNextSoonest'))).toBeVisible();
     expect(next.queryByText(/PrimerSwitch comută automat/)).toBeNull();
   });
+  it('marks windows used past the plan on credits, keeps the real number and caps the bar', async () => {
+    const raw = codexSnapshot({ nextId: 'codex-personal' });
+    // The active account keeps working on its purchased credits at 105% weekly.
+    raw.accounts[0].quota!.limits[0].secondary!.usedPercent = 105;
+    // Personal is past its weekly plan too, with a credit balance but no flag.
+    const personal = raw.accounts[1].quota!.limits[0];
+    personal.primary!.usedPercent = 20;
+    personal.secondary!.usedPercent = 104;
+    personal.rateLimitReachedType = null;
+    personal.credits = { hasCredits: false, unlimited: false, balance: '3.00' };
+    // Research is past its plan without any credits: no hint.
+    raw.accounts[2].quota!.limits[0].secondary!.usedPercent = 102;
+    await setup(raw);
+    const active = within(
+      screen
+        .getByRole('heading', { name: 'Active account' })
+        .closest('section')!,
+    );
+    const weekly = active.getByRole('meter', { name: 'Weekly' });
+    expect(weekly).toHaveAttribute('aria-valuenow', '100');
+    expect(weekly).toHaveAttribute(
+      'aria-valuetext',
+      '105 percent used · Using credits',
+    );
+    expect(weekly.querySelector('span')).toHaveStyle({ width: '100%' });
+    const activeWeekly = weekly.closest('.usage-quota')!;
+    expect(activeWeekly).toHaveTextContent('105%');
+    expect(
+      within(activeWeekly as HTMLElement).getByText('Using credits'),
+    ).toBeVisible();
+    expect(
+      within(
+        active
+          .getByRole('meter', { name: '5 hours' })
+          .closest('.usage-quota') as HTMLElement,
+      ).queryByText('Using credits'),
+    ).toBeNull();
+    const personalRow = within(row('personal@example.invalid'));
+    expect(personalRow.getByText('104%')).toBeVisible();
+    expect(personalRow.getByText('Using credits')).toBeVisible();
+    expect(personalRow.getByText('Limit reached')).toBeVisible();
+    const researchRow = within(row('research@example.invalid'));
+    expect(researchRow.getByText('102%')).toBeVisible();
+    expect(researchRow.queryByText('Using credits')).toBeNull();
+    const next = within(
+      screen.getByRole('heading', { name: 'Next best' }).closest('section')!,
+    );
+    expect(next.getByText('Using credits')).toBeVisible();
+  });
   it('shows a partial switch as a warning and moves focus to the result', async () => {
     const { call } = await setup();
     call.mockResolvedValueOnce(

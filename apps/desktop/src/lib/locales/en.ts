@@ -248,6 +248,7 @@ export const en = {
   codexCredits: 'Credits',
   codexCreditsUnlimited: 'Unlimited',
   codexCreditsAvailable: 'Available',
+  codexUsingCredits: 'Using credits',
   codexOtherLimit: 'Other limit',
   codexResetsIn: 'Resets in {duration}',
   codexPlanFree: 'Free',

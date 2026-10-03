@@ -10,6 +10,7 @@
     tone = 'blue',
     compact = false,
     description,
+    note,
   }: {
     value: number | null;
     label: string;
@@ -19,6 +20,8 @@
     tone?: string;
     compact?: boolean;
     description?: string;
+    /** A short visible hint under the bar, for example "Using credits". */
+    note?: string;
   } = $props();
   const descriptionId = $props.id();
   let percent = $derived(
@@ -46,12 +49,18 @@
       : Math.min(100, Math.max(0, value))}
     aria-valuetext={value === null
       ? t($language, 'dataUnavailable')
-      : t($language, 'usageMeter', { value: percentage(value, $language) })}
+      : [
+          t($language, 'usageMeter', { value: percentage(value, $language) }),
+          note,
+        ]
+          .filter(Boolean)
+          .join(' · ')}
   >
     <span style:width={Math.min(100, Math.max(0, value ?? 0)) + '%'}></span>
   </div>
   {#if description}<span class="sr-only" id={descriptionId}>{description}</span
     >{/if}
+  {#if note}<small class="quota-note">{note}</small>{/if}
   {#if !compact}<small class="quota-reset"
       >{resetAt !== null && resetAt > now
         ? t($language, 'resetIn', {
@@ -60,3 +69,14 @@
         : countdown(resetAt, now, $language)}</small
     >{/if}
 </div>
+
+<style>
+  .quota-note {
+    display: block;
+    margin-top: 7px;
+    font-size: 0.68rem;
+    font-weight: 600;
+    line-height: 1.3;
+    color: var(--codex-warn, var(--subtle));
+  }
+</style>

@@ -245,6 +245,24 @@ export function codexNextAccount(snapshot: CodexSnapshot): CodexAccount | null {
   );
 }
 
+/** The main limit has purchased credits: the flag, a balance or unlimited credits. */
+function codexHasCredits(account: CodexAccount): boolean {
+  const credits = codexMainLimit(account)?.credits;
+  return (
+    !!credits && (credits.hasCredits || credits.unlimited || !!credits.balance)
+  );
+}
+/**
+ * A main window past 100% while the main limit has credits: Codex keeps working on
+ * purchased credits. The real percentage stays visible next to this hint.
+ */
+export function codexUsingCredits(
+  account: CodexAccount,
+  window: CodexWindow | null,
+): boolean {
+  return !!window && window.usedPercent > 100 && codexHasCredits(account);
+}
+
 /** Credits are shown only when the main limit reports some. */
 export function codexCredits(
   account: CodexAccount,

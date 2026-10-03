@@ -7,6 +7,7 @@
     codexExtraLimits,
     codexLimitName,
     codexMainLimit,
+    codexUsingCredits,
     codexWindowLabel,
     codexWindows,
   } from '../lib/codex-format';
@@ -44,6 +45,10 @@
     }),
   );
   let credits = $derived(codexCredits(account, $language));
+  const creditsNote = (window: CodexWindow | null) =>
+    codexUsingCredits(account, window)
+      ? t($language, 'codexUsingCredits')
+      : undefined;
   const clamp = (value: number) => Math.min(100, Math.max(0, value));
 </script>
 
@@ -64,6 +69,7 @@
             resetAt={windows.short.resetsAt}
             {now}
             threshold={100}
+            note={creditsNote(windows.short)}
           />{/if}
         {#if windows.long}<QuotaBar
             value={windows.long.usedPercent}
@@ -76,6 +82,7 @@
             {now}
             threshold={100}
             tone="green"
+            note={creditsNote(windows.long)}
           />{/if}
       </div>{:else}<p class="codex-quota-note">
         {t($language, 'codexNoWindows')}

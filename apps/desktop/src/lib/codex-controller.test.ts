@@ -25,6 +25,7 @@ import {
   codexNextAccount,
   codexPlanLabel,
   codexStatus,
+  codexUsingCredits,
   codexWindowLabel,
 } from './codex-format';
 import { en } from './locales/en';
@@ -579,6 +580,47 @@ describe('Codex view derivations', () => {
     expect(codexNextAccount(raw)).toBeNull();
     raw.nextId = 'codex-studio';
     expect(codexNextAccount(raw)).toBeNull();
+  });
+  it('marks only main windows past 100% with purchased credits as using credits', () => {
+    const withCredits = (
+      weekly: number,
+      credits: NonNullable<ReturnType<typeof codexMainLimit>['credits']>,
+    ) =>
+      codexAccount('codex-credits', {
+        quota: {
+          ordinaryUsageAllowed: true,
+          resetCreditsAvailable: null,
+          limits: [codexMainLimit(20, weekly, { credits })],
+        },
+      });
+    const flag = { hasCredits: true, unlimited: false, balance: null };
+    const weekly = (account: ReturnType<typeof codexAccount>) =>
+      account.quota!.limits[0].secondary;
+    const over = withCredits(105, flag);
+    expect(codexUsingCredits(over, weekly(over))).toBe(true);
+    // The 5-hour window of the same account is within the plan.
+    expect(codexUsingCredits(over, over.quota!.limits[0].primary)).toBe(false);
+    for (const credits of [
+      { hasCredits: false, unlimited: false, balance: '3.50' },
+      { hasCredits: false, unlimited: true, balance: null },
+    ]) {
+      const account = withCredits(101, credits);
+      expect(codexUsingCredits(account, weekly(account))).toBe(true);
+    }
+    // Exactly 100% is the plan limit itself, not credit usage.
+    const full = withCredits(100, flag);
+    expect(codexUsingCredits(full, weekly(full))).toBe(false);
+    // Without credits a reading past 100% gets no hint.
+    for (const credits of [
+      { hasCredits: false, unlimited: false, balance: null },
+      { hasCredits: false, unlimited: false, balance: '' },
+    ]) {
+      const account = withCredits(104, credits);
+      expect(codexUsingCredits(account, weekly(account))).toBe(false);
+    }
+    expect(codexUsingCredits(over, null)).toBe(false);
+    // Such an account is limited, so the native side never ranks it next.
+    expect(codexLimitState(over).limited).toBe(true);
   });
   it('labels windows from real durations, known plans and compact durations', () => {
     expect(codexWindowLabel(300, 'short', 'en')).toBe('5 hours');

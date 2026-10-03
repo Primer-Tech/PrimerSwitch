@@ -7,6 +7,7 @@
     codexMainLimit,
     codexMessage,
     codexSecondaryLine,
+    codexUsingCredits,
     codexWindowLabel,
     codexWindows,
   } from '../lib/codex-format';
@@ -182,6 +183,9 @@
                 value={row.windows.short.usedPercent}
                 {now}
                 threshold={100}
+                note={codexUsingCredits(account, row.windows.short)
+                  ? t($language, 'codexUsingCredits')
+                  : undefined}
               />{:else}<span class="no-reading" aria-hidden="true">—</span><span
                 class="sr-only">{t($language, 'dataUnavailable')}</span
               >{/if}</td
@@ -197,6 +201,9 @@
                 {now}
                 threshold={100}
                 tone="green"
+                note={codexUsingCredits(account, row.windows.long)
+                  ? t($language, 'codexUsingCredits')
+                  : undefined}
               />{:else}<span class="no-reading" aria-hidden="true">—</span><span
                 class="sr-only">{t($language, 'dataUnavailable')}</span
               >{/if}</td

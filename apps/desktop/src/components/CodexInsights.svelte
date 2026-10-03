@@ -5,6 +5,7 @@
     codexCanSwitch,
     codexInitial,
     codexMainLimit,
+    codexUsingCredits,
     codexWindowLabel,
     codexWindows,
   } from '../lib/codex-format';
@@ -90,6 +91,9 @@
           value={windows.short.usedPercent}
           {now}
           threshold={100}
+          note={codexUsingCredits(nextBest, windows.short)
+            ? t($language, 'codexUsingCredits')
+            : undefined}
         />{/if}{#if windows.long}<QuotaBar
           compact
           label={codexWindowLabel(
@@ -101,6 +105,9 @@
           {now}
           threshold={100}
           tone="green"
+          note={codexUsingCredits(nextBest, windows.long)
+            ? t($language, 'codexUsingCredits')
+            : undefined}
         />{/if}
     </div>
     <p>

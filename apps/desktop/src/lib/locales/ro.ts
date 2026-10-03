@@ -254,6 +254,7 @@ export const ro: Record<keyof typeof en, string> = {
   codexCredits: 'Credite',
   codexCreditsUnlimited: 'Nelimitate',
   codexCreditsAvailable: 'Disponibile',
+  codexUsingCredits: 'Folosește credite',
   codexOtherLimit: 'Altă limită',
   codexResetsIn: 'Resetare în {duration}',
   codexPlanFree: 'Gratuit',

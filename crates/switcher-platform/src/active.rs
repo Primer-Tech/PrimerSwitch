@@ -392,7 +392,8 @@ mod mac {
     use super::*;
     use core_foundation::base::TCFType;
     use security_framework::os::macos::keychain::SecKeychain;
-    use std::{ffi::c_void, ptr};
+    use security_framework_sys::base::{SecKeychainAttribute, SecKeychainAttributeList};
+    use std::ffi::c_void;
 
     // `security add-generic-password -U` uses this legacy Security.framework
     // entry point. The security-framework crate currently exposes the related
@@ -449,10 +450,37 @@ mod mac {
             .find_generic_password(SERVICE, ACCOUNT)
             .map_err(|_| PlatformError::Conflict)?;
         let length = u32::try_from(bytes.len()).map_err(|_| PlatformError::KeyUnavailable)?;
+        // Mirror Apple's `security add-generic-password -U` update path. Its
+        // legacy API receives the existing generic-password attributes as well
+        // as the replacement data; passing a null list can report success but
+        // leave the externally visible item unchanged on some macOS runners.
+        let service = SERVICE.as_bytes();
+        let account = ACCOUNT.as_bytes();
+        let mut attributes = [
+            SecKeychainAttribute {
+                tag: four_char(b"labl"),
+                length: service.len() as u32,
+                data: service.as_ptr().cast_mut().cast(),
+            },
+            SecKeychainAttribute {
+                tag: four_char(b"svce"),
+                length: service.len() as u32,
+                data: service.as_ptr().cast_mut().cast(),
+            },
+            SecKeychainAttribute {
+                tag: four_char(b"acct"),
+                length: account.len() as u32,
+                data: account.as_ptr().cast_mut().cast(),
+            },
+        ];
+        let attribute_list = SecKeychainAttributeList {
+            count: attributes.len() as u32,
+            attr: attributes.as_mut_ptr(),
+        };
         let status = unsafe {
             SecKeychainItemModifyContent(
                 item.as_concrete_TypeRef().cast(),
-                ptr::null(),
+                (&attribute_list as *const SecKeychainAttributeList).cast(),
                 length,
                 bytes.as_ptr().cast(),
             )
@@ -462,6 +490,9 @@ mod mac {
         } else {
             Err(PlatformError::KeyUnavailable)
         }
+    }
+    const fn four_char(bytes: &[u8; 4]) -> u32 {
+        u32::from_be_bytes(*bytes)
     }
     fn native_username() -> Result<String> {
         use std::{ffi::CStr, mem::MaybeUninit, ptr};

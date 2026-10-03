@@ -4034,6 +4034,7 @@ dependencies = [
  "rand 0.8.8",
  "secret-service",
  "security-framework",
+ "security-framework-sys",
  "serde",
  "serde_json",
  "sha2 0.10.9",

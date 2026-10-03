@@ -390,26 +390,25 @@ fn is_desired(current: &RawSnapshot, journal: &Journal) -> bool {
 #[cfg(target_os = "macos")]
 mod mac {
     use super::*;
-    use core_foundation::base::TCFType;
+    use core_foundation::base::{CFRelease, TCFType};
     use security_framework::os::macos::keychain::SecKeychain;
-    use security_framework_sys::base::{SecKeychainAttribute, SecKeychainAttributeList};
-    use std::ffi::c_void;
+    use security_framework_sys::{
+        base::{OSStatus, SecAccessRef, SecKeychainItemRef},
+        keychain_item::SecKeychainItemDelete,
+    };
+    use std::ptr;
 
-    // `security add-generic-password -U` uses this legacy Security.framework
-    // entry point. The security-framework crate currently exposes the related
-    // `SecKeychainItemModifyAttributesAndData` call instead; on hosted macOS
-    // runners that call could look updated in-process while the `security`
-    // command still read the previous password. Keep this small binding local
-    // so we can use the same durable update primitive as Apple's CLI without
-    // passing credentials through a subprocess.
+    // The high-level crate does not expose keychain item access ACLs. Preserve
+    // the existing ACL while replacing the content, so a Claude item created
+    // with `security add-generic-password -A` keeps its non-prompting access.
     #[link(name = "Security", kind = "framework")]
     unsafe extern "C" {
-        fn SecKeychainItemModifyContent(
-            item_ref: *mut c_void,
-            attr_list: *const c_void,
-            length: u32,
-            data: *const c_void,
-        ) -> i32;
+        fn SecKeychainItemCopyAccess(
+            item_ref: SecKeychainItemRef,
+            access: *mut SecAccessRef,
+        ) -> OSStatus;
+        fn SecKeychainItemSetAccess(item_ref: SecKeychainItemRef, access: SecAccessRef)
+        -> OSStatus;
     }
 
     // Static source inspection of installed public Claude 2.1.287, not native Mac
@@ -441,58 +440,101 @@ mod mac {
         }
     }
     pub(super) fn update_current(bytes: &[u8]) -> Result<()> {
-        // Use an explicit handle to the user's default keychain. This matches
-        // Claude's `security add-generic-password -U` write target and avoids
-        // SecItem queries selecting a different keychain item with the same
-        // service/account pair.
+        // Use an explicit handle to the user's default keychain. Updating the
+        // existing item in-place is not durable on all supported macOS
+        // versions (the Security.framework call can report success while a
+        // fresh `security find-generic-password` still returns the old data).
+        // Recreate the item through the same keychain-specific API that owns
+        // the item instead. The old bytes stay in memory until the replacement
+        // has been verified so a failed add can restore the previous value.
         let keychain = SecKeychain::default().map_err(|_| PlatformError::KeyUnavailable)?;
-        let (_, item) = keychain
+        let (old_password, item) = keychain
             .find_generic_password(SERVICE, ACCOUNT)
             .map_err(|_| PlatformError::Conflict)?;
-        let length = u32::try_from(bytes.len()).map_err(|_| PlatformError::KeyUnavailable)?;
-        // Mirror Apple's `security add-generic-password -U` update path. Its
-        // legacy API receives the existing generic-password attributes as well
-        // as the replacement data; passing a null list can report success but
-        // leave the externally visible item unchanged on some macOS runners.
-        let service = SERVICE.as_bytes();
-        let account = ACCOUNT.as_bytes();
-        let mut attributes = [
-            SecKeychainAttribute {
-                tag: four_char(b"labl"),
-                length: service.len() as u32,
-                data: service.as_ptr().cast_mut().cast(),
-            },
-            SecKeychainAttribute {
-                tag: four_char(b"svce"),
-                length: service.len() as u32,
-                data: service.as_ptr().cast_mut().cast(),
-            },
-            SecKeychainAttribute {
-                tag: four_char(b"acct"),
-                length: account.len() as u32,
-                data: account.as_ptr().cast_mut().cast(),
-            },
-        ];
-        let attribute_list = SecKeychainAttributeList {
-            count: attributes.len() as u32,
-            attr: attributes.as_mut_ptr(),
-        };
-        let status = unsafe {
-            SecKeychainItemModifyContent(
-                item.as_concrete_TypeRef().cast(),
-                (&attribute_list as *const SecKeychainAttributeList).cast(),
-                length,
-                bytes.as_ptr().cast(),
-            )
-        };
-        if status == 0 {
-            Ok(())
+        let old_bytes = old_password.to_owned();
+        let access = copy_access(item.as_concrete_TypeRef())?;
+        let delete_status = unsafe { SecKeychainItemDelete(item.as_concrete_TypeRef()) };
+        drop(item);
+        if delete_status != 0 {
+            release_access(access);
+            return Err(PlatformError::KeyUnavailable);
+        }
+
+        if keychain
+            .add_generic_password(SERVICE, ACCOUNT, bytes)
+            .is_err()
+        {
+            // The delete API is intentionally best-effort in the upstream
+            // wrapper. Re-adding the old value gives the caller a usable
+            // keychain item even when the replacement could not be created.
+            restore_item(&keychain, &old_bytes, access);
+            return Err(PlatformError::KeyUnavailable);
+        }
+
+        match keychain.find_generic_password(SERVICE, ACCOUNT) {
+            Ok((current, replacement)) if current.as_ref() == bytes => {
+                let status =
+                    unsafe { SecKeychainItemSetAccess(replacement.as_concrete_TypeRef(), access) };
+                drop(replacement);
+                if status == 0 {
+                    release_access(access);
+                    Ok(())
+                } else {
+                    restore_item(&keychain, &old_bytes, access);
+                    Err(PlatformError::KeyUnavailable)
+                }
+            }
+            Ok((_, replacement)) => {
+                delete_item(replacement);
+                restore_item(&keychain, &old_bytes, access);
+                Err(PlatformError::KeyUnavailable)
+            }
+            Err(_) => {
+                restore_item(&keychain, &old_bytes, access);
+                Err(PlatformError::KeyUnavailable)
+            }
+        }
+    }
+
+    fn copy_access(item: SecKeychainItemRef) -> Result<SecAccessRef> {
+        let mut access = ptr::null_mut();
+        let status = unsafe { SecKeychainItemCopyAccess(item, &mut access) };
+        if status == 0 && !access.is_null() {
+            Ok(access)
         } else {
+            release_access(access);
             Err(PlatformError::KeyUnavailable)
         }
     }
-    const fn four_char(bytes: &[u8; 4]) -> u32 {
-        u32::from_be_bytes(*bytes)
+
+    fn restore_item(keychain: &SecKeychain, bytes: &[u8], access: SecAccessRef) {
+        if let Ok((_, item)) = keychain.find_generic_password(SERVICE, ACCOUNT) {
+            delete_item(item);
+        }
+        if keychain
+            .add_generic_password(SERVICE, ACCOUNT, bytes)
+            .is_ok()
+        {
+            if let Ok((_, item)) = keychain.find_generic_password(SERVICE, ACCOUNT) {
+                let status =
+                    unsafe { SecKeychainItemSetAccess(item.as_concrete_TypeRef(), access) };
+                drop(item);
+                let _ = status;
+            }
+        }
+        release_access(access);
+    }
+
+    fn delete_item(item: impl TCFType<Ref = SecKeychainItemRef>) {
+        let status = unsafe { SecKeychainItemDelete(item.as_concrete_TypeRef()) };
+        drop(item);
+        let _ = status;
+    }
+
+    fn release_access(access: SecAccessRef) {
+        if !access.is_null() {
+            unsafe { CFRelease(access.cast()) };
+        }
     }
     fn native_username() -> Result<String> {
         use std::{ffi::CStr, mem::MaybeUninit, ptr};

@@ -4028,13 +4028,11 @@ name = "switcher-platform"
 version = "0.2.0"
 dependencies = [
  "chacha20poly1305",
- "core-foundation",
  "fs2",
  "libc",
  "rand 0.8.8",
  "secret-service",
  "security-framework",
- "security-framework-sys",
  "serde",
  "serde_json",
  "sha2 0.10.9",

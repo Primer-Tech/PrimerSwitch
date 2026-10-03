@@ -390,37 +390,7 @@ fn is_desired(current: &RawSnapshot, journal: &Journal) -> bool {
 #[cfg(target_os = "macos")]
 mod mac {
     use super::*;
-    use core_foundation::base::{CFRelease, OSStatus, TCFType};
     use security_framework::os::macos::keychain::SecKeychain;
-    use security_framework_sys::{
-        base::{
-            SecAccessRef, SecKeychainAttribute, SecKeychainAttributeList, SecKeychainItemRef,
-            SecKeychainRef,
-        },
-        keychain_item::SecKeychainItemDelete,
-    };
-    use std::ffi::c_void;
-    use std::ptr;
-
-    // The high-level crate does not expose keychain item access ACLs. Preserve
-    // the existing ACL while replacing the content, so a Claude item created
-    // with `security add-generic-password -A` keeps its non-prompting access.
-    #[link(name = "Security", kind = "framework")]
-    unsafe extern "C" {
-        fn SecKeychainItemCopyAccess(
-            item_ref: SecKeychainItemRef,
-            access: *mut SecAccessRef,
-        ) -> OSStatus;
-        fn SecKeychainItemCreateFromContent(
-            item_class: u32,
-            attributes: *mut SecKeychainAttributeList,
-            length: u32,
-            data: *const c_void,
-            keychain: SecKeychainRef,
-            initial_access: SecAccessRef,
-            item: *mut SecKeychainItemRef,
-        ) -> OSStatus;
-    }
 
     // Static source inspection of installed public Claude 2.1.287, not native Mac
     // acceptance. Older username/service-only selectors are intentionally not guessed.
@@ -463,113 +433,33 @@ mod mac {
             .find_generic_password(SERVICE, ACCOUNT)
             .map_err(|_| PlatformError::Conflict)?;
         let old_bytes = old_password.to_owned();
-        let access = copy_access(item.as_concrete_TypeRef())?;
-        let delete_status = unsafe { SecKeychainItemDelete(item.as_concrete_TypeRef()) };
-        drop(item);
-        if delete_status != 0 {
-            release_access(access);
-            return Err(PlatformError::KeyUnavailable);
-        }
+        item.delete();
 
-        if create_item(&keychain, bytes, access).is_err() {
+        if keychain
+            .add_generic_password(SERVICE, ACCOUNT, bytes)
+            .is_err()
+        {
             // Re-creating the old value gives the caller a usable keychain
             // item even when the replacement could not be created.
-            restore_item(&keychain, &old_bytes, access);
+            let _ = keychain.add_generic_password(SERVICE, ACCOUNT, &old_bytes);
             return Err(PlatformError::KeyUnavailable);
         }
 
         match keychain.find_generic_password(SERVICE, ACCOUNT) {
             Ok((current, replacement)) if current.as_ref() == bytes => {
                 drop(replacement);
-                release_access(access);
                 Ok(())
             }
             Ok((_, replacement)) => {
-                delete_item(replacement);
-                restore_item(&keychain, &old_bytes, access);
+                replacement.delete();
+                let _ = keychain.add_generic_password(SERVICE, ACCOUNT, &old_bytes);
                 Err(PlatformError::KeyUnavailable)
             }
             Err(_) => {
-                restore_item(&keychain, &old_bytes, access);
+                let _ = keychain.add_generic_password(SERVICE, ACCOUNT, &old_bytes);
                 Err(PlatformError::KeyUnavailable)
             }
         }
-    }
-
-    fn copy_access(item: SecKeychainItemRef) -> Result<SecAccessRef> {
-        let mut access = ptr::null_mut();
-        let status = unsafe { SecKeychainItemCopyAccess(item, &mut access) };
-        if status == 0 && !access.is_null() {
-            Ok(access)
-        } else {
-            release_access(access);
-            Err(PlatformError::KeyUnavailable)
-        }
-    }
-
-    fn restore_item(keychain: &SecKeychain, bytes: &[u8], access: SecAccessRef) {
-        if let Ok((_, item)) = keychain.find_generic_password(SERVICE, ACCOUNT) {
-            delete_item(item);
-        }
-        let _ = create_item(keychain, bytes, access);
-        release_access(access);
-    }
-
-    fn create_item(keychain: &SecKeychain, bytes: &[u8], access: SecAccessRef) -> Result<()> {
-        let service = SERVICE.as_bytes();
-        let account = ACCOUNT.as_bytes();
-        let mut attributes = [
-            SecKeychainAttribute {
-                tag: four_char(b"labl"),
-                length: service.len() as u32,
-                data: service.as_ptr().cast_mut().cast(),
-            },
-            SecKeychainAttribute {
-                tag: four_char(b"svce"),
-                length: service.len() as u32,
-                data: service.as_ptr().cast_mut().cast(),
-            },
-            SecKeychainAttribute {
-                tag: four_char(b"acct"),
-                length: account.len() as u32,
-                data: account.as_ptr().cast_mut().cast(),
-            },
-        ];
-        let mut attribute_list = SecKeychainAttributeList {
-            count: attributes.len() as u32,
-            attr: attributes.as_mut_ptr(),
-        };
-        let mut item = ptr::null_mut();
-        let length = u32::try_from(bytes.len()).map_err(|_| PlatformError::KeyUnavailable)?;
-        let status = unsafe {
-            SecKeychainItemCreateFromContent(
-                four_char(b"genp"),
-                &mut attribute_list,
-                length,
-                bytes.as_ptr().cast(),
-                keychain.as_concrete_TypeRef(),
-                access,
-                &mut item,
-            )
-        };
-        if !item.is_null() {
-            unsafe { CFRelease(item.cast()) };
-        }
-        if status == 0 {
-            Ok(())
-        } else {
-            Err(PlatformError::KeyUnavailable)
-        }
-    }
-
-    const fn four_char(bytes: &[u8; 4]) -> u32 {
-        u32::from_be_bytes(*bytes)
-    }
-
-    fn delete_item(item: impl TCFType<Ref = SecKeychainItemRef>) {
-        let status = unsafe { SecKeychainItemDelete(item.as_concrete_TypeRef()) };
-        drop(item);
-        let _ = status;
     }
 
     fn release_access(access: SecAccessRef) {

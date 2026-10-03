@@ -60,7 +60,8 @@
   </div>
   {#if description}<span class="sr-only" id={descriptionId}>{description}</span
     >{/if}
-  {#if note}<small class="quota-note">{note}</small>{/if}
+  <!-- The meter's value text already announces the note. -->
+  {#if note}<small class="quota-note" aria-hidden="true">{note}</small>{/if}
   {#if !compact}<small class="quota-reset"
       >{resetAt !== null && resetAt > now
         ? t($language, 'resetIn', {

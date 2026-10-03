@@ -253,7 +253,8 @@ impl RuntimeHandle {
         Ok(self.get_codex_snapshot())
     }
     /// Background step: discover Codex if needed, follow auth.json (rotations,
-    /// external logins, a hybrid write) and read at most one due quota.
+    /// external logins, a hybrid write), read at most one due quota, then decide
+    /// automatic switching.
     pub async fn codex_tick(&self) {
         let Ok(_job) = self.inner.codex_job.try_lock() else {
             return;

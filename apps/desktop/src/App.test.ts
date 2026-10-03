@@ -1,4 +1,5 @@
 import {
+  cleanup,
   fireEvent,
   render,
   screen,
@@ -67,12 +68,9 @@ describe('desktop workflows', () => {
     ).toHaveTextContent('Personal');
     expect(
       screen.getByRole('columnheader', {
-        name: 'Higher of overall and selected-model weekly usage.',
+        name: t('en', 'weeklyEffectiveHelp'),
       }),
-    ).toHaveAttribute(
-      'title',
-      'Higher of overall and selected-model weekly usage.',
-    );
+    ).toHaveAttribute('title', t('en', 'weeklyEffectiveHelp'));
     const dialog = await details('Studio');
     expect(dialog).toHaveTextContent('Available resets');
     expect(dialog).toHaveTextContent('Weekly window started');
@@ -171,7 +169,11 @@ describe('desktop workflows', () => {
     expect(screen.getByRole('slider')).toHaveAttribute('max', '900');
     expect(screen.getByRole('slider')).toHaveAttribute('step', '30');
     expect(screen.getByRole('spinbutton')).toHaveValue(99.5);
-    expect(screen.getByText(/It consumes usage/)).toBeVisible();
+    expect(screen.getByText(t('en', 'primeHelp'))).toBeVisible();
+    // Resets may switch accounts even with automatic switching off (B17): say so.
+    expect(
+      screen.getByText(/even when automatic switching is off/),
+    ).toBeVisible();
   });
   it('disables every mutation in demo while keeping details readable', async () => {
     const { call } = setup(snapshot({ demo: true }));
@@ -359,6 +361,132 @@ describe('desktop workflows', () => {
     expect(
       screen.queryByText(t('en', 'switchInterrupted')),
     ).not.toBeInTheDocument();
+  });
+  it('says why Switch is unavailable while an account is still being checked', async () => {
+    setup(
+      snapshot({
+        accounts: [
+          account('a'),
+          account('b', { identityVerified: false, isNext: false }),
+        ],
+      }),
+    );
+    const reason = await screen.findByText(t('en', 'switchChecking'));
+    const button = screen.getByRole('button', { name: 'Switch' });
+    expect(button).toBeDisabled();
+    expect(button).toHaveAttribute('aria-describedby', reason.id);
+    expect(button.parentElement).toHaveAttribute(
+      'title',
+      t('en', 'switchChecking'),
+    );
+    // A first-launch check is not reported as an identity problem.
+    expect(screen.queryByText('Identity unverified')).not.toBeInTheDocument();
+  });
+  it('offers a browser sign-in for an account Claude no longer accepts', async () => {
+    const { call } = setup(
+      snapshot({
+        accounts: [
+          account('a'),
+          account('b', { signInRequired: true, error: 'signInRequired' }),
+        ],
+      }),
+    );
+    expect(await screen.findByText(t('en', 'switchNeedsSignIn'))).toBeVisible();
+    expect(
+      screen.queryByRole('button', { name: 'Switch' }),
+    ).not.toBeInTheDocument();
+    call.mockResolvedValueOnce({
+      id: 'login-1',
+      url: 'https://platform.claude.com/oauth/authorize',
+    });
+    await fireEvent.click(
+      screen.getByRole('button', { name: 'Sign in again to Personal' }),
+    );
+    await waitFor(() => expect(call).toHaveBeenCalledWith('begin_login'));
+  });
+  it('shows when exhausted accounts free up and who frees up first', async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const raw = snapshot({
+      accounts: [
+        account('a', { exhausted: true, freesAt: now + 7800 }),
+        account('b', { exhausted: true, freesAt: now + 3600 }),
+      ],
+      consumptionPlan: [],
+    });
+    setup(raw);
+    expect(
+      await screen.findByText(
+        t('en', 'allExhaustedUntil', { name: 'Personal', duration: '1h 0m' }),
+      ),
+    ).toBeVisible();
+    expect(
+      screen.getByText(t('en', 'freesIn', { duration: '2h 10m' })),
+    ).toBeVisible();
+    language.set('ro');
+    const ro = { ...raw, revision: 2 };
+    ro.settings = { ...raw.settings, language: 'ro' };
+    cleanup();
+    setup(ro);
+    expect(
+      await screen.findByText(
+        'Toate conturile sunt la limită. Primul cont liber va fi Personal, în 1 h 0 min.',
+      ),
+    ).toBeVisible();
+    expect(screen.getByText('Se eliberează în 2 h 10 min')).toBeVisible();
+  });
+  it('names a blocking environment variable instead of showing an empty window', async () => {
+    setup(
+      snapshot({
+        accounts: [],
+        activeId: null,
+        consumptionPlan: [],
+        error: {
+          code: 'unsupportedEnvironment',
+          accountId: null,
+          param: 'ANTHROPIC_API_KEY',
+          action: null,
+          at: 1,
+        },
+      }),
+    );
+    expect(
+      await screen.findByRole('heading', {
+        name: t('en', 'switchingUnavailable'),
+      }),
+    ).toBeVisible();
+    // Stated once, in place of the empty state, not again as a banner.
+    expect(
+      screen.getByText(
+        t('en', 'unsupportedEnvironment', { name: 'ANTHROPIC_API_KEY' }),
+      ),
+    ).toBeVisible();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: 'Import current account' }),
+    ).not.toBeInTheDocument();
+  });
+  it('labels deletion in account details and maps raw plan tiers', async () => {
+    setup(
+      snapshot({
+        accounts: [
+          account('a', { planTier: 'default_claude_max_20x' }),
+          account('b', { planTier: 'default_claude_max_5x' }),
+        ],
+      }),
+    );
+    expect(await screen.findByText('Max 20×')).toBeVisible();
+    const dialog = await details();
+    // The only "×" left in the dialog is its own close button.
+    expect(
+      within(dialog)
+        .getAllByRole('button')
+        .filter((b) => b.textContent === '×'),
+    ).toHaveLength(1);
+    const remove = within(dialog).getByRole('button', {
+      name: 'Delete account Personal',
+    });
+    expect(remove).toHaveTextContent('Delete account');
+    expect(within(dialog).getByText('Max 5×')).toBeVisible();
   });
   it('updates local countdowns without provider commands', async () => {
     vi.useFakeTimers();

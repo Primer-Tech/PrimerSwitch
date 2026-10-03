@@ -1,6 +1,13 @@
 <script lang="ts">
-  import { language, t } from '../lib/i18n';
-  import { age, countdown, date, percentage } from '../lib/format';
+  import { language, t, type MessageKey } from '../lib/i18n';
+  import {
+    age,
+    countdown,
+    date,
+    duration,
+    percentage,
+    planLabel,
+  } from '../lib/format';
   import { errorText, safeError } from '../lib/controller';
   import type { Snapshot, AccountView, ErrorView } from '../lib/types';
   import Icon from './Icon.svelte';
@@ -79,6 +86,41 @@
     if (snapshot?.error) dismissedError = errorKey(snapshot.error);
     ondismiss();
   }
+  // When every account is at its limit, say who frees up first and when.
+  let exhaustedAll = $derived(
+    !!snapshot?.accounts.length && snapshot.accounts.every((a) => a.exhausted),
+  );
+  let firstFree = $derived(
+    (snapshot?.accounts ?? [])
+      .filter((a) => a.freesAt != null && a.freesAt > now)
+      .sort((a, b) => a.freesAt! - b.freesAt!)[0] ?? null,
+  );
+  // A context that cannot switch at all explains itself instead of an empty window.
+  const blockingCodes = [
+    'unsupportedContext',
+    'unsupportedEnvironment',
+    'unsupportedSetting',
+  ];
+  let blocked = $derived(
+    snapshot &&
+      !snapshot.accounts.length &&
+      snapshot.error &&
+      blockingCodes.includes(snapshot.error.code)
+      ? snapshot.error
+      : null,
+  );
+  /** Why Switch cannot be used for a row right now, or null when it can. */
+  function switchReason(account: AccountView): MessageKey | null {
+    if (account.active) return null;
+    if (snapshot?.demo) return 'demoOnly';
+    if (account.signInRequired) return 'switchNeedsSignIn';
+    if (disabled) return 'switchBusy';
+    if (!account.identityVerified)
+      return account.error ? 'switchUnverified' : 'switchChecking';
+    return null;
+  }
+  const lasting = (reason: MessageKey | null) =>
+    reason === 'switchChecking' || reason === 'switchUnverified';
   let addOpen = $state(false),
     addButton: HTMLButtonElement;
   function add(action: () => void) {
@@ -149,7 +191,10 @@
           >{t($language, 'demoNotice')}</span
         >
       </div>{/if}
-    {#if error || statusError}<div class="error-notice" role="alert">
+    {#if error || (statusError && statusError !== blocked)}<div
+        class="error-notice"
+        role="alert"
+      >
         <span
           >{error
             ? safeError(error, $language)
@@ -171,6 +216,16 @@
           class="icon-button"
           onclick={() =>
             (dismissedNotice = `${errorKey(notice!)}|${notice!.at}`)}>×</button
+        >
+      </div>{/if}
+    {#if exhaustedAll}<div class="error-notice info-notice" role="status">
+        <span
+          >{firstFree
+            ? t($language, 'allExhaustedUntil', {
+                name: firstFree.name,
+                duration: duration(firstFree.freesAt!, now, $language),
+              })
+            : t($language, 'allExhausted')}</span
         >
       </div>{/if}
     {#if pending || snapshot?.busy}<div class="pending-notice" role="status">
@@ -214,8 +269,8 @@
                 <div>
                   <div class="identity-line">
                     <h3>{active.name}</h3>
-                    {#if active.planTier}<span class="badge muted"
-                        >{active.planTier}</span
+                    {#if planLabel(active.planTier)}<span class="badge muted"
+                        >{planLabel(active.planTier)}</span
                       >{/if}<span class="badge accent"
                       >{t($language, 'active')}</span
                     >
@@ -278,14 +333,18 @@
             {:else}<div class="empty-active">
                 <div>
                   <h3>
-                    {snapshot
-                      ? t($language, 'noActive')
-                      : t($language, 'loadingAccounts')}
+                    {blocked
+                      ? t($language, 'switchingUnavailable')
+                      : snapshot
+                        ? t($language, 'noActive')
+                        : t($language, 'loadingAccounts')}
                   </h3>
                   <p>
-                    {snapshot
-                      ? t($language, 'importOrAdd')
-                      : t($language, 'loadingState')}
+                    {blocked
+                      ? errorText(blocked, [], $language)
+                      : snapshot
+                        ? t($language, 'importOrAdd')
+                        : t($language, 'loadingState')}
                   </p>
                 </div>
               </div>{/if}
@@ -345,7 +404,8 @@
                       ></tr
                     ></thead
                   ><tbody>
-                    {#each snapshot.accounts as account (account.id)}<tr
+                    {#each snapshot.accounts as account (account.id)}
+                      {@const reason = switchReason(account)}<tr
                         class:current-row={account.active}
                         ><td
                           ><div class="table-identity">
@@ -365,7 +425,14 @@
                               <span class="account-email"
                                 >{account.email ||
                                   t($language, 'emailUnavailable')}</span
-                              >{#if account.error && account.usage}<small
+                              >{#if reason === 'switchNeedsSignIn'}<small
+                                  class="warning-text"
+                                  id={`switch-reason-${account.id}`}
+                                  >{t($language, 'switchNeedsSignIn')}</small
+                                >{:else if lasting(reason)}<small
+                                  id={`switch-reason-${account.id}`}
+                                  >{t($language, reason!)}</small
+                                >{:else if account.error && account.usage}<small
                                   class="warning-text"
                                   >{t($language, 'lastReadingKept')}</small
                                 >{:else if !account.usage}<small
@@ -373,6 +440,15 @@
                                 >{:else if account.decisionFresh === false}<small
                                   >{t($language, 'cachedAge', {
                                     age: age(account.usageAt, now, $language),
+                                  })}</small
+                                >{/if}{#if account.exhausted && account.freesAt != null && account.freesAt > now}<small
+                                  class="frees-in"
+                                  >{t($language, 'freesIn', {
+                                    duration: duration(
+                                      account.freesAt,
+                                      now,
+                                      $language,
+                                    ),
                                   })}</small
                                 >{/if}
                             </div>
@@ -399,18 +475,33 @@
                         >
                         <td
                           ><div class="row-actions">
-                            <button
-                              class="switch-button"
-                              disabled={disabled ||
-                                account.active ||
-                                !account.identityVerified}
-                              onclick={() => onswitch(account)}
-                              >{account.active
-                                ? t($language, 'currentAccount')
-                                : operation === 'switch:' + account.id
-                                  ? t($language, 'switching')
-                                  : t($language, 'switch')}</button
-                            ><button
+                            {#if account.signInRequired && !account.active}<button
+                                class="switch-button sign-in-button"
+                                {disabled}
+                                aria-label={t($language, 'signInAgainLabel', {
+                                  name: account.name,
+                                })}
+                                onclick={onlogin}
+                                >{t($language, 'signInAgain')}</button
+                              >{:else}<span
+                                class="switch-wrap"
+                                title={reason
+                                  ? t($language, reason)
+                                  : undefined}
+                                ><button
+                                  class="switch-button"
+                                  disabled={account.active || !!reason}
+                                  aria-describedby={lasting(reason)
+                                    ? `switch-reason-${account.id}`
+                                    : undefined}
+                                  onclick={() => onswitch(account)}
+                                  >{account.active
+                                    ? t($language, 'currentAccount')
+                                    : operation === 'switch:' + account.id
+                                      ? t($language, 'switching')
+                                      : t($language, 'switch')}</button
+                                ></span
+                              >{/if}<button
                               class="icon-button"
                               aria-label={t($language, 'detailsLabel', {
                                 name: account.name,
@@ -427,9 +518,9 @@
               </div>{:else if snapshot}<div class="panel empty-accounts">
                 <h3>{t($language, 'emptyTitle')}</h3>
                 <p>{t($language, 'emptyDescription')}</p>
-                <button {disabled} onclick={oncurrent}
-                  >{t($language, 'importCurrent')}</button
-                >
+                {#if !blocked}<button {disabled} onclick={oncurrent}
+                    >{t($language, 'importCurrent')}</button
+                  >{/if}
               </div>{/if}
           </section>
           <section
@@ -610,5 +701,15 @@
     color: var(--text);
     background: var(--surface);
     border-color: color-mix(in srgb, var(--accent) 35%, var(--line));
+  }
+  .switch-wrap {
+    display: inline-flex;
+  }
+  .frees-in {
+    color: var(--accent);
+  }
+  .row-actions .sign-in-button {
+    color: var(--danger);
+    border-color: color-mix(in srgb, var(--danger) 40%, var(--line));
   }
 </style>

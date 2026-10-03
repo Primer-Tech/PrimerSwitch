@@ -1,7 +1,14 @@
 <script lang="ts">
-  import { language, t, subscriptionLabel } from '../lib/i18n';
+  import { language, t, subscriptionLabel, type MessageKey } from '../lib/i18n';
   import Ring from './Ring.svelte';
-  import { age, date, countdown, percentage } from '../lib/format';
+  import {
+    age,
+    date,
+    countdown,
+    duration,
+    percentage,
+    planLabel,
+  } from '../lib/format';
   import { codeMessage, safeError } from '../lib/controller';
   import type { AccountView } from '../lib/types';
   let {
@@ -33,6 +40,19 @@
       (a, b) => b.percent - a.percent,
     ),
   );
+  let plan = $derived(planLabel(account.planTier));
+  /** Why Switch cannot be used right now, or null when it can. */
+  let switchReason = $derived<MessageKey | null>(
+    account.signInRequired
+      ? 'switchNeedsSignIn'
+      : disabled
+        ? 'switchBusy'
+        : !account.identityVerified
+          ? account.error
+            ? 'switchUnverified'
+            : 'switchChecking'
+          : null,
+  );
 </script>
 
 <article
@@ -48,12 +68,6 @@
       <h3>{account.name}</h3>
       <p>{account.email || t($language, 'emailUnavailable')}</p>
     </div>
-    <button
-      class="icon-button delete-button"
-      aria-label={t($language, 'deleteLabel', { name: account.name })}
-      {disabled}
-      onclick={ondelete}>×</button
-    >
   </div>
   <div class="badges">
     {#if account.active}<span class="badge accent"
@@ -64,12 +78,20 @@
     {#if account.exhausted}<span class="badge danger-badge"
         >{t($language, 'exhausted')}</span
       >{/if}
-    {#if !account.identityVerified}<span class="badge muted"
-        >{t($language, 'identityUnverified')}</span
+    {#if account.signInRequired}<span class="badge danger-badge"
+        >{t($language, 'signInAgain')}</span
+      >{:else if !account.identityVerified && !account.error}<span
+        class="badge muted">{t($language, 'identityUnverified')}</span
       >{/if}
-    {#if account.planTier}<span class="badge muted">{account.planTier}</span
-      >{/if}
+    {#if plan}<span class="badge muted">{plan}</span>{/if}
   </div>
+  {#if account.exhausted && account.freesAt != null && account.freesAt > now}<p
+      class="frees-in"
+    >
+      {t($language, 'freesIn', {
+        duration: duration(account.freesAt, now, $language),
+      })}
+    </p>{/if}
   <div class="card-rings">
     <Ring
       label={t($language, 'fiveHours')}
@@ -113,7 +135,9 @@
   <div class="account-details">
     <div>
       <span>{t($language, 'subscription')}</span><strong
-        >{subscriptionLabel(account.subscriptionStatus, $language)}</strong
+        >{account.subscriptionStatus
+          ? subscriptionLabel(account.subscriptionStatus, $language)
+          : t($language, 'unknownStatus')}</strong
       >
     </div>
     <div class="renewal">
@@ -145,7 +169,7 @@
       </p>{/if}
     <div>
       <span>{t($language, 'availableResets')}</span><strong
-        >{account.resets.available ?? t($language, 'unknown')}</strong
+        >{account.resets.available ?? t($language, 'unknownCount')}</strong
       >
     </div>
     {#if account.resets.expiresAt !== null}<p class="detail-note">
@@ -192,6 +216,9 @@
           ? ' ' + t($language, 'lastReadingKept')
           : ''}</small
       >{/if}
+    {#if account.signInRequired && !account.active}<small
+        >{t($language, 'signInHint')}</small
+      >{/if}
   </div>
   <div class="card-actions">
     <button
@@ -200,15 +227,67 @@
       aria-label={t($language, 'refreshLabel', { name: account.name })}
       >↻ {t($language, 'refresh')}</button
     >
-    {#if !account.active}<button
-        class="switch-button"
-        disabled={disabled || !account.identityVerified}
-        onclick={onswitch}
-        >{pending === `switch:${account.id}`
-          ? t($language, 'switching')
-          : t($language, 'switch')}</button
+    {#if !account.active}<span
+        class="switch-wrap"
+        title={switchReason ? t($language, switchReason) : undefined}
+        ><button
+          class="switch-button"
+          disabled={!!switchReason}
+          aria-describedby={switchReason
+            ? `card-switch-reason-${account.id}`
+            : undefined}
+          onclick={onswitch}
+          >{pending === `switch:${account.id}`
+            ? t($language, 'switching')
+            : t($language, 'switch')}</button
+        ></span
       >{:else}<span class="active-caption"
         >{t($language, 'currentAccount')}</span
       >{/if}
   </div>
+  {#if switchReason && !account.active}<p
+      class="detail-note switch-reason"
+      id={`card-switch-reason-${account.id}`}
+    >
+      {t($language, switchReason)}
+    </p>{/if}
+  <div class="card-danger">
+    <button
+      class="delete-account"
+      aria-label={t($language, 'deleteLabel', { name: account.name })}
+      {disabled}
+      onclick={ondelete}>{t($language, 'deleteAccount')}</button
+    >
+  </div>
 </article>
+
+<style>
+  .switch-wrap {
+    display: inline-flex;
+  }
+  .frees-in {
+    margin: 10px 0 0;
+    font-size: 0.72rem;
+    color: var(--accent);
+  }
+  .switch-reason {
+    margin: 0 0 8px;
+    text-align: right;
+  }
+  .card-danger {
+    display: flex;
+    justify-content: flex-end;
+    padding-top: 12px;
+    border-top: 1px solid var(--line);
+  }
+  .delete-account {
+    font-size: 0.73rem;
+    padding: 0.45rem 0.7rem;
+    color: var(--danger);
+    background: transparent;
+    border-color: color-mix(in srgb, var(--danger) 45%, var(--line));
+  }
+  .delete-account:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--danger) 9%, transparent);
+  }
+</style>

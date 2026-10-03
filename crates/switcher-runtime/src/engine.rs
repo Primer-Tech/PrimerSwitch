@@ -2262,7 +2262,7 @@ impl Engine {
                     );
                     body.push(' ');
                     body.push_str(&if ro {
-                        format!("Primul se eliberează {label}, în {wait} ({time}).")
+                        format!("Primul cont liber va fi {label}, în {wait} ({time}).")
                     } else {
                         format!("{label} frees up first, in {wait} ({time}).")
                     });

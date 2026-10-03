@@ -13,7 +13,7 @@ Since 0.160.0 every interactive Codex terminal is a client of one shared **app-s
 
 1. PrimerSwitch saves the sign-in that is about to be replaced (Codex rotates tokens on its own, so the latest copy is kept; an unknown login is saved as a new account).
 2. It writes the selected account's sign-in to `auth.json` atomically. Nothing else in the Codex home changes.
-3. If the daemon is running, it runs Codex's official `codex app-server daemon restart`. The daemon finishes running turns first (graceful drain, 60 s by default) and saves its threads; new prompts during the drain are refused with "Server is draining".
+3. If the daemon is running, it runs Codex's official `codex app-server daemon restart` with the running daemon's own environment, so tools started from your terminals keep the same `PATH`, virtual environments and variables. The daemon finishes running turns first (graceful drain, 60 s by default) and saves its threads; new prompts during the drain are refused with "Server is draining". Codex refuses this restart from an administrator process, so PrimerSwitch running elevated does not switch while the daemon runs.
 4. Each open terminal shows **Reconnecting…** for a few seconds, resumes the same conversation with your typed input intact, and continues on the new account. A turn that was cut off at the end of the drain continues automatically.
 
 If no daemon is running, only the file is written and the next Codex session uses the new account.
@@ -30,7 +30,7 @@ Resumed conversations carry encrypted reasoning that belongs to the previous acc
 
 ## Usage readings
 
-The active account is read every 10 minutes through your Codex home (skipped while its token is about to expire, so Codex refreshes it first). Other accounts are read about once an hour, and sooner after one of their windows resets, each in its own temporary private home; if Codex rotates a token there, the new token is saved. **Refresh** reads one account now; **Refresh all** reads every account. A rejected sign-in marks that account **Sign in again**; it cannot be selected until you sign in once more.
+The active account is read every 10 minutes through your Codex home (skipped while its token is about to expire, so Codex refreshes it first). Other accounts are read about once an hour, and sooner after one of their windows resets, each in its own temporary private home; if Codex rotates a token there, the new token is saved. **Refresh** reads one account now; **Refresh all** reads every account. Two rejected readings in a row mark that account **Sign in again** (one can be a temporary refresh failure); it cannot be selected until you sign in once more, and it is retried only every six hours meanwhile. The temporary homes disable Codex's plugin-marketplace sync, so a reading downloads nothing extra.
 
 PrimerSwitch never sends inference requests, never consumes reset credits and never logs out an account. The active account cannot be deleted; switch to another account first.
 

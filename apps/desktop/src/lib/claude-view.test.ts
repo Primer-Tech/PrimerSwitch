@@ -18,6 +18,17 @@ const row = (raw: Snapshot, id: string) =>
 const status = (raw: Snapshot, id: string) => row(raw, id).status;
 const withAccounts = (...accounts: AccountView[]) =>
   snapshot({ accounts, consumptionPlan: [] });
+/** An account at Claude's own limit: its 5-hour window is spent. */
+function limited(id: string, freesAt: number, overrides = {}): AccountView {
+  const spent = account(id, {
+    exhausted: true,
+    freesAt,
+    isNext: false,
+    ...overrides,
+  });
+  spent.usage!.fiveHour.utilization = 100;
+  return spent;
+}
 
 describe('Claude adapter: meters', () => {
   it('shows the 5-hour window, the account-wide week and one row per model limit', () => {
@@ -71,8 +82,8 @@ describe('Claude adapter: statuses in the shared words', () => {
   it('says when a limited account frees up, or that it is likely free again', () => {
     const raw = withAccounts(
       account('a'),
-      account('b', { exhausted: true, freesAt: now + 3600 }),
-      account('c', { exhausted: true, freesAt: now - 60 }),
+      limited('b', now + 3600),
+      limited('c', now - 60),
     );
     expect(status(raw, 'b')).toMatchObject({
       kind: 'limited',
@@ -92,6 +103,37 @@ describe('Claude adapter: statuses in the shared words', () => {
       claudeView(raw, { locale: 'ro', now }).rows.find((r) => r.id === 'b')!
         .status.detail,
     ).toBe('Se eliberează în 1 h 0 min');
+    // The weekly value automation uses at 100% is a real limit too.
+    const weekly = account('d', { exhausted: true, freesAt: now + 3600 });
+    weekly.usage!.weeklyModel = 100;
+    expect(status(withAccounts(account('a'), weekly), 'd').label).toBe(
+      'Limit reached',
+    );
+  });
+  it('calls an account at the switch threshold but below its limit "Near limit"', () => {
+    // Claude marks it exhausted at the threshold; its windows are below 100%.
+    const near = account('b', {
+      exhausted: true,
+      freesAt: now + 3600,
+      isNext: false,
+    });
+    near.usage!.fiveHour.utilization = 96;
+    const raw = withAccounts(account('a'), near);
+    expect(status(raw, 'b')).toEqual({
+      kind: 'near',
+      label: 'Near limit',
+      detail: 'Resets in 1h 0m · Resets available: 2',
+      title: null,
+    });
+    // Still not usable: it ranks with the limited accounts, not as ready.
+    expect(row(raw, 'b').limited).toBe(true);
+    const ro = claudeView(raw, { locale: 'ro', now }).rows.find(
+      (r) => r.id === 'b',
+    )!.status;
+    expect(ro.label).toBe('Aproape de limită');
+    expect(ro.detail).toBe(
+      'Se resetează în 1 h 0 min · Resetări disponibile: 2',
+    );
   });
   it('asks for a new sign-in and explains checks that are running or failed', () => {
     const raw = withAccounts(
@@ -155,8 +197,12 @@ describe('Claude adapter: statuses in the shared words', () => {
     expect(status(raw, 'a')).toMatchObject({
       kind: 'active',
       label: 'Active',
-      detail: 'Limit reached · frees in 2h 10m · Resets available: 2',
+      detail: 'Near limit · resets in 2h 10m · Resets available: 2',
     });
+    raw.accounts[0].usage!.fiveHour.utilization = 100;
+    expect(status(raw, 'a').detail).toBe(
+      'Limit reached · frees in 2h 10m · Resets available: 2',
+    );
   });
 });
 
@@ -198,27 +244,31 @@ describe('Claude adapter: the page', () => {
     expect(view(raw, 'ro').nextReason).toBe(t('ro', 'nextWhyMostLeft'));
   });
   it('calls out an active account at the switch threshold or at its limit', () => {
-    expect(view(snapshot()).alert).toBeNull();
+    expect(view(snapshot())).toMatchObject({ alert: null, alertLimit: null });
     const raw = withAccounts(
       account('a', { exhausted: true, freesAt: now + 7800 }),
       account('b'),
     );
-    expect(view(raw).alert).toBe(
-      'Reached the 95% switch threshold · frees in 2h 10m',
-    );
+    expect(view(raw)).toMatchObject({
+      alert: 'Reached the 95% switch threshold · resets in 2h 10m',
+      alertLimit: 'near',
+    });
     raw.accounts[0].usage!.fiveHour.utilization = 100;
-    expect(view(raw).alert).toBe('Limit reached · frees in 2h 10m');
+    expect(view(raw)).toMatchObject({
+      alert: 'Limit reached · frees in 2h 10m',
+      alertLimit: 'limited',
+    });
   });
   it('says who frees up first when every account is limited', () => {
     const raw = withAccounts(
-      account('a', { exhausted: true, freesAt: now + 7800 }),
+      limited('a', now + 7800, { active: true }),
       account('b', { exhausted: true, freesAt: now + 3600 }),
     );
     expect(view(raw).allLimited).toBe(
-      'Every account is at its limit. Personal frees up first, in 1h 0m.',
+      'Every account is at or near its limit. Personal frees up first, in 1h 0m.',
     );
     expect(view(raw, 'ro').allLimited).toBe(
-      'Toate conturile sunt la limită. Primul se eliberează Personal, în 1 h 0 min.',
+      'Toate conturile sunt la limită sau aproape de ea. Primul se eliberează Personal, în 1 h 0 min.',
     );
     expect(view(snapshot()).allLimited).toBeNull();
   });

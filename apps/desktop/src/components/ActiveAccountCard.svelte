@@ -79,7 +79,7 @@
       </div>
       {#if view.model}<span class="active-model">{view.model}</span>{/if}
     </div>
-    {#if active.status.kind === 'signIn'}<div class="callout danger">
+    {#if active.status.kind === 'signIn'}<div class="callout danger sign-in">
         <Icon name="warning" />
         <p>{active.identity}</p>
         {#if active.canSignIn}<button
@@ -90,7 +90,10 @@
           >{/if}
       </div>{/if}
     <UsageMeters row={active} {now} threshold={view.threshold} />
-    {#if view.alert && active.status.kind !== 'signIn'}<div class="callout">
+    {#if view.alert && active.status.kind !== 'signIn'}<div
+        class="callout"
+        class:danger={view.alertLimit === 'limited'}
+      >
         <Icon name="warning" />
         <p>{view.alert}</p>
         {#if next}<button
@@ -184,10 +187,12 @@
     line-height: 1.45;
   }
   .callout.danger {
-    margin: 0 0 12px;
     color: var(--danger);
     border-color: color-mix(in srgb, var(--danger) 40%, var(--line));
     background: color-mix(in srgb, var(--danger) 7%, var(--surface));
+  }
+  .callout.sign-in {
+    margin: 0 0 12px;
   }
   .callout > :global(svg) {
     flex: none;

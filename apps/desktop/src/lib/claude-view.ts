@@ -14,6 +14,7 @@ import {
   rankRows,
   statusView,
   type AccountRowView,
+  type LimitKind,
   type NoteView,
   type PageView,
   type StatusKind,
@@ -29,12 +30,27 @@ export interface ClaudeViewOptions {
 /** Model readings older than 30 minutes are flagged in the details. */
 const SCOPED_STALE_SECONDS = 1800;
 
+/**
+ * Claude's `exhausted` means at or over the switch threshold. Only a binding window
+ * (the 5-hour window, or the weekly value automation uses) at 100% is a real limit;
+ * below that the account is near its limit.
+ */
+function limitOf(account: AccountView): LimitKind | null {
+  if (!account.exhausted) return null;
+  const usage = account.usage;
+  return usage &&
+    (usage.fiveHour.utilization >= 100 || usage.weeklyModel >= 100)
+    ? 'limited'
+    : 'near';
+}
+
 function row(
   account: AccountView,
   { locale, now, switchingId = null }: ClaudeViewOptions,
 ): AccountRowView {
   const usage = account.usage;
   const signIn = !!account.signInRequired;
+  const limit = limitOf(account);
   const kind: StatusKind = signIn
     ? 'signIn'
     : account.active
@@ -45,8 +61,8 @@ function row(
           : 'checking'
         : !usage
           ? 'unread'
-          : account.exhausted
-            ? 'limited'
+          : limit
+            ? limit
             : account.isNext
               ? 'next'
               : 'ready';
@@ -105,7 +121,7 @@ function row(
     status: statusView(
       {
         kind,
-        limit: account.active && account.exhausted ? 'limited' : null,
+        limit: account.active ? limit : null,
         freesAt,
         failure,
         resets: account.exhausted
@@ -170,6 +186,7 @@ export function claudeView(
       order: [],
       orderEmpty: orderEmptyText([], locale),
       alert: null,
+      alertLimit: null,
       allLimited: null,
       signIn: [],
       updatedAt: null,
@@ -185,9 +202,7 @@ export function claudeView(
     rows.find((r) => r.active) ??
     null;
   const activeAccount = snapshot.accounts.find((a) => a.id === active?.id);
-  const usage = activeAccount?.usage;
-  const atLimit =
-    !!usage && (usage.fiveHour.utilization >= 100 || usage.weeklyModel >= 100);
+  const activeLimit = activeAccount ? limitOf(activeAccount) : null;
   return {
     provider: 'claude',
     loaded: true,
@@ -200,15 +215,16 @@ export function claudeView(
     order: orderEntries(plan, rows),
     orderEmpty: orderEmptyText(rows, locale),
     alert:
-      activeAccount && activeAccount.exhausted
+      activeAccount && activeLimit
         ? alertText(
-            atLimit ? 'limited' : 'threshold',
+            activeLimit,
             activeAccount.freesAt ?? null,
             settings.threshold,
             now,
             locale,
           )
         : null,
+    alertLimit: activeLimit,
     allLimited:
       snapshot.accounts.length &&
       snapshot.accounts.every((account) => account.exhausted)

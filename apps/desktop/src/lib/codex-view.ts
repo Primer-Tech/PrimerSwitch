@@ -29,6 +29,7 @@ import {
   rankRows,
   statusView,
   type AccountRowView,
+  type LimitKind,
   type MeterView,
   type NoteView,
   type PageView,
@@ -96,7 +97,7 @@ function row(
   options: CodexViewOptions,
   threshold: number,
   switchingId: string | null,
-): AccountRowView & { limitKind: 'limited' | 'credits' | 'threshold' | null } {
+): AccountRowView & { limitKind: LimitKind | null } {
   const { locale, now, pending = null, pendingId = null } = options;
   const windows = codexWindows(codexMainLimit(account));
   const main = [windows.short, windows.long].filter(
@@ -104,22 +105,23 @@ function row(
   );
   const provider = codexLimitState(account);
   const credits = main.some((window) => codexUsingCredits(account, window));
-  // The switch threshold is the limit for both providers; a provider limit always is.
+  // A real limit (100%, a reached-limit flag or blocked usage) or, below it, a main
+  // window at the shared switch threshold: automation skips both alike.
   const atThreshold = main.some((window) => window.usedPercent >= threshold);
-  const limited = provider.limited || atThreshold;
+  const limitKind: LimitKind | null = credits
+    ? 'credits'
+    : provider.limited
+      ? 'limited'
+      : atThreshold
+        ? 'near'
+        : null;
+  const limited = limitKind !== null;
   const blocking = main.filter((window) => window.usedPercent >= threshold);
   const freesAt = !limited
     ? null
     : blocking.length && blocking.every((window) => window.resetsAt !== null)
       ? Math.max(...blocking.map((window) => window.resetsAt!))
       : provider.freesAt;
-  const limitKind = credits
-    ? 'credits'
-    : provider.limited
-      ? 'limited'
-      : atThreshold
-        ? 'threshold'
-        : null;
   const chatgpt = account.authKind === 'chatgpt';
   const checking =
     (pending === 'codex_refresh_account' && pendingId === account.id) ||
@@ -136,10 +138,8 @@ function row(
             ? 'unsupported'
             : !account.quota
               ? 'unread'
-              : limited
-                ? credits
-                  ? 'credits'
-                  : 'limited'
+              : limitKind
+                ? limitKind
                 : snapshot.nextId === account.id
                   ? 'next'
                   : 'ready';
@@ -170,8 +170,7 @@ function row(
   const status = statusView(
     {
       kind,
-      limit:
-        account.selected && limited ? (credits ? 'credits' : 'limited') : null,
+      limit: account.selected ? limitKind : null,
       freesAt,
       failure,
       blocked,
@@ -264,6 +263,7 @@ export function codexView(
       order: [],
       orderEmpty: orderEmptyText([], locale),
       alert: null,
+      alertLimit: null,
       allLimited: null,
       signIn: [],
       updatedAt: null,
@@ -285,6 +285,10 @@ export function codexView(
     built.find((r) => r.active) ??
     null;
   const active = rows.find((r) => r.id === activeBuilt?.id) ?? null;
+  const activeLimit =
+    activeBuilt?.limitKind && activeBuilt.status.kind !== 'signIn'
+      ? activeBuilt.limitKind
+      : null;
   return {
     provider: 'codex',
     loaded: true,
@@ -298,15 +302,10 @@ export function codexView(
     order: orderEntries(snapshot.order, rows),
     orderEmpty: orderEmptyText(rows, locale),
     alert:
-      activeBuilt?.limitKind && activeBuilt.status.kind !== 'signIn'
-        ? alertText(
-            activeBuilt.limitKind,
-            activeBuilt.freesAt,
-            threshold,
-            now,
-            locale,
-          )
+      activeBuilt && activeLimit
+        ? alertText(activeLimit, activeBuilt.freesAt, threshold, now, locale)
         : null,
+    alertLimit: activeLimit,
     allLimited:
       built.length && built.every((r) => r.limited)
         ? allLimitedText(rows, now, locale)

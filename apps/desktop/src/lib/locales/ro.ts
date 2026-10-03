@@ -24,9 +24,9 @@ export const ro: Record<keyof typeof en, string> = {
   // Notices.
   switchingAccount: 'Se comută contul…',
   updatingAccounts: 'Se actualizează conturile…',
-  allLimited: 'Toate conturile sunt la limită.',
+  allLimited: 'Toate conturile sunt la limită sau aproape de ea.',
   allLimitedUntil:
-    'Toate conturile sunt la limită. Primul se eliberează {name}, în {duration}.',
+    'Toate conturile sunt la limită sau aproape de ea. Primul se eliberează {name}, în {duration}.',
   signInNeeded:
     'Autentifică-te din nou ca să poți folosi în continuare {names}.',
 
@@ -79,6 +79,7 @@ export const ro: Record<keyof typeof en, string> = {
   next: 'Următorul',
   statusReady: 'Disponibil',
   statusLimited: 'Limită atinsă',
+  statusNearLimit: 'Aproape de limită',
   statusChecking: 'Se verifică…',
   statusUnread: 'Neverificat încă',
   statusFailed: 'Verificare eșuată',
@@ -91,6 +92,7 @@ export const ro: Record<keyof typeof en, string> = {
   statusFreeAgain:
     'Probabil disponibil din nou · actualizează pentru confirmare',
   statusLimitFreesIn: '{limit} · se eliberează în {duration}',
+  statusLimitResetsIn: '{limit} · se resetează în {duration}',
   statusResetsAvailable: 'Resetări disponibile: {count}',
   statusResetCooldown: 'Resetări posibile în {duration}',
   freesIn: 'Se eliberează în {duration}',

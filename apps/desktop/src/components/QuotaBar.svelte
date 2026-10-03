@@ -36,10 +36,12 @@
   );
 </script>
 
+<!-- Amber from the switch threshold, red at the provider's own limit. -->
 <div
   class="usage-quota"
   class:compact
-  class:over-limit={value !== null && value >= threshold}
+  class:near-limit={value !== null && value >= threshold && value < 100}
+  class:over-limit={value !== null && value >= 100}
   data-tone={meter.tone}
 >
   <div class="quota-label">
@@ -118,6 +120,9 @@
     background: var(--quota-color);
     border-radius: 4px;
     transition: width 0.2s;
+  }
+  .near-limit .quota-track span {
+    background: var(--warn);
   }
   .over-limit .quota-track span {
     background: var(--danger);

@@ -607,12 +607,15 @@ describe('desktop workflows', () => {
       ],
       consumptionPlan: [],
     });
+    // Both 5-hour windows are spent: Claude's own limit, not just the threshold.
+    raw.accounts.forEach((spent) => (spent.usage!.fiveHour.utilization = 100));
     setup(raw);
     expect(
       await screen.findByText(
         t('en', 'allLimitedUntil', { name: 'Personal', duration: '1h 0m' }),
       ),
     ).toBeVisible();
+    expect(row('Personal').getByText('Limit reached')).toBeVisible();
     expect(row('Personal').getByText(/^Frees in 1h 0m/)).toBeVisible();
     expect(
       row('Studio').getByText(/Limit reached · frees in 2h 10m/),
@@ -628,12 +631,35 @@ describe('desktop workflows', () => {
     setup(ro);
     expect(
       await screen.findByText(
-        'Toate conturile sunt la limită. Primul se eliberează Personal, în 1 h 0 min.',
+        'Toate conturile sunt la limită sau aproape de ea. Primul se eliberează Personal, în 1 h 0 min.',
       ),
     ).toBeVisible();
     expect(
       row('Personal').getByText(/^Se eliberează în 1 h 0 min/),
     ).toBeVisible();
+  });
+  it('calls an account at the switch threshold "Near limit" in amber', async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const raw = snapshot({
+      accounts: [
+        account('a'),
+        account('b', { exhausted: true, freesAt: now + 3600, isNext: false }),
+      ],
+      consumptionPlan: [],
+    });
+    raw.accounts[1].usage!.fiveHour.utilization = 96;
+    setup(raw);
+    await screen.findAllByText('a@example.invalid');
+    const status = row('Personal')
+      .getByText('Near limit')
+      .closest('[data-kind]');
+    expect(status).toHaveAttribute('data-kind', 'near');
+    expect(status).toHaveTextContent('Resets in 1h 0m');
+    expect(
+      row('Personal')
+        .getByRole('meter', { name: '5-hour window' })
+        .closest('.usage-quota'),
+    ).toHaveClass('near-limit');
   });
   it('offers the next account on the active card at the switch threshold', async () => {
     const now = Math.floor(Date.now() / 1000);
@@ -648,7 +674,7 @@ describe('desktop workflows', () => {
     await screen.findAllByText('a@example.invalid');
     expect(
       activeCard().getByText(
-        'Reached the 95% switch threshold · frees in 2h 10m',
+        'Reached the 95% switch threshold · resets in 2h 10m',
       ),
     ).toBeVisible();
     call.mockResolvedValueOnce(snapshot({ revision: 2, activeId: 'b' }));

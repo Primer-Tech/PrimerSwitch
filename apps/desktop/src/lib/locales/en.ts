@@ -23,9 +23,9 @@ export const en = {
   // Notices.
   switchingAccount: 'Switching account…',
   updatingAccounts: 'Updating accounts…',
-  allLimited: 'Every account is at its limit.',
+  allLimited: 'Every account is at or near its limit.',
   allLimitedUntil:
-    'Every account is at its limit. {name} frees up first, in {duration}.',
+    'Every account is at or near its limit. {name} frees up first, in {duration}.',
   signInNeeded: 'Sign in again to keep using {names}.',
 
   // Active account card.
@@ -76,6 +76,7 @@ export const en = {
   next: 'Next',
   statusReady: 'Ready',
   statusLimited: 'Limit reached',
+  statusNearLimit: 'Near limit',
   statusChecking: 'Checking…',
   statusUnread: 'Not checked yet',
   statusFailed: 'Check failed',
@@ -87,6 +88,7 @@ export const en = {
   statusCantSwitch: 'Can’t switch to this account',
   statusFreeAgain: 'Likely free again · refresh to confirm',
   statusLimitFreesIn: '{limit} · frees in {duration}',
+  statusLimitResetsIn: '{limit} · resets in {duration}',
   statusResetsAvailable: 'Resets available: {count}',
   statusResetCooldown: 'Resets usable in {duration}',
   freesIn: 'Frees in {duration}',

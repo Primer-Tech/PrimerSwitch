@@ -24,6 +24,7 @@ export type StatusKind =
   | 'active'
   | 'next'
   | 'ready'
+  | 'near'
   | 'limited'
   | 'credits'
   | 'signIn'
@@ -32,6 +33,13 @@ export type StatusKind =
   | 'failed'
   | 'apiKey'
   | 'unsupported';
+
+/**
+ * How far an account is from usable: `limited` and `credits` are real provider
+ * limits (100% used, a reached-limit flag or blocked usage); `near` is at or over
+ * the switch threshold without one. Automation skips all three alike.
+ */
+export type LimitKind = 'limited' | 'credits' | 'near';
 
 /** One status, in the words both providers share. */
 export interface StatusView {
@@ -45,9 +53,9 @@ export interface StatusView {
 /** Inputs of a status; `statusView` turns them into the shared words. */
 export interface StatusInput {
   kind: StatusKind;
-  /** The active account is itself at its limit (or on purchased credits). */
-  limit?: 'limited' | 'credits' | null;
-  /** When the windows that block the account reopen; null when unknown. */
+  /** The active account is itself limited, on purchased credits or near its limit. */
+  limit?: LimitKind | null;
+  /** When the windows at or over the switch threshold reset; null when unknown. */
   freesAt?: number | null;
   /** Why the last check failed; the row keeps its last reading. */
   failure?: string | null;
@@ -63,6 +71,7 @@ const labels: Record<StatusKind, MessageKey> = {
   active: 'active',
   next: 'next',
   ready: 'statusReady',
+  near: 'statusNearLimit',
   limited: 'statusLimited',
   credits: 'usingCredits',
   signIn: 'signInAgain',
@@ -72,17 +81,48 @@ const labels: Record<StatusKind, MessageKey> = {
   apiKey: 'statusApiKey',
   unsupported: 'statusUnsupported',
 };
+const limitLabels: Record<LimitKind, MessageKey> = {
+  limited: 'statusLimited',
+  credits: 'usingCredits',
+  near: 'statusNearLimit',
+};
 
-/** "Frees in 2h 10m", "Likely free again · refresh to confirm", or nothing when unknown. */
+/**
+ * When a limit lifts: a real limit "Frees in 2h 10m", an account near its limit
+ * "Resets in 2h 10m"; "Likely free again · refresh to confirm" once that time has
+ * passed, or nothing when it is unknown.
+ */
 function freesText(
+  limit: LimitKind,
   freesAt: number | null | undefined,
   now: number,
   locale: Language,
 ): string | null {
   if (freesAt === null || freesAt === undefined) return null;
-  return freesAt > now
-    ? t(locale, 'freesIn', { duration: duration(freesAt, now, locale) })
-    : t(locale, 'statusFreeAgain');
+  if (freesAt <= now) return t(locale, 'statusFreeAgain');
+  const left = duration(freesAt, now, locale);
+  return t(locale, limit === 'near' ? 'resetIn' : 'freesIn', {
+    duration: left,
+  });
+}
+/** "Limit reached · frees in 2h 10m", "Near limit · resets in 2h 10m". */
+function limitWithTime(
+  label: string,
+  limit: LimitKind,
+  freesAt: number | null | undefined,
+  now: number,
+  locale: Language,
+): string {
+  return freesAt !== null && freesAt !== undefined && freesAt > now
+    ? t(
+        locale,
+        limit === 'near' ? 'statusLimitResetsIn' : 'statusLimitFreesIn',
+        {
+          limit: label,
+          duration: duration(freesAt, now, locale),
+        },
+      )
+    : label;
 }
 
 /** The shared status words for one account, at `now`. */
@@ -99,26 +139,25 @@ export function statusView(
     parts.push(t(locale, 'statusFailedDetail'));
     title = input.failure ?? null;
   }
-  if (kind === 'limited' || kind === 'credits') {
-    const frees = freesText(input.freesAt, now, locale);
+  if (kind === 'limited' || kind === 'credits' || kind === 'near') {
+    const frees = freesText(kind, input.freesAt, now, locale);
     if (frees) parts.push(frees);
   }
-  if (kind === 'active' && input.limit) {
-    const limit = t(
-      locale,
-      input.limit === 'credits' ? 'usingCredits' : 'statusLimited',
-    );
-    const freesAt = input.freesAt ?? null;
+  if (kind === 'active' && input.limit)
     parts.push(
-      freesAt !== null && freesAt > now
-        ? t(locale, 'statusLimitFreesIn', {
-            limit,
-            duration: duration(freesAt, now, locale),
-          })
-        : limit,
+      limitWithTime(
+        t(locale, limitLabels[input.limit]),
+        input.limit,
+        input.freesAt,
+        now,
+        locale,
+      ),
     );
-  }
-  const limitedNow = kind === 'limited' || kind === 'credits' || !!input.limit;
+  const limitedNow =
+    kind === 'limited' ||
+    kind === 'credits' ||
+    kind === 'near' ||
+    !!input.limit;
   const resets = input.resets;
   if (limitedNow && resets?.available) {
     parts.push(
@@ -225,6 +264,8 @@ export interface PageView {
   orderEmpty: string;
   /** The active account is at the switch threshold or at its limit. */
   alert: string | null;
+  /** What the alert is about: a real limit shows in red, the others in amber. */
+  alertLimit: LimitKind | null;
   /** Every account is at its limit, and who frees up first. */
   allLimited: string | null;
   /** Saved accounts that need a new sign-in. */
@@ -368,24 +409,19 @@ export function allLimitedText(
 
 /** The active-card callout: at the limit, or at the switch threshold. */
 export function alertText(
-  limit: 'limited' | 'credits' | 'threshold',
+  limit: LimitKind,
   freesAt: number | null,
   threshold: number,
   now: number,
   locale: Language,
 ): string {
   const text =
-    limit === 'threshold'
+    limit === 'near'
       ? t(locale, 'alertThreshold', {
           threshold: percentage(threshold, locale),
         })
-      : t(locale, limit === 'credits' ? 'usingCredits' : 'statusLimited');
-  return freesAt !== null && freesAt > now
-    ? t(locale, 'statusLimitFreesIn', {
-        limit: text,
-        duration: duration(freesAt, now, locale),
-      })
-    : text;
+      : t(locale, limitLabels[limit]);
+  return limitWithTime(text, limit, freesAt, now, locale);
 }
 
 /** Where the order strip explains an empty order. */

@@ -24,7 +24,10 @@
       {#each row.extras as extra (extra.key)}<li>
           <span class="extra-name">{extra.label}</span><span
             class="extra-track"
-            class:full={extra.value !== null && extra.value >= threshold}
+            class:near={extra.value !== null &&
+              extra.value >= threshold &&
+              extra.value < 100}
+            class:full={extra.value !== null && extra.value >= 100}
             role="meter"
             aria-label={extra.label}
             aria-valuemin="0"
@@ -106,6 +109,9 @@
     height: 100%;
     border-radius: 4px;
     background: var(--violet);
+  }
+  .extra-track.near span {
+    background: var(--warn);
   }
   .extra-track.full span {
     background: var(--danger);

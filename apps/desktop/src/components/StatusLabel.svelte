@@ -76,10 +76,12 @@
   [data-kind='failed'] .label {
     color: var(--danger);
   }
-  [data-kind='credits'] .dot {
+  [data-kind='credits'] .dot,
+  [data-kind='near'] .dot {
     background: var(--warn);
   }
-  [data-kind='credits'] .label {
+  [data-kind='credits'] .label,
+  [data-kind='near'] .label {
     color: var(--warn);
   }
   [data-kind='unread'] .dot,

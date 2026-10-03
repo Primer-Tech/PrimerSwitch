@@ -119,20 +119,32 @@ describe('Codex adapter: statuses in the shared words', () => {
       detail: 'Se eliberează în 2 h 10 min',
     });
   });
-  it('treats the shared switch threshold as the limit', () => {
+  it('calls a window at the switch threshold "Near limit" until a real limit', () => {
     const raw = fixture();
     raw.accounts[2].quota!.limits[0].primary!.usedPercent = 96;
     const research = row(raw, 'codex-research');
+    // Not usable for automation, but Codex still serves it.
     expect(research.limited).toBe(true);
     expect(research.status).toMatchObject({
-      label: 'Limit reached',
-      detail: 'Frees in 4h 30m',
+      kind: 'near',
+      label: 'Near limit',
+      detail: 'Resets in 4h 30m',
+    });
+    expect(row(raw, 'codex-research', { locale: 'ro' }).status).toMatchObject({
+      label: 'Aproape de limită',
+      detail: 'Se resetează în 4 h 30 min',
     });
     expect(
       row(raw, 'codex-research', {
         settings: { ...defaults, threshold: 98 },
       }).status.label,
     ).toBe('Next');
+    // A reached-limit flag or blocked usage is a real limit at any percentage.
+    raw.accounts[2].quota!.limits[0].rateLimitReachedType = 'primary';
+    expect(row(raw, 'codex-research').status.label).toBe('Limit reached');
+    raw.accounts[2].quota!.limits[0].rateLimitReachedType = null;
+    raw.accounts[2].quota!.ordinaryUsageAllowed = false;
+    expect(row(raw, 'codex-research').status.label).toBe('Limit reached');
   });
   it('says it is likely free again once the reset has passed', () => {
     const raw = fixture();
@@ -270,22 +282,32 @@ describe('Codex adapter: the page', () => {
     ).toBe(t('ro', 'nextWhyMostLeft'));
   });
   it('calls out an active account at its limit or at the switch threshold', () => {
-    expect(view(fixture()).alert).toBeNull();
+    expect(view(fixture())).toMatchObject({ alert: null, alertLimit: null });
     const limited = fixture();
     limited.accounts[0].quota!.limits[0].primary!.usedPercent = 100;
-    expect(view(limited).alert).toBe('Limit reached · frees in 3h 12m');
+    expect(view(limited)).toMatchObject({
+      alert: 'Limit reached · frees in 3h 12m',
+      alertLimit: 'limited',
+    });
+    expect(row(limited, 'codex-studio').status.detail).toBe(
+      'Limit reached · frees in 3h 12m',
+    );
     const threshold = fixture();
     threshold.accounts[0].quota!.limits[0].primary!.usedPercent = 96;
-    expect(view(threshold).alert).toBe(
-      'Reached the 95% switch threshold · frees in 3h 12m',
+    expect(view(threshold)).toMatchObject({
+      alert: 'Reached the 95% switch threshold · resets in 3h 12m',
+      alertLimit: 'near',
+    });
+    expect(row(threshold, 'codex-studio').status.detail).toBe(
+      'Near limit · resets in 3h 12m',
     );
   });
-  it('says who frees up first when every account is limited', () => {
+  it('says who frees up first when every account is at or near its limit', () => {
     const raw = fixture();
     raw.accounts[0].quota!.limits[0].primary!.usedPercent = 100;
-    raw.accounts[2].quota!.limits[0].secondary!.usedPercent = 100;
+    raw.accounts[2].quota!.limits[0].secondary!.usedPercent = 96;
     expect(view(raw).allLimited).toBe(
-      'Every account is at its limit. personal@example.invalid frees up first, in 2h 10m.',
+      'Every account is at or near its limit. personal@example.invalid frees up first, in 2h 10m.',
     );
     expect(view(fixture()).allLimited).toBeNull();
   });

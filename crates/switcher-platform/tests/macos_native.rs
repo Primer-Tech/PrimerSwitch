@@ -65,26 +65,49 @@ fn set_keychain_list(paths: &[String]) -> Result<(), String> {
     security_ok(arguments).map(|_| ())
 }
 
+fn default_keychain() -> Result<String, String> {
+    let output = security_ok(["default-keychain", "-d", "user"])?;
+    let path = String::from_utf8_lossy(&output)
+        .lines()
+        .map(str::trim)
+        .map(|line| line.trim_matches('"').to_owned())
+        .find(|line| !line.is_empty())
+        .ok_or_else(|| "the macOS user default keychain is empty".to_owned())?;
+    Ok(path)
+}
+
+fn set_default_keychain(path: &str) -> Result<(), String> {
+    security_ok(["default-keychain", "-d", "user", "-s", path]).map(|_| ())
+}
+
 struct KeychainFixture {
     path: PathBuf,
     original_search_list: Vec<String>,
+    original_default_keychain: String,
 }
 
 impl KeychainFixture {
     fn create(root: &Path) -> Result<Self, String> {
         let original_search_list = keychain_list()?;
+        let original_default_keychain = default_keychain()?;
         let path = root.join("primerswitch-fixture.keychain-db");
         let path_text = path.to_string_lossy().into_owned();
         security_ok(["create-keychain", "-p", PASSWORD, &path_text])?;
         let fixture = Self {
             path,
             original_search_list,
+            original_default_keychain,
         };
         let setup = (|| {
             let path_text = fixture.path.to_string_lossy().into_owned();
             security_ok(["unlock-keychain", "-p", PASSWORD, &path_text])?;
             security_ok(["set-keychain-settings", "-lut", "3600", &path_text])?;
             set_keychain_list(&[path_text])?;
+            // SecItemAdd uses the user's default keychain when no explicit
+            // keychain is supplied. Keep the native vault item in the
+            // isolated fixture keychain instead of the runner login keychain.
+            let path_text = fixture.path.to_string_lossy().into_owned();
+            set_default_keychain(&path_text)?;
             Ok::<_, String>(())
         })();
         if let Err(error) = setup {
@@ -114,6 +137,7 @@ impl KeychainFixture {
 
 impl Drop for KeychainFixture {
     fn drop(&mut self) {
+        let _ = set_default_keychain(&self.original_default_keychain);
         let _ = set_keychain_list(&self.original_search_list);
         let path = self.path.to_string_lossy().into_owned();
         let _ = security(["delete-keychain", &path]);

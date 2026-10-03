@@ -13,15 +13,16 @@ export const codexReasonSchema = z.enum([
   'vaultUnavailable',
   'identityUnverified',
   'identityMismatch',
-  'clientsRunning',
-  'processInventoryUnavailable',
   'externalChange',
-  'reconciliationRequired',
   'loginExpired',
   'loginCanceled',
   'providerUnavailable',
-  'invalidPreparation',
   'busy',
+  'daemonRestartFailed',
+  'signInRequired',
+  'switchInProgress',
+  'switcherUnavailable',
+  'activeAccount',
 ]);
 export type CodexReason = z.infer<typeof codexReasonSchema>;
 export const codexCapabilitySchema = z
@@ -64,6 +65,7 @@ export const codexAccountSchema = z
     workspaceId: text.nullable(),
     workspaceName: text.nullable(),
     authKind: z.enum(['chatgpt', 'apiKey', 'unsupported']),
+    planType: text.nullable(),
     identityEvidence: z.enum([
       'none',
       'claimsOnly',
@@ -72,7 +74,7 @@ export const codexAccountSchema = z
     ]),
     identityVerified: z.boolean(),
     selected: z.boolean(),
-    manualSwitch: codexCapabilitySchema,
+    switchable: codexCapabilitySchema,
     quota: z
       .object({
         ordinaryUsageAllowed: z.boolean().nullable(),
@@ -84,6 +86,7 @@ export const codexAccountSchema = z
     quotaReadAt: timestamp,
     quotaState: z.enum(['unread', 'fresh', 'cached', 'unavailable']),
     error: codexReasonSchema.nullable(),
+    needsSignIn: z.boolean(),
   })
   .strict();
 export const codexLoginSchema = z
@@ -91,6 +94,29 @@ export const codexLoginSchema = z
     id,
     status: z.enum(['waiting', 'verifying', 'complete', 'failed']),
     error: codexReasonSchema.nullable(),
+  })
+  .strict();
+const switchingSchema = z
+  .object({
+    targetId: id,
+    stage: z.enum(['saving', 'restarting', 'verifying']),
+    startedAt: z.number().int(),
+  })
+  .strict();
+const lastSwitchSchema = z
+  .object({
+    accountId: id,
+    at: z.number().int(),
+    daemonRestarted: z.boolean(),
+    otherClients: z.number().int().nonnegative(),
+    error: codexReasonSchema.nullable(),
+  })
+  .strict();
+const environmentSchema = z
+  .object({
+    daemonRunning: z.boolean().nullable(),
+    otherClients: z.number().int().nonnegative(),
+    codexSwitcherRunning: z.boolean(),
   })
   .strict();
 export const codexSnapshotSchema = z
@@ -112,8 +138,9 @@ export const codexSnapshotSchema = z
       .object({
         loginBrowser: codexCapabilitySchema,
         importCurrent: codexCapabilitySchema,
+        importSwitcher: codexCapabilitySchema,
         refreshQuota: codexCapabilitySchema,
-        manualSwitch: codexCapabilitySchema,
+        switchAccount: codexCapabilitySchema,
         deleteSaved: codexCapabilitySchema,
       })
       .strict(),
@@ -121,21 +148,16 @@ export const codexSnapshotSchema = z
     busy: z.boolean(),
     error: codexReasonSchema.nullable(),
     demo: z.boolean(),
+    switching: switchingSchema.nullable(),
+    lastSwitch: lastSwitchSchema.nullable(),
+    environment: environmentSchema,
+    warnings: z.array(codexReasonSchema),
   })
-  .strict();
-export const codexPreparationSchema = z
-  .object({ id, accountId: id, expiresAt: z.number().int() })
   .strict();
 export type CodexSnapshot = z.infer<typeof codexSnapshotSchema>;
 export type CodexAccount = z.infer<typeof codexAccountSchema>;
 export type CodexLogin = z.infer<typeof codexLoginSchema>;
-export type CodexPreparation = z.infer<typeof codexPreparationSchema>;
 export type CodexLimit = z.infer<typeof limitSchema>;
-
-export function hasCodexSelectionEvidence(account: CodexAccount): boolean {
-  return (
-    account.authKind === 'chatgpt' &&
-    (account.identityEvidence === 'managedLogin' ||
-      account.identityEvidence === 'backendVerified')
-  );
-}
+export type CodexWindow = z.infer<typeof windowSchema>;
+export type CodexSwitching = z.infer<typeof switchingSchema>;
+export type CodexLastSwitch = z.infer<typeof lastSwitchSchema>;

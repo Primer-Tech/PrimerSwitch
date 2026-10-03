@@ -3,7 +3,7 @@ import { mount } from 'svelte';
 import App from './App.svelte';
 import { createController } from './lib/controller';
 import { createCodexController } from './lib/codex-controller';
-import { codexSnapshot } from './test/codex-fixtures';
+import { codexCapability, codexDemoSnapshot } from './test/codex-fixtures';
 import { snapshot, account } from './test/fixtures';
 import './styles.css';
 import './theme.css';
@@ -36,9 +36,38 @@ const controller = createController({
   },
   subscribe: async () => () => {},
 });
+// Codex preview states: ?codex=switching | signin | limited | setup | empty
+const codexDemo = codexDemoSnapshot();
+const codexScenario = new URLSearchParams(location.search).get('codex');
+if (codexScenario === 'switching')
+  codexDemo.switching = {
+    targetId: 'codex-research',
+    stage: 'restarting',
+    startedAt: Math.floor(Date.now() / 1000) - 23,
+  };
+else if (codexScenario === 'signin')
+  Object.assign(codexDemo.accounts[2], {
+    needsSignIn: true,
+    quotaState: 'unavailable',
+    error: 'signInRequired',
+    switchable: codexCapability('signInRequired'),
+  });
+else if (codexScenario === 'limited')
+  Object.assign(codexDemo.accounts[0].quota!.limits[0].primary!, {
+    usedPercent: 100,
+    resetsAt: Math.floor(Date.now() / 1000) + 47 * 60,
+  });
+else if (codexScenario === 'setup')
+  Object.assign(codexDemo, {
+    availability: 'notInstalled',
+    blockedReason: 'notInstalled',
+    executableVersion: null,
+  });
+else if (codexScenario === 'empty')
+  Object.assign(codexDemo, { accounts: [], selectedId: null });
 const codexController = createCodexController({
   call: async (command) => {
-    if (command === 'get_codex_snapshot') return codexSnapshot({ demo: true });
+    if (command === 'get_codex_snapshot') return codexDemo;
     throw new Error('providerUnavailable');
   },
   subscribe: async () => () => {},

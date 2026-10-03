@@ -1,22 +1,24 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
   import { language, t } from '../lib/i18n';
-  import { age, countdown } from '../lib/format';
+  import { age } from '../lib/format';
   import {
+    codexImportedMessage,
+    codexLastRead,
     codexMessage,
-    codexLimitName,
-    codexWindowLabel,
+    codexNextBest,
   } from '../lib/codex-format';
-  import type { CodexController } from '../lib/codex-controller';
-  import {
-    hasCodexSelectionEvidence,
-    type CodexAccount,
-  } from '../lib/codex-types';
+  import type { CodexController, CodexNotice } from '../lib/codex-controller';
+  import type { CodexAccount } from '../lib/codex-types';
   import Icon from './Icon.svelte';
+  import CodexIcon from './CodexIcon.svelte';
   import ProviderTabs from './ProviderTabs.svelte';
-  import QuotaBar from './QuotaBar.svelte';
-  import CodexQuotas from './CodexQuotas.svelte';
   import Modal from './Modal.svelte';
+  import CodexActiveCard from './CodexActiveCard.svelte';
+  import CodexAccountsTable from './CodexAccountsTable.svelte';
+  import CodexInsights from './CodexInsights.svelte';
+  import CodexSwitchBanner from './CodexSwitchBanner.svelte';
+  import CodexDetails from './CodexDetails.svelte';
   import primerLogo from '../assets/primer-logo.png';
   import meta from '../../package.json';
   let {
@@ -37,87 +39,189 @@
     settingsAvailable?: boolean;
   } = $props();
   let snapshot = $derived($controller.snapshot);
+  let pending = $derived($controller.pending);
   let selected = $derived(
-    snapshot?.accounts.find((a) => a.id === snapshot.selectedId) ?? null,
+    snapshot?.accounts.find((a) => a.id === snapshot.selectedId) ??
+      snapshot?.accounts.find((a) => a.selected) ??
+      null,
   );
-  let disabled = $derived(
+  let switching = $derived(snapshot?.switching ?? null);
+  let switchPending = $derived(pending === 'codex_switch_account');
+  /** Any lock that must keep mutations disabled. */
+  let locked = $derived(
     externalBlocked ||
       externalDemo ||
-      !!$controller.pending ||
+      !!pending ||
       !!snapshot?.busy ||
       !!snapshot?.demo ||
-      $controller.login.open ||
-      $controller.preparation.open,
+      !!switching ||
+      $controller.login.open,
   );
-  let addOpen = $state(false),
-    addButton: HTMLButtonElement;
+  let nextBest = $derived(snapshot ? codexNextBest(snapshot) : null);
+  let switchTargetId = $derived(
+    switching?.targetId ?? (switchPending ? $controller.pendingId : null),
+  );
+  let switchTarget = $derived(
+    snapshot?.accounts.find((a) => a.id === switchTargetId) ?? null,
+  );
+  let switchStartedLocally = $state<number | null>(null);
+  $effect(() => {
+    if (!switching && !switchPending) switchStartedLocally = null;
+    else if (switchStartedLocally === null)
+      switchStartedLocally = Math.floor(Date.now() / 1000);
+  });
+  let lastRead = $derived(codexLastRead(snapshot));
+  let setupProblem = $derived(
+    !!snapshot &&
+      snapshot.availability !== 'supported' &&
+      !(snapshot.availability === 'unqualified' && !snapshot.blockedReason),
+  );
+  let dismissedSnapshotError = $state<string | null>(null);
+  $effect(() => {
+    if (!snapshot?.error) dismissedSnapshotError = null;
+  });
+  let errorReason = $derived(
+    $controller.error &&
+      !(setupProblem && $controller.error === snapshot?.blockedReason)
+      ? $controller.error
+      : snapshot?.error && snapshot.error !== dismissedSnapshotError
+        ? snapshot.error
+        : null,
+  );
+  let warnings = $derived([...new Set(snapshot?.warnings ?? [])]);
+  let dismissedWarnings = $state('');
+  let showWarnings = $derived(
+    warnings.length > 0 && warnings.join(',') !== dismissedWarnings,
+  );
+  let canRefreshAll = $derived(
+    !!snapshot?.capabilities.refreshQuota.enabled &&
+      !!snapshot?.accounts.some(
+        (a) => a.authKind === 'chatgpt' && !a.needsSignIn,
+      ),
+  );
+  let canAdd = $derived(
+    !!snapshot &&
+      (snapshot.capabilities.loginBrowser.enabled ||
+        snapshot.capabilities.importCurrent.enabled ||
+        snapshot.capabilities.importSwitcher.enabled),
+  );
+  let loginFor = $derived(
+    snapshot?.accounts.find((a) => a.id === $controller.login.accountId) ??
+      null,
+  );
+  let addOpen = $state(false);
+  let addButton = $state<HTMLButtonElement | null>(null);
+  let addMenu = $state<HTMLElement | null>(null);
+  let noticeElement = $state<HTMLElement | null>(null);
+  let errorElement = $state<HTMLElement | null>(null);
   let detailsId = $state<string | null>(null),
     deleteTarget = $state<CodexAccount | null>(null),
-    returnFocus = $state<HTMLElement | null>(null),
-    acknowledged = $state(false);
+    returnFocus = $state<HTMLElement | null>(null);
   let details = $derived(
     snapshot?.accounts.find((a) => a.id === detailsId) ?? null,
   );
   onMount(() => {
     void controller.start();
   });
-  $effect(() => {
-    if (!$controller.preparation.open) acknowledged = false;
-  });
-  function add(action: () => void) {
-    addOpen = false;
-    returnFocus = addButton;
-    addButton?.focus();
-    action();
+  function noticeText(notice: CodexNotice): string {
+    switch (notice.kind) {
+      case 'loginComplete': {
+        const account = snapshot?.accounts.find(
+          (a) => a.id === notice.accountId,
+        );
+        return account
+          ? t($language, 'codexSignedInAgain', { name: account.name })
+          : t($language, 'codexLoginComplete');
+      }
+      case 'deleteComplete':
+        return t($language, 'codexDeleteComplete');
+      case 'importedCurrent':
+        return codexImportedMessage('current', notice.added, $language);
+      case 'importedSwitcher':
+        return codexImportedMessage('switcher', notice.added, $language);
+      case 'switched': {
+        const name =
+          snapshot?.accounts.find((a) => a.id === notice.accountId)?.name ??
+          notice.name;
+        return t(
+          $language,
+          notice.daemonRestarted ? 'codexSwitchedLive' : 'codexSwitchedNext',
+          { name },
+        );
+      }
+    }
+  }
+  function focusOutcome(trigger: HTMLElement | null) {
+    const active = document.activeElement;
+    if (
+      trigger?.isConnected &&
+      active &&
+      active !== document.body &&
+      !(active instanceof HTMLButtonElement && active.disabled)
+    )
+      return;
+    setTimeout(() => (noticeElement ?? errorElement)?.focus(), 0);
+  }
+  async function switchTo(account: CodexAccount, trigger: HTMLElement | null) {
+    detailsId = null;
+    await controller.switchAccount(account);
+    await tick();
+    focusOutcome(trigger);
+  }
+  function signIn(account: CodexAccount | null, trigger: HTMLElement | null) {
+    detailsId = null;
+    returnFocus = trigger;
+    void controller.beginLogin(account);
+  }
+  function openDetails(account: CodexAccount, trigger: HTMLElement) {
+    returnFocus = trigger;
+    detailsId = account.id;
+  }
+  function askDelete(account: CodexAccount, trigger: HTMLElement | null) {
+    returnFocus = trigger;
+    detailsId = null;
+    deleteTarget = account;
+  }
+  async function confirmDelete() {
+    const target = deleteTarget;
+    if (target && (await controller.deleteAccount(target.id))) {
+      deleteTarget = null;
+      await tick();
+      focusOutcome(returnFocus);
+    }
   }
   async function cancelLogin() {
     await controller.cancelLogin();
     await tick();
     if (returnFocus?.isConnected) returnFocus.focus();
   }
-  async function cancelSelection() {
-    await controller.dismissPreparation();
-    await tick();
-    if (
-      returnFocus?.isConnected &&
-      !(returnFocus instanceof HTMLButtonElement && returnFocus.disabled)
-    )
-      returnFocus.focus();
-    else document.getElementById('provider-codex')?.focus();
+  function dismissError() {
+    if ($controller.error) controller.dismissError();
+    else dismissedSnapshotError = snapshot?.error ?? null;
   }
-  async function applySelection() {
-    if (await controller.applySwitch(acknowledged)) {
-      await tick();
-      document.getElementById('provider-codex')?.focus();
-    }
+  function add(run: () => void) {
+    addOpen = false;
+    returnFocus = addButton;
+    addButton?.focus();
+    run();
   }
-  function closeAdd(event: KeyboardEvent) {
+  function keydown(event: KeyboardEvent) {
     if (event.key === 'Escape' && addOpen) {
       event.preventDefault();
       addOpen = false;
       addButton?.focus();
     }
   }
-  function openDetails(account: CodexAccount, trigger: HTMLElement) {
-    returnFocus = trigger;
-    detailsId = account.id;
-  }
-  async function selectAccount(account: CodexAccount, trigger: HTMLElement) {
-    returnFocus = trigger;
-    await controller.prepareSwitch(account);
-  }
-  function canSelect(account: CodexAccount) {
-    return (
-      !disabled &&
-      !account.selected &&
-      hasCodexSelectionEvidence(account) &&
-      account.manualSwitch.enabled &&
-      !!snapshot?.capabilities.manualSwitch.enabled
-    );
+  function pointerdown(event: PointerEvent) {
+    if (
+      addOpen &&
+      !(event.target instanceof Node && addMenu?.contains(event.target))
+    )
+      addOpen = false;
   }
 </script>
 
-<svelte:window onkeydown={closeAdd} />
+<svelte:window onkeydown={keydown} onpointerdown={pointerdown} />
 <div class="desktop-shell">
   <aside class="sidebar" aria-label={t($language, 'navigation')}>
     <div class="sidebar-brand" role="img" aria-label="PrimerSwitch">
@@ -164,9 +268,9 @@
           if (provider === 'claude') onclaude();
         }}
         disabled={externalBlocked ||
-          !!$controller.pending ||
-          $controller.login.open ||
-          $controller.preparation.open}
+          !!pending ||
+          !!switching ||
+          $controller.login.open}
       />
     </header>
     {#if snapshot?.demo}<div
@@ -178,38 +282,95 @@
           >{t($language, 'demoNotice')}</span
         >
       </div>{/if}
-    {#if $controller.error || snapshot?.error}<div
-        class="error-notice"
-        role="alert"
+    <div class="codex-live" aria-live="polite">
+      {#if switching || switchPending}<CodexSwitchBanner
+          name={switchTarget?.name ?? ''}
+          stage={switching?.stage ?? 'saving'}
+          elapsed={now - (switching?.startedAt ?? switchStartedLocally ?? now)}
+        />{/if}
+    </div>
+    {#if snapshot?.environment.codexSwitcherRunning}<div
+        class="codex-banner warn"
+        role="note"
       >
-        <span
-          >{codexMessage(
-            $controller.error ?? snapshot?.error ?? null,
-            $language,
-          )}</span
-        >{#if $controller.error}<button
-            class="icon-button"
-            aria-label={t($language, 'dismissMessage')}
-            onclick={() => controller.dismissError()}>×</button
+        <CodexIcon name="warning" />
+        <p>
+          <strong>{t($language, 'codexSwitcherTitle')}</strong>
+          {t($language, 'codexSwitcherText')}
+        </p>
+        {#if snapshot.capabilities.importSwitcher.enabled}<button
+            disabled={locked}
+            onclick={() => controller.importSwitcher()}
+            >{pending === 'codex_import_switcher'
+              ? t($language, 'codexImporting')
+              : t($language, 'codexSwitcherImport')}</button
           >{/if}
       </div>{/if}
-    {#if $controller.notice}<div class="codex-success" role="status">
-        {t(
-          $language,
-          $controller.notice === 'loginComplete'
-            ? 'codexLoginComplete'
-            : $controller.notice === 'switchComplete'
-              ? 'codexSwitchComplete'
-              : 'codexDeleteComplete',
-        )}
+    {#if showWarnings}<div
+        class="codex-banner warn"
+        role="note"
+        aria-label={t($language, 'codexWarnings')}
+      >
+        <CodexIcon name="info" />
+        <ul>
+          {#each warnings as warning (warning)}<li>
+              {codexMessage(warning, $language)}
+            </li>{/each}
+        </ul>
+        <button
+          class="icon-button"
+          aria-label={t($language, 'dismissMessage')}
+          onclick={() => (dismissedWarnings = warnings.join(','))}>×</button
+        >
       </div>{/if}
-    {#if $controller.pending || snapshot?.busy}<div
+    {#if errorReason}<div
+        class="error-notice"
+        role="alert"
+        tabindex="-1"
+        bind:this={errorElement}
+      >
+        <span>{codexMessage(errorReason, $language)}</span><button
+          class="icon-button"
+          aria-label={t($language, 'dismissMessage')}
+          onclick={dismissError}>×</button
+        >
+      </div>{/if}
+    {#if $controller.notice}
+      {@const notice = $controller.notice}
+      {@const warning = notice.kind === 'switched' ? notice.warning : null}
+      <div
+        class="codex-notice"
+        class:warn={!!warning}
+        role="status"
+        tabindex="-1"
+        bind:this={noticeElement}
+      >
+        <CodexIcon name={warning ? 'warning' : 'check'} />
+        <div>
+          <p>{noticeText(notice)}</p>
+          {#if notice.kind === 'switched' && notice.otherClients > 0}<p
+              class="sub"
+            >
+              {t($language, 'codexSwitchedOtherClients')}
+            </p>{/if}
+          {#if warning}<p class="sub warning">
+              {codexMessage(warning, $language)}
+            </p>{/if}
+        </div>
+        <button
+          class="icon-button"
+          aria-label={t($language, 'dismissMessage')}
+          onclick={() => controller.dismissNotice()}>×</button
+        >
+      </div>
+    {/if}
+    {#if snapshot?.busy && !pending && !switching && !$controller.login.open}<div
         class="pending-notice"
         role="status"
       >
         <span class="spinner" aria-hidden="true"></span>{t(
           $language,
-          'codexWorking',
+          'codexBusy',
         )}
       </div>{/if}
     <div
@@ -220,15 +381,16 @@
     >
       <main class="dashboard-grid codex-dashboard">
         <div class="main-column">
-          {#if snapshot && snapshot.availability !== 'supported'}<section
-              class="panel codex-setup"
+          {#if snapshot && setupProblem}<section
+              class="panel codex-setup-panel"
+              aria-labelledby="codex-setup-panel-heading"
             >
               <div class="panel-heading">
-                <h2><Icon name="settings" />{t($language, 'codexSetup')}</h2>
-                <button
-                  {disabled}
-                  onclick={() => controller.action('codex_discover')}
-                  ><Icon name="refresh" />{t(
+                <h2 id="codex-setup-panel-heading">
+                  <Icon name="settings" />{t($language, 'codexSetupTitle')}
+                </h2>
+                <button disabled={locked} onclick={() => controller.discover()}
+                  ><Icon name="refresh" size={16} />{t(
                     $language,
                     'codexCheckSetup',
                   )}</button
@@ -244,256 +406,123 @@
                 )}
               </p>
             </section>{/if}
-          <section
-            class="panel active-panel"
-            aria-labelledby="codex-active-heading"
-          >
-            <div class="panel-heading">
-              <h2 id="codex-active-heading">
-                <span class="status-dot" class:inactive={!selected}></span>{t(
-                  $language,
-                  'codexSelectedAccount',
-                )}
-              </h2>
-              {#if selected}<button
-                  class="quiet-button"
-                  disabled={disabled ||
-                    !snapshot?.capabilities.refreshQuota.enabled ||
-                    selected.authKind !== 'chatgpt'}
-                  aria-label={t($language, 'codexRefreshLabel', {
-                    name: selected.name,
-                  })}
-                  onclick={() =>
-                    controller.action('codex_refresh_account', {
-                      id: selected!.id,
-                    })}><Icon name="refresh" />{t($language, 'refresh')}</button
-                >{/if}
-            </div>
-            {#if selected}
-              <div class="active-title">
-                <span class="avatar large-avatar"
-                  >{selected.name.slice(0, 1).toUpperCase()}</span
-                >
-                <div>
-                  <div class="identity-line">
-                    <h3>{selected.name}</h3>
-                    <span class="badge accent"
-                      >{t($language, 'codexSelected')}</span
-                    ><span class="badge muted"
-                      >{t(
-                        $language,
-                        selected.authKind === 'chatgpt'
-                          ? 'codexChatGPT'
-                          : selected.authKind === 'apiKey'
-                            ? 'codexApiKey'
-                            : 'codexUnsupportedAuth',
-                      )}</span
-                    >
-                  </div>
-                  <p>
-                    {selected.email ??
-                      t(
-                        $language,
-                        'emailUnavailable',
-                      )}{#if selected.workspaceName}<span>
-                        · {selected.workspaceName}</span
-                      >{/if}
-                  </p>
-                </div>
-                {#if snapshot?.activeModel}<span class="active-model"
-                    >{snapshot.activeModel}</span
-                  >{/if}
-              </div>
-              <CodexQuotas account={selected} {now} />
-              <div class="active-caption">
-                <span
-                  >{t(
-                    $language,
-                    selected.quotaState === 'cached' ? 'cachedAge' : 'readAge',
-                    { age: age(selected.quotaReadAt, now, $language) },
-                  )}</span
-                ><button
-                  class="text-button"
-                  onclick={(event) =>
-                    openDetails(selected!, event.currentTarget)}
-                  >{t($language, 'viewAccountDetails')}<Icon
-                    name="next"
-                    size={14}
-                  /></button
-                >
-              </div>
-              {#if selected.error}<p class="warning-text">
-                  {codexMessage(selected.error, $language)}
-                </p>{/if}
-            {:else}<div class="empty-active">
-                <div>
-                  <h3>
-                    {t(
-                      $language,
-                      snapshot ? 'codexNoSelected' : 'loadingAccounts',
-                    )}
-                  </h3>
-                  <p>{t($language, 'codexImportOrAdd')}</p>
-                </div>
-              </div>{/if}
-          </section>
+          <CodexActiveCard
+            {snapshot}
+            account={selected}
+            {now}
+            {locked}
+            refreshing={!!selected &&
+              ((pending === 'codex_refresh_account' &&
+                $controller.pendingId === selected.id) ||
+                pending === 'codex_refresh_all')}
+            {nextBest}
+            onrefresh={(account) => controller.refreshAccount(account.id)}
+            ondetails={openDetails}
+            onswitch={(account, trigger) => switchTo(account, trigger)}
+            onsignin={(account, trigger) => signIn(account, trigger)}
+          />
           <section
             class="saved-section"
             aria-labelledby="codex-accounts-heading"
           >
             <div class="section-heading">
               <h2 id="codex-accounts-heading">
-                {t($language, 'savedAccounts')}<span class="count"
+                {t($language, 'codexSavedAccounts')}<span class="count"
                   >{snapshot?.accounts.length ?? 0}</span
                 >
               </h2>
               <div
                 class="add-menu"
                 role="group"
-                aria-label={t($language, 'addActions')}
+                aria-label={t($language, 'codexAddActions')}
+                bind:this={addMenu}
               >
                 <button
                   class="primary"
                   bind:this={addButton}
-                  disabled={disabled ||
-                    !snapshot ||
-                    (!snapshot.capabilities.loginBrowser.enabled &&
-                      !snapshot.capabilities.importCurrent.enabled)}
+                  disabled={locked || !canAdd}
                   aria-expanded={addOpen}
                   aria-controls="codex-add-actions"
                   onclick={() => (addOpen = !addOpen)}
-                  ><Icon name="plus" size={16} />{t(
-                    $language,
-                    'addAccount',
-                  )}<Icon name="chevron" size={14} /></button
+                  ><Icon name="plus" size={16} />{pending ===
+                    'codex_import_current' ||
+                  pending === 'codex_import_switcher'
+                    ? t($language, 'codexImporting')
+                    : t($language, 'codexAddAccount')}<Icon
+                    name="chevron"
+                    size={14}
+                  /></button
                 >{#if addOpen}<div id="codex-add-actions" class="add-options">
                     <button
-                      disabled={disabled ||
+                      disabled={locked ||
                         !snapshot?.capabilities.loginBrowser.enabled}
-                      onclick={() =>
-                        add(() => {
-                          void controller.beginLogin();
-                        })}>{t($language, 'codexAddAccount')}</button
+                      onclick={() => add(() => signIn(null, addButton))}
+                      ><Icon name="plus" />{t(
+                        $language,
+                        'codexAddSignIn',
+                      )}</button
                     ><button
-                      disabled={disabled ||
+                      disabled={locked ||
                         !snapshot?.capabilities.importCurrent.enabled}
                       onclick={() =>
                         add(() => {
-                          void controller.action('codex_import_current');
-                        })}>{t($language, 'codexImportCurrent')}</button
-                    >
+                          void controller.importCurrent();
+                        })}
+                      ><Icon name="import" />{t(
+                        $language,
+                        'codexAddImportCurrent',
+                      )}</button
+                    >{#if snapshot?.capabilities.importSwitcher.enabled}<button
+                        disabled={locked}
+                        onclick={() =>
+                          add(() => {
+                            void controller.importSwitcher();
+                          })}
+                        ><Icon name="archive" />{t(
+                          $language,
+                          'codexAddImportSwitcher',
+                        )}</button
+                      >{/if}
                   </div>{/if}
               </div>
             </div>
-            {#if snapshot?.accounts.length}<div class="table-scroll">
-                <table class="account-table codex-account-table">
-                  <thead
-                    ><tr
-                      ><th>{t($language, 'account')}</th><th
-                        >{t($language, 'codexSavedQuota')}</th
-                      ><th>{t($language, 'actions')}</th></tr
-                    ></thead
-                  ><tbody>
-                    {#each snapshot.accounts as account (account.id)}<tr
-                        class:current-row={account.selected}
-                        ><td
-                          ><div class="table-identity">
-                            <span class="avatar"
-                              >{account.name.slice(0, 1).toUpperCase()}</span
-                            >
-                            <div>
-                              <div class="identity-line">
-                                <strong>{account.name}</strong
-                                >{#if account.selected}<span class="row-badge"
-                                    >{t($language, 'codexSelected')}</span
-                                  >{/if}
-                              </div>
-                              <span class="account-email"
-                                >{account.email ??
-                                  t(
-                                    $language,
-                                    account.authKind === 'apiKey'
-                                      ? 'codexApiKey'
-                                      : 'emailUnavailable',
-                                  )}</span
-                              >{#if account.workspaceName}<small
-                                  >{account.workspaceName}</small
-                                >{/if}{#if !account.identityVerified}<small
-                                  class="warning-text"
-                                  >{t($language, 'codexQuotaUnverified')}</small
-                                >{/if}
-                            </div>
-                          </div></td
-                        >
-                        <td
-                          >{#if account.authKind === 'chatgpt' && account.identityVerified && account.quota?.limits[0]?.primary}<QuotaBar
-                              compact
-                              value={account.quota.limits[0].primary
-                                .usedPercent}
-                              label={codexWindowLabel(
-                                account.quota.limits[0].primary
-                                  .windowDurationMins,
-                                false,
-                                $language,
-                              )}
-                              {now}
-                              threshold={100}
-                            /><small class="codex-table-reading"
-                              >{t(
-                                $language,
-                                account.quotaState === 'cached'
-                                  ? 'cachedAge'
-                                  : 'readAge',
-                                {
-                                  age: age(account.quotaReadAt, now, $language),
-                                },
-                              )}</small
-                            >{:else}<span class="subtle"
-                              >{t($language, 'codexNoQuotaShort')}</span
-                            >{/if}</td
-                        >
-                        <td
-                          ><div class="row-actions">
-                            <button
-                              class="switch-button"
-                              disabled={!canSelect(account)}
-                              title={!account.manualSwitch.enabled
-                                ? codexMessage(
-                                    account.manualSwitch.blockedReason,
-                                    $language,
-                                  )
-                                : undefined}
-                              onclick={(event) =>
-                                selectAccount(account, event.currentTarget)}
-                              >{t(
-                                $language,
-                                account.selected
-                                  ? 'codexSelected'
-                                  : 'codexSelect',
-                              )}</button
-                            ><button
-                              class="icon-button"
-                              aria-label={t($language, 'detailsLabel', {
-                                name: account.name,
-                              })}
-                              onclick={(event) =>
-                                openDetails(account, event.currentTarget)}
-                              ><Icon name="more" /></button
-                            >
-                          </div></td
-                        ></tr
-                      >{/each}
-                  </tbody>
-                </table>
-              </div>{:else if snapshot}<div class="panel empty-accounts">
-                <h3>{t($language, 'codexEmptyTitle')}</h3>
-                <p>{t($language, 'codexImportOrAdd')}</p>
-                <button
-                  disabled={disabled ||
-                    !snapshot.capabilities.importCurrent.enabled}
-                  onclick={() => controller.action('codex_import_current')}
-                  >{t($language, 'codexImportCurrent')}</button
+            {#if snapshot?.accounts.length}<CodexAccountsTable
+                {snapshot}
+                {now}
+                {locked}
+                {pending}
+                pendingId={$controller.pendingId}
+                onswitch={(account, trigger) => switchTo(account, trigger)}
+                onsignin={(account, trigger) => signIn(account, trigger)}
+                ondetails={openDetails}
+                onrefresh={(account) => controller.refreshAccount(account.id)}
+                ondelete={askDelete}
+              />{:else if snapshot}<div
+                class="panel empty-accounts codex-empty"
+              >
+                <span class="empty-account-icon"
+                  ><CodexIcon name="terminal" size={22} /></span
                 >
+                <h3>{t($language, 'codexEmptyTitle')}</h3>
+                <p>{t($language, 'codexEmptyText')}</p>
+                <div class="empty-actions">
+                  <button
+                    class="primary"
+                    disabled={locked ||
+                      !snapshot.capabilities.loginBrowser.enabled}
+                    onclick={(event) => signIn(null, event.currentTarget)}
+                    >{t($language, 'codexAddSignIn')}</button
+                  ><button
+                    disabled={locked ||
+                      !snapshot.capabilities.importCurrent.enabled}
+                    onclick={() => controller.importCurrent()}
+                    >{t($language, 'codexAddImportCurrent')}</button
+                  >{#if snapshot.capabilities.importSwitcher.enabled}<button
+                      disabled={locked}
+                      onclick={() => controller.importSwitcher()}
+                      >{t($language, 'codexAddImportSwitcher')}</button
+                    >{/if}
+                </div>
               </div>{/if}
           </section>
         </div>
@@ -501,246 +530,93 @@
           class="insights-column"
           aria-label={t($language, 'accountInsights')}
         >
-          <section class="panel">
-            <h2><Icon name="next" />{t($language, 'codexManualTitle')}</h2>
-            <p>{t($language, 'codexManualDescription')}</p>
-            <p>{t($language, 'codexCloseClients')}</p>
-            <div class="codex-mode-badge">
-              {t($language, 'codexManualOnly')}
-            </div>
-          </section>
-          <section class="panel">
-            <div class="panel-heading">
-              <h2>
-                <Icon name="settings" />{t($language, 'codexCompatibility')}
-              </h2>
-              <button
-                class="icon-button"
-                aria-label={t($language, 'codexCheckSetup')}
-                {disabled}
-                onclick={() => controller.action('codex_discover')}
-                ><Icon name="refresh" size={16} /></button
-              >
-            </div>
-            <dl class="automation-list">
-              <div>
-                <dt>{t($language, 'codexVersion')}</dt>
-                <dd>
-                  {snapshot?.executableVersion ?? t($language, 'unknown')}
-                </dd>
-              </div>
-              <div>
-                <dt>{t($language, 'codexBrowserLogin')}</dt>
-                <dd>
-                  {t(
-                    $language,
-                    snapshot?.capabilities.loginBrowser.enabled
-                      ? 'codexAvailable'
-                      : 'codexUnavailable',
-                  )}
-                </dd>
-              </div>
-            </dl>
-            {#if snapshot?.blockedReason}<p>
-                {codexMessage(snapshot.blockedReason, $language)}
-              </p>{/if}
-            <p>{t($language, 'codexSupportScope')}</p>
-          </section>
-          <section class="panel">
-            <h2><Icon name="credits" />{t($language, 'codexResetCredits')}</h2>
-            <div
-              class="credits-value"
-              role="status"
-              aria-label={`${selected?.quota?.resetCreditsAvailable ?? t($language, 'unknown')} ${t($language, 'codexReadOnly')}`}
-            >
-              <strong>{selected?.quota?.resetCreditsAvailable ?? '—'}</strong
-              ><span>{t($language, 'codexReadOnly')}</span>
-            </div>
-            <p>{t($language, 'codexNoCreditActions')}</p>
-          </section>
+          <CodexInsights
+            {snapshot}
+            {now}
+            {locked}
+            {nextBest}
+            checkingSetup={pending === 'codex_discover'}
+            onswitch={(account, trigger) => switchTo(account, trigger)}
+            ondiscover={() => controller.discover()}
+          />
         </aside>
       </main>
     </div>
     <footer class="workspace-footer">
       <div>
-        <span class="status-dot" class:inactive={!selected?.quotaReadAt}
-        ></span><span
-          >{selected?.quotaReadAt
-            ? t($language, 'updatedAge', {
-                age: age(selected.quotaReadAt, now, $language),
+        <span class="status-dot" class:inactive={!lastRead}></span><span
+          >{lastRead
+            ? t($language, 'codexUpdatedAge', {
+                age: age(lastRead, now, $language),
               })
-            : t($language, 'noUpdates')}</span
+            : t($language, 'codexNoReadings')}</span
         >
       </div>
       <span class="version">PrimerSwitch {meta.version}</span><button
         class="quiet-button"
-        {disabled}
-        onclick={() => controller.action('codex_discover')}
-        ><Icon name="refresh" size={15} />{t(
-          $language,
-          'codexCheckSetup',
-        )}</button
+        disabled={locked || !canRefreshAll}
+        onclick={() => controller.refreshAll()}
+        ><Icon name="refresh" size={15} />{pending === 'codex_refresh_all'
+          ? t($language, 'codexRefreshing')
+          : t($language, 'codexRefreshAll')}</button
       >
     </footer>
   </div>
 </div>
 {#if $controller.login.open}<Modal
-    title={t($language, 'codexAddAccount')}
+    title={t($language, loginFor ? 'codexLoginAgainTitle' : 'codexLoginTitle')}
     {returnFocus}
     onclose={() => {
       void cancelLogin();
     }}
   >
-    <p class="modal-intro">{t($language, 'codexLoginDescription')}</p>
-    <p class="help">{t($language, 'codexIsolatedLogin')}</p>
+    <p class="modal-intro">
+      {loginFor
+        ? t($language, 'codexLoginAgainDescription', {
+            name: loginFor.email ?? loginFor.name,
+          })
+        : t($language, 'codexLoginDescription')}
+    </p>
+    {#if !loginFor}<p class="help">
+        {t($language, 'codexLoginKeepsCurrent')}
+      </p>{/if}
     {#if $controller.login.error}<p class="warning-text" role="alert">
         {codexMessage($controller.login.error, $language)}
       </p>{:else}<p class="working-message" role="status">
         <span class="spinner" aria-hidden="true"></span>{t(
           $language,
           $controller.login.working
-            ? 'openingBrowser'
+            ? 'codexLoginOpening'
             : $controller.login.session?.status === 'verifying'
-              ? 'codexVerifyingLogin'
-              : 'codexWaitingLogin',
+              ? 'codexLoginVerifying'
+              : 'codexLoginWaiting',
         )}
       </p>{/if}
     <div class="modal-actions">
       <button onclick={() => cancelLogin()}>{t($language, 'cancel')}</button>
     </div>
   </Modal>{/if}
-{#if $controller.preparation.open}<Modal
-    title={t($language, 'codexSelectTitle')}
-    {returnFocus}
-    onclose={() => {
-      void cancelSelection();
-    }}
-  >
-    <p class="modal-intro">
-      {t($language, 'codexSelectDescription', {
-        name: $controller.preparation.target?.name ?? '',
-      })}
-    </p>
-    <p>{t($language, 'codexCloseClients')}</p>
-    <p class="help">{t($language, 'codexNativeGuard')}</p>
-    {#if $controller.preparation.error}<p class="warning-text" role="alert">
-        {codexMessage($controller.preparation.error, $language)}
-      </p>{/if}
-    {#if $controller.preparation.working}<p
-        class="working-message"
-        role="status"
-      >
-        <span class="spinner" aria-hidden="true"></span>{t(
-          $language,
-          'codexWorking',
-        )}
-      </p>{/if}
-    <label class="codex-ack"
-      ><input
-        type="checkbox"
-        bind:checked={acknowledged}
-        disabled={!!$controller.pending}
-      /><span>{t($language, 'codexClosedAcknowledgement')}</span></label
-    >
-    {#if $controller.preparation.value && $controller.preparation.value.expiresAt <= now}<p
-        class="warning-text"
-        role="alert"
-      >
-        {t($language, 'codexReason_invalidPreparation')}
-      </p>{/if}
-    <div class="modal-actions">
-      <button
-        disabled={$controller.pending === 'codex_apply_switch'}
-        onclick={() => cancelSelection()}>{t($language, 'cancel')}</button
-      >{#if !$controller.preparation.value || $controller.preparation.value.expiresAt <= now}<button
-          class="primary"
-          disabled={!!$controller.pending || externalBlocked}
-          onclick={() => {
-            const target = $controller.preparation.target;
-            if (target) void controller.prepareSwitch(target);
-          }}>{t($language, 'codexCheckAgain')}</button
-        >{:else}<button
-          class="primary"
-          disabled={!acknowledged ||
-            !!$controller.pending ||
-            externalBlocked ||
-            !!snapshot?.demo}
-          onclick={() => applySelection()}>{t($language, 'codexSelect')}</button
-        >{/if}
-    </div>
-  </Modal>{/if}
-{#if details}<Modal
+{#if details && snapshot}<Modal
     title={details.name}
     {returnFocus}
     onclose={() => (detailsId = null)}
   >
-    <div class="codex-details">
-      <p class="subtle">{details.email ?? t($language, 'emailUnavailable')}</p>
-      <dl class="automation-list">
-        <div>
-          <dt>{t($language, 'codexAuthKind')}</dt>
-          <dd>
-            {t(
-              $language,
-              details.authKind === 'chatgpt'
-                ? 'codexChatGPT'
-                : details.authKind === 'apiKey'
-                  ? 'codexApiKey'
-                  : 'codexUnsupportedAuth',
-            )}
-          </dd>
-        </div>
-        <div>
-          <dt>{t($language, 'codexQuotaVerification')}</dt>
-          <dd>
-            {t(
-              $language,
-              details.identityVerified
-                ? 'codexVerified'
-                : 'codexQuotaUnverified',
-            )}
-          </dd>
-        </div>
-        <div>
-          <dt>{t($language, 'codexWorkspace')}</dt>
-          <dd>
-            {details.workspaceName ??
-              details.workspaceId ??
-              t($language, 'unknown')}
-          </dd>
-        </div>
-      </dl>
-      <CodexQuotas account={details} {now} />{#if details.error}<p
-          class="warning-text"
-        >
-          {codexMessage(details.error, $language)}
-        </p>{/if}
-      <p class="help">{t($language, 'codexActiveQuotaOnly')}</p>
-      <div class="modal-actions">
-        <button
-          class="danger-button"
-          disabled={disabled || !snapshot?.capabilities.deleteSaved.enabled}
-          aria-label={t($language, 'deleteLabel', { name: details.name })}
-          onclick={() => {
-            deleteTarget = details;
-            detailsId = null;
-          }}>{t($language, 'deleteAccount')}</button
-        >{#if details.selected}<button
-            disabled={disabled ||
-              !snapshot?.capabilities.refreshQuota.enabled ||
-              details.authKind !== 'chatgpt'}
-            aria-label={t($language, 'codexRefreshLabel', {
-              name: details.name,
-            })}
-            onclick={() =>
-              controller.action('codex_refresh_account', { id: details!.id })}
-            >{t($language, 'refresh')}</button
-          >{/if}
-      </div>
-    </div>
+    <CodexDetails
+      account={details}
+      {snapshot}
+      {now}
+      {locked}
+      checking={(pending === 'codex_refresh_account' &&
+        $controller.pendingId === details.id) ||
+        pending === 'codex_refresh_all'}
+      onswitch={() => switchTo(details!, returnFocus)}
+      onsignin={() => signIn(details, returnFocus)}
+      onrefresh={() => controller.refreshAccount(details!.id)}
+      ondelete={() => askDelete(details!, returnFocus)}
+    />
   </Modal>{/if}
 {#if deleteTarget}<Modal
-    title={t($language, 'deleteTitle')}
+    title={t($language, 'codexDeleteTitle')}
     {returnFocus}
     onclose={() => (deleteTarget = null)}
     ><p class="modal-intro">
@@ -751,19 +627,148 @@
       </p>{/if}
     <div class="modal-actions">
       <button
-        disabled={!!$controller.pending}
+        disabled={pending === 'codex_delete_account'}
         onclick={() => (deleteTarget = null)}>{t($language, 'cancel')}</button
-      ><button
-        class="danger-button"
-        {disabled}
-        onclick={async () => {
-          const target = deleteTarget;
-          if (
-            target &&
-            (await controller.action('codex_delete_account', { id: target.id }))
-          )
-            deleteTarget = null;
-        }}>{t($language, 'deleteAccount')}</button
+      ><button class="danger-button" disabled={locked} onclick={confirmDelete}
+        >{pending === 'codex_delete_account'
+          ? t($language, 'codexDeleting')
+          : t($language, 'codexDeleteConfirm')}</button
       >
     </div></Modal
   >{/if}
+
+<style>
+  :global(:root) {
+    --codex-warn: #f0c46f;
+  }
+  :global(:root[data-theme='light']) {
+    --codex-warn: #8a5300;
+  }
+  @media (prefers-color-scheme: light) {
+    :global(:root:not([data-theme='dark'])) {
+      --codex-warn: #8a5300;
+    }
+  }
+  .codex-banner,
+  .codex-notice {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    padding: 12px 14px 12px 16px;
+    margin-bottom: 17px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: var(--surface);
+    font-size: 0.79rem;
+    line-height: 1.55;
+  }
+  .codex-banner > :global(svg),
+  .codex-notice > :global(svg) {
+    flex: none;
+    margin-top: 1px;
+  }
+  .codex-banner.warn {
+    border-color: color-mix(in srgb, var(--codex-warn) 45%, var(--line));
+    background: color-mix(in srgb, var(--codex-warn) 7%, var(--surface));
+  }
+  .codex-banner.warn > :global(svg) {
+    color: var(--codex-warn);
+  }
+  .codex-banner p,
+  .codex-banner ul {
+    flex: 1;
+    min-width: 0;
+    margin: 0;
+  }
+  .codex-banner ul {
+    padding: 0;
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .codex-banner strong {
+    color: var(--codex-warn);
+  }
+  .codex-banner button:not(.icon-button) {
+    flex: none;
+    align-self: center;
+    font-size: 0.76rem;
+    padding: 0.45rem 0.8rem;
+  }
+  .codex-banner .icon-button,
+  .codex-notice .icon-button {
+    margin: -5px -4px -5px 0;
+  }
+  .codex-notice {
+    border-color: color-mix(in srgb, var(--green) 40%, var(--line));
+    background: color-mix(in srgb, var(--green) 6%, var(--surface));
+  }
+  .codex-notice > :global(svg) {
+    color: var(--green);
+  }
+  .codex-notice > div {
+    flex: 1;
+    min-width: 0;
+  }
+  .codex-notice p {
+    margin: 0;
+  }
+  .codex-notice .sub {
+    color: var(--subtle);
+    margin-top: 3px;
+  }
+  .codex-notice .sub.warning {
+    color: var(--codex-warn);
+  }
+  .codex-notice.warn {
+    border-color: color-mix(in srgb, var(--codex-warn) 45%, var(--line));
+    background: color-mix(in srgb, var(--codex-warn) 7%, var(--surface));
+  }
+  .codex-notice.warn > :global(svg) {
+    color: var(--codex-warn);
+  }
+  .codex-notice:focus-visible,
+  .error-notice:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  .panel.codex-setup-panel {
+    padding: 17px 19px;
+    margin-bottom: 18px;
+    border-color: color-mix(in srgb, var(--danger) 40%, var(--line));
+  }
+  .codex-setup-panel p {
+    margin: 10px 0 0;
+    font-size: 0.8rem;
+    line-height: 1.6;
+    color: var(--subtle);
+  }
+  .codex-setup-panel button {
+    font-size: 0.76rem;
+    padding: 0.45rem 0.8rem;
+  }
+  .codex-empty .empty-actions {
+    display: flex;
+    justify-content: center;
+    flex-wrap: wrap;
+    gap: 9px;
+  }
+  .codex-empty .empty-account-icon {
+    margin-bottom: 14px;
+  }
+  .add-options button {
+    gap: 9px;
+  }
+  @media (max-width: 560px) {
+    .codex-banner {
+      flex-wrap: wrap;
+    }
+    .codex-banner p {
+      flex-basis: calc(100% - 34px);
+    }
+    .codex-banner button:not(.icon-button) {
+      margin-left: 30px;
+    }
+  }
+</style>

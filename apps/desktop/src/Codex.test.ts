@@ -11,10 +11,12 @@ import App from './App.svelte';
 import { createController } from './lib/controller';
 import { createCodexController } from './lib/codex-controller';
 import type { CodexBridge } from './lib/codex-bridge';
+import type { CodexSnapshot } from './lib/codex-types';
 import {
-  codexSnapshot,
   codexAccount,
   codexCapability,
+  codexDemoSnapshot,
+  codexSnapshot,
 } from './test/codex-fixtures';
 import { snapshot } from './test/fixtures';
 import { language, t } from './lib/i18n';
@@ -22,6 +24,7 @@ async function setup(raw = codexSnapshot(), locale: 'en' | 'ro' = 'en') {
   const claude = snapshot();
   claude.settings.language = locale;
   claude.demo = raw.demo;
+  let emit: (value: unknown) => void = () => {};
   const claudeCall = vi.fn().mockResolvedValue(claude),
     call = vi.fn<CodexBridge['call']>().mockResolvedValue(raw);
   const controller = createController({
@@ -30,67 +33,425 @@ async function setup(raw = codexSnapshot(), locale: 'en' | 'ro' = 'en') {
     }),
     codexController = createCodexController({
       call,
-      subscribe: async () => () => {},
+      subscribe: async (callback) => {
+        emit = callback;
+        return () => {};
+      },
     });
   render(App, { controller, codexController });
   await screen.findAllByText('a@example.invalid');
   const tab = screen.getByRole('tab', { name: 'Codex' });
   tab.focus();
   await fireEvent.click(tab);
-  await screen.findByRole('heading', {
-    name: t(locale, 'codexSelectedAccount'),
-  });
+  await screen.findByText(t(locale, 'codexDescription'));
   await waitFor(() => expect(get(codexController).snapshot).not.toBeNull());
   await waitFor(() => expect(get(codexController).pending).toBeNull());
-  return { call, claudeCall, codexController };
+  return {
+    call,
+    claudeCall,
+    codexController,
+    emit: (value: unknown) => emit(value),
+  };
+}
+function deferred() {
+  let resolve!: (value: unknown) => void;
+  const promise = new Promise<unknown>((ok) => (resolve = ok));
+  return { promise, resolve };
+}
+const row = (email: string) =>
+  within(screen.getByRole('table')).getByText(email).closest('tr')!;
+function switched(
+  id: string,
+  revision: number,
+  outcome: Partial<NonNullable<CodexSnapshot['lastSwitch']>> = {},
+) {
+  const raw = codexSnapshot({ revision, selectedId: id });
+  raw.accounts.forEach((account) => (account.selected = account.id === id));
+  raw.lastSwitch = {
+    accountId: id,
+    at: Math.floor(Date.now() / 1000),
+    daemonRestarted: true,
+    otherClients: 0,
+    error: null,
+    ...outcome,
+  };
+  return raw;
 }
 afterEach(() => language.set('en'));
-describe('Codex dashboard and guarded workflows', () => {
-  it('renders every native quota group, nullable permissions, credit strings and unknown reset times', async () => {
+describe('Codex accounts page', () => {
+  it('shows every saved account with both windows, plan and a plain-language status', async () => {
     await setup();
+    const table = screen.getByRole('table');
     expect(
-      screen.getByText('Included usage permission is unknown'),
-    ).toBeVisible();
+      within(table)
+        .getAllByRole('columnheader')
+        .map((header) => header.textContent?.trim()),
+    ).toEqual(['Account', '5 hours', 'Weekly', 'Status', 'Actions']);
+    const personal = within(row('personal@example.invalid'));
+    expect(personal.getByRole('meter', { name: '5 hours' })).toHaveAttribute(
+      'aria-valuenow',
+      '100',
+    );
+    expect(personal.getByRole('meter', { name: 'Weekly' })).toHaveAttribute(
+      'aria-valuenow',
+      '62',
+    );
+    expect(personal.getByText('Plus')).toBeVisible();
+    expect(personal.getByText('Limit reached')).toBeVisible();
+    expect(personal.getByText(/^Frees in 2h 1\dm$/)).toBeVisible();
+    const research = within(row('research@example.invalid'));
+    expect(research.getByText('Pro Lite')).toBeVisible();
+    expect(research.getByText('Ready')).toBeVisible();
+    expect(
+      research.getByRole('button', {
+        name: 'Switch Codex to research@example.invalid',
+      }),
+    ).toBeEnabled();
+    const studio = within(row('studio@example.invalid'));
+    expect(studio.getByText('Active')).toBeVisible();
+    expect(studio.queryByRole('button', { name: /^Switch/ })).toBeNull();
     const active = within(
       screen
-        .getByRole('heading', { name: 'Selected for new clients' })
+        .getByRole('heading', { name: 'Active account' })
         .closest('section')!,
     );
-    expect(
-      active.getByRole('meter', { name: '5-hour window' }),
-    ).toHaveAttribute('aria-valuenow', '42');
-    expect(active.getByRole('meter', { name: '7-day window' })).toHaveAttribute(
+    expect(active.getByRole('heading', { level: 3 })).toHaveTextContent(
+      'studio@example.invalid',
+    );
+    expect(active.getByRole('meter', { name: '5 hours' })).toHaveAttribute(
       'aria-valuenow',
-      '19',
+      '40',
+    );
+    expect(active.getByRole('meter', { name: 'Weekly' })).toHaveAttribute(
+      'aria-valuenow',
+      '35',
     );
     expect(
-      active
-        .getByRole('meter', { name: '1-day window' })
-        .closest('.usage-quota'),
-    ).toHaveTextContent('Reset time unknown');
-    expect(screen.getByText('12.50')).toBeVisible();
+      active.getByRole('meter', { name: 'Code review · Weekly' }),
+    ).toHaveAttribute('aria-valuenow', '12');
+    expect(active.queryByRole('meter', { name: /^Codex ·/ })).toBeNull();
+    expect(active.getByText('12.50')).toBeVisible();
+    expect(screen.getByText('Codex 0.160.0 · ready')).toBeVisible();
     expect(
-      screen.getByRole('status', { name: 'Unknown Read-only' }),
+      screen.getByRole('heading', { name: 'How switching works' }),
     ).toBeVisible();
-    expect(screen.getByText('Personal Codex').closest('tr')).toHaveTextContent(
-      'Saved reading',
+  });
+  it('drops the close-your-clients model and its jargon', async () => {
+    await setup();
+    for (const retired of [
+      /Close Codex/i,
+      /Manual account selection/i,
+      /Selected for new clients/i,
+      /Read-only/i,
+      /Included usage permission is unknown/i,
+      /Quota ownership/i,
+      /FILE credential storage/i,
+    ])
+      expect(screen.queryByText(retired)).toBeNull();
+    expect(screen.queryByRole('checkbox')).toBeNull();
+    expect(screen.queryByRole('dialog')).toBeNull();
+  });
+  it('recommends the next best account and switches with one call, showing progress then success', async () => {
+    const { call, emit } = await setup();
+    const next = within(
+      screen.getByRole('heading', { name: 'Next best' }).closest('section')!,
+    );
+    expect(next.getByText('research@example.invalid')).toBeVisible();
+    const result = deferred();
+    call.mockReturnValueOnce(result.promise);
+    await fireEvent.click(
+      next.getByRole('button', {
+        name: 'Switch now to research@example.invalid',
+      }),
+    );
+    expect(call).toHaveBeenCalledWith('codex_switch_account', {
+      id: 'codex-research',
+    });
+    expect(
+      await screen.findByText('Switching to research@example.invalid'),
+    ).toBeVisible();
+    expect(screen.getByText('Saving the new sign-in…')).toBeVisible();
+    expect(screen.getByRole('button', { name: /Add account/ })).toBeDisabled();
+    expect(
+      within(row('personal@example.invalid')).getByRole('button', {
+        name: 'Switch Codex to personal@example.invalid',
+      }),
+    ).toBeDisabled();
+    emit(
+      codexSnapshot({
+        revision: 2,
+        busy: true,
+        switching: {
+          targetId: 'codex-research',
+          stage: 'restarting',
+          startedAt: Math.floor(Date.now() / 1000),
+        },
+      }),
     );
     expect(
-      screen.queryByRole('button', { name: 'Manage automation' }),
-    ).not.toBeInTheDocument();
-    expect(screen.queryByText('Consumption order')).not.toBeInTheDocument();
+      await screen.findByText(t('en', 'codexStageRestarting')),
+    ).toBeVisible();
+    result.resolve(switched('codex-research', 3));
     expect(
-      screen.queryByText('Weekly · selected model'),
-    ).not.toBeInTheDocument();
+      await screen.findByText(
+        'Codex now uses research@example.invalid. Open terminals reconnect automatically.',
+      ),
+    ).toBeVisible();
+    expect(screen.queryByText(t('en', 'codexStageRestarting'))).toBeNull();
+    expect(
+      within(
+        screen
+          .getByRole('heading', { name: 'Active account' })
+          .closest('section')!,
+      ).getByRole('heading', { level: 3 }),
+    ).toHaveTextContent('research@example.invalid');
+    expect(
+      call.mock.calls.filter(([name]) => name === 'codex_switch_account'),
+    ).toHaveLength(1);
+  });
+  it('shows a partial switch as a warning and moves focus to the result', async () => {
+    const { call } = await setup();
+    call.mockResolvedValueOnce(
+      switched('codex-research', 2, {
+        daemonRestarted: false,
+        otherClients: 1,
+        error: 'daemonRestartFailed',
+      }),
+    );
+    await fireEvent.click(
+      within(row('research@example.invalid')).getByRole('button', {
+        name: 'Switch Codex to research@example.invalid',
+      }),
+    );
+    const notice = (
+      await screen.findByText(
+        'Codex now uses research@example.invalid. It applies to the next Codex session you start.',
+      )
+    ).closest('[role="status"]') as HTMLElement;
+    expect(notice).toHaveTextContent(t('en', 'codexSwitchedOtherClients'));
+    expect(notice).toHaveTextContent(
+      t('en', 'codexReason_daemonRestartFailed'),
+    );
+    expect(screen.queryByRole('alert')).toBeNull();
+    await waitFor(() => expect(notice).toHaveFocus());
+    await fireEvent.click(
+      within(notice).getByRole('button', { name: 'Dismiss message' }),
+    );
+    expect(notice).not.toBeInTheDocument();
+  });
+  it('explains a rejected switch without claiming success', async () => {
+    const { call } = await setup();
+    call.mockRejectedValueOnce('switchInProgress');
+    await fireEvent.click(
+      within(row('research@example.invalid')).getByRole('button', {
+        name: 'Switch Codex to research@example.invalid',
+      }),
+    );
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      t('en', 'codexReason_switchInProgress'),
+    );
+    expect(screen.queryByText(/Codex now uses/)).toBeNull();
+    expect(
+      within(row('studio@example.invalid')).getByText('Active'),
+    ).toBeVisible();
+  });
+  it('warns about Codex Switcher and imports its accounts', async () => {
+    const raw = codexSnapshot();
+    raw.environment.codexSwitcherRunning = true;
+    raw.capabilities.importSwitcher = codexCapability();
+    const { call } = await setup(raw);
+    expect(screen.getByText('Codex Switcher is running.')).toBeVisible();
+    expect(
+      screen.getByText(/force-closes Codex terminals when it switches/),
+    ).toBeVisible();
+    const imported = codexSnapshot({ revision: 2 });
+    imported.environment.codexSwitcherRunning = true;
+    imported.capabilities.importSwitcher = codexCapability();
+    imported.accounts.push(
+      codexAccount('codex-team'),
+      codexAccount('codex-lab'),
+    );
+    call.mockResolvedValueOnce(imported);
+    await fireEvent.click(
+      screen.getByRole('button', { name: 'Import its accounts' }),
+    );
+    expect(call).toHaveBeenCalledWith('codex_import_switcher', undefined);
+    expect(
+      await screen.findByText('Imported 2 accounts from Codex Switcher.'),
+    ).toBeVisible();
+    await fireEvent.click(screen.getByRole('button', { name: /Add account/ }));
+    expect(
+      screen.getByRole('button', { name: 'Import from Codex Switcher' }),
+    ).toBeEnabled();
+  });
+  it('lists only the available add-account entries', async () => {
+    await setup();
+    expect(screen.queryByText('Codex Switcher is running.')).toBeNull();
+    await fireEvent.click(screen.getByRole('button', { name: /Add account/ }));
+    expect(
+      screen.getByRole('button', { name: 'Sign in with ChatGPT…' }),
+    ).toBeEnabled();
+    expect(
+      screen.getByRole('button', { name: 'Import current Codex sign-in' }),
+    ).toBeEnabled();
+    expect(
+      screen.queryByRole('button', { name: 'Import from Codex Switcher' }),
+    ).toBeNull();
+    await fireEvent.keyDown(window, { key: 'Escape' });
+    expect(
+      screen.queryByRole('button', { name: 'Sign in with ChatGPT…' }),
+    ).toBeNull();
+    expect(screen.getByRole('button', { name: /Add account/ })).toHaveFocus();
+  });
+  it('offers Sign in again for expired saved sign-ins', async () => {
+    const raw = codexSnapshot();
+    Object.assign(raw.accounts[2], {
+      needsSignIn: true,
+      error: 'signInRequired',
+      quotaState: 'unavailable',
+      switchable: codexCapability('signInRequired'),
+    });
+    const { call } = await setup(raw);
+    const research = within(row('research@example.invalid'));
+    expect(research.getByText('Sign in again')).toBeVisible();
+    expect(research.queryByRole('button', { name: /^Switch/ })).toBeNull();
+    expect(screen.queryByRole('heading', { name: 'Next best' })).toBeNull();
+    call.mockResolvedValueOnce({
+      id: 'login-again',
+      status: 'waiting',
+      error: null,
+    });
+    const trigger = research.getByRole('button', {
+      name: 'Sign in again as research@example.invalid',
+    });
+    expect(trigger).toHaveTextContent('Sign in');
+    await fireEvent.click(trigger);
+    expect(call).toHaveBeenCalledWith('codex_begin_login');
+    const dialog = await screen.findByRole('dialog');
+    expect(within(dialog).getByRole('heading')).toHaveTextContent(
+      'Sign in again',
+    );
+    expect(dialog).toHaveTextContent(
+      'Sign in as research@example.invalid in your browser.',
+    );
+    await fireEvent(dialog, new Event('cancel', { cancelable: true }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    expect(call).toHaveBeenCalledWith('codex_cancel_login', {
+      id: 'login-again',
+    });
+    await waitFor(() => expect(trigger).toHaveFocus());
+  });
+  it('uses managed browser completion with no pasted-code input and restores Add focus on cancellation', async () => {
+    const { call } = await setup();
+    const add = screen.getByRole('button', { name: /Add account/ });
+    await fireEvent.click(add);
+    call.mockResolvedValueOnce({
+      id: 'login-ui',
+      status: 'waiting',
+      error: null,
+    });
+    await fireEvent.click(
+      screen.getByRole('button', { name: 'Sign in with ChatGPT…' }),
+    );
+    const dialog = await screen.findByRole('dialog');
+    expect(dialog).toHaveTextContent('there’s no code to paste');
+    expect(dialog).toHaveTextContent(t('en', 'codexLoginKeepsCurrent'));
+    expect(within(dialog).queryByRole('textbox')).toBeNull();
+    await waitFor(() =>
+      expect(
+        screen.getByText('Waiting for you to finish in the browser…'),
+      ).toBeVisible(),
+    );
+    await fireEvent(dialog, new Event('cancel', { cancelable: true }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    expect(call).toHaveBeenCalledWith('codex_cancel_login', { id: 'login-ui' });
+    await waitFor(() => expect(add).toHaveFocus());
+  });
+  it('refreshes any account from its menu, opens details and keeps Delete off the active account', async () => {
+    const { call, codexController } = await setup();
+    const personalMenu = within(row('personal@example.invalid')).getByRole(
+      'button',
+      { name: 'More actions for personal@example.invalid' },
+    );
+    await fireEvent.click(personalMenu);
+    expect(personalMenu).toHaveAttribute('aria-expanded', 'true');
+    await fireEvent.click(
+      screen.getByRole('button', { name: 'Refresh usage' }),
+    );
+    expect(call).toHaveBeenCalledWith('codex_refresh_account', {
+      id: 'codex-personal',
+    });
+    expect(personalMenu).toHaveFocus();
+    await waitFor(() => expect(get(codexController).pending).toBeNull());
+    const studioMenu = within(row('studio@example.invalid')).getByRole(
+      'button',
+      { name: 'More actions for studio@example.invalid' },
+    );
+    await fireEvent.click(studioMenu);
+    const deleteActive = screen.getByRole('button', { name: 'Delete' });
+    expect(deleteActive).toBeDisabled();
+    expect(deleteActive).toHaveAccessibleDescription(
+      'Switch to another account before removing this one.',
+    );
+    await fireEvent.keyDown(window, { key: 'Escape' });
+    expect(studioMenu).toHaveFocus();
+    expect(screen.queryByRole('button', { name: 'Delete' })).toBeNull();
+    await fireEvent.click(personalMenu);
+    await fireEvent.click(screen.getByRole('button', { name: 'Details' }));
+    const dialog = screen.getByRole('dialog');
+    expect(within(dialog).getByRole('heading', { level: 2 })).toHaveTextContent(
+      'personal@example.invalid',
+    );
+    expect(dialog).toHaveTextContent('Limit reached');
+    expect(dialog).toHaveTextContent('ChatGPT account');
+    expect(dialog).toHaveTextContent('Plus');
+    await fireEvent.click(
+      within(dialog).getByRole('button', { name: 'Delete from PrimerSwitch' }),
+    );
+    const confirm = screen.getByRole('dialog');
+    expect(confirm).toHaveTextContent(
+      'doesn’t sign you out of ChatGPT or change the account Codex uses now',
+    );
+    await fireEvent.click(
+      within(confirm).getByRole('button', { name: 'Cancel' }),
+    );
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    await waitFor(() => expect(personalMenu).toHaveFocus());
+    expect(
+      call.mock.calls.some(([name]) => name === 'codex_delete_account'),
+    ).toBe(false);
+    await fireEvent.click(screen.getByRole('button', { name: /Refresh all/ }));
+    expect(call).toHaveBeenCalledWith('codex_refresh_all', undefined);
+  });
+  it('shows unsupported setup explicitly and keeps actions disabled', async () => {
+    const raw = codexSnapshot({
+      availability: 'unsupported',
+      blockedReason: 'unsupportedStore',
+    });
+    Object.keys(raw.capabilities).forEach((key) => {
+      raw.capabilities[key as keyof typeof raw.capabilities] =
+        codexCapability('unsupportedStore');
+    });
+    raw.accounts.forEach(
+      (account) => (account.switchable = codexCapability('unsupportedStore')),
+    );
+    await setup(raw);
+    expect(
+      screen.getByRole('heading', { name: 'Codex setup' }).closest('section'),
+    ).toHaveTextContent(t('en', 'codexReason_unsupportedStore'));
+    expect(screen.getByRole('button', { name: /Add account/ })).toBeDisabled();
+    expect(
+      screen.getByRole('button', {
+        name: 'Switch Codex to research@example.invalid',
+      }),
+    ).toBeDisabled();
+    expect(screen.queryByRole('heading', { name: 'Next best' })).toBeNull();
+    expect(screen.getByText('Codex 0.160.0 · needs attention')).toBeVisible();
   });
   it('supports keyboard provider navigation and keeps the active Codex tab on Codex', async () => {
     const { claudeCall } = await setup();
     const codex = screen.getByRole('tab', { name: 'Codex' });
-    await fireEvent.click(codex);
-    expect(screen.getByRole('tab', { name: 'Codex' })).toHaveAttribute(
-      'aria-selected',
-      'true',
-    );
+    expect(codex).toHaveAttribute('aria-selected', 'true');
     await fireEvent.keyDown(codex, { key: 'ArrowLeft' });
     await waitFor(() =>
       expect(screen.getByRole('tab', { name: /Claude/ })).toHaveFocus(),
@@ -105,290 +466,31 @@ describe('Codex dashboard and guarded workflows', () => {
       claudeCall.mock.calls.every(([name]) => name === 'get_snapshot'),
     ).toBe(true);
   });
-  it('uses managed browser completion with no pasted-code input and restores Add focus on cancellation', async () => {
-    const { call } = await setup();
-    const add = screen.getByRole('button', { name: /Add account/ });
-    await fireEvent.click(add);
-    call.mockResolvedValueOnce({
-      id: 'login-ui',
-      status: 'waiting',
-      error: null,
-    });
-    await fireEvent.click(
-      screen.getByRole('button', { name: 'Add a Codex account' }),
-    );
-    const dialog = await screen.findByRole('dialog');
-    expect(dialog).toHaveTextContent('no code needs to be pasted');
-    expect(within(dialog).queryByRole('textbox')).not.toBeInTheDocument();
-    await waitFor(() =>
-      expect(screen.getByText('Waiting for browser sign-in…')).toBeVisible(),
-    );
-    await fireEvent(dialog, new Event('cancel', { cancelable: true }));
-    await waitFor(() =>
-      expect(screen.queryByRole('dialog')).not.toBeInTheDocument(),
-    );
-    expect(call).toHaveBeenCalledWith('codex_cancel_login', { id: 'login-ui' });
-    await waitFor(() => expect(add).toHaveFocus());
-  });
-  it('requires a closed-client acknowledgment before applying an opaque preparation', async () => {
-    const { call } = await setup();
-    call.mockResolvedValueOnce({
-      id: 'prepare-ui',
-      accountId: 'codex-b',
-      expiresAt: Math.floor(Date.now() / 1000) + 60,
-    });
-    await fireEvent.click(
-      screen.getByRole('button', { name: 'Select account' }),
-    );
-    const dialog = screen.getByRole('dialog');
-    expect(dialog).toHaveTextContent('Reopen them after the change');
-    const apply = within(dialog).getByRole('button', {
-      name: 'Select account',
-    });
-    await waitFor(() =>
-      expect(within(dialog).getByRole('checkbox')).toBeEnabled(),
-    );
-    expect(apply).toBeDisabled();
-    await fireEvent.click(within(dialog).getByRole('checkbox'));
-    expect(apply).toBeEnabled();
-    call.mockRejectedValueOnce('clientsRunning');
-    await fireEvent.click(apply);
-    await waitFor(() =>
-      expect(within(dialog).getByRole('alert')).toHaveTextContent(
-        'Close Codex clients',
-      ),
-    );
-    expect(
-      screen.queryByText('Account selected. Reopen Codex clients to use it.'),
-    ).not.toBeInTheDocument();
-    expect(call).toHaveBeenLastCalledWith('codex_apply_switch', {
-      preparationId: 'prepare-ui',
-      clientsClosedAcknowledged: true,
-    });
-  });
-  it('cancels the native preparation when the switch dialog is dismissed', async () => {
-    const { call } = await setup();
-    const trigger = screen.getByRole('button', { name: 'Select account' });
-    call.mockResolvedValueOnce({
-      id: 'prepare-cancel',
-      accountId: 'codex-b',
-      expiresAt: Math.floor(Date.now() / 1000) + 60,
-    });
-    await fireEvent.click(trigger);
-    const dialog = screen.getByRole('dialog');
-    await waitFor(() =>
-      expect(within(dialog).getByRole('checkbox')).toBeEnabled(),
-    );
-    await fireEvent.click(
-      within(dialog).getByRole('button', { name: 'Cancel' }),
-    );
-    await waitFor(() =>
-      expect(call).toHaveBeenCalledWith('codex_cancel_preparation', {
-        id: 'prepare-cancel',
-      }),
-    );
-    await waitFor(() =>
-      expect(screen.queryByRole('dialog')).not.toBeInTheDocument(),
-    );
-    await waitFor(() => expect(trigger).toHaveFocus());
-  });
-  it('announces authoritative selection and restores usable provider focus', async () => {
-    const { call } = await setup();
-    call.mockResolvedValueOnce({
-      id: 'prepare-success',
-      accountId: 'codex-b',
-      expiresAt: Math.floor(Date.now() / 1000) + 60,
-    });
-    await fireEvent.click(
-      screen.getByRole('button', { name: 'Select account' }),
-    );
-    const dialog = screen.getByRole('dialog');
-    await waitFor(() =>
-      expect(within(dialog).getByRole('checkbox')).toBeEnabled(),
-    );
-    await fireEvent.click(within(dialog).getByRole('checkbox'));
-    const selected = codexSnapshot({ revision: 2, selectedId: 'codex-b' });
-    selected.accounts[0].selected = false;
-    selected.accounts[1].selected = true;
-    call.mockResolvedValueOnce(selected);
-    await fireEvent.click(
-      within(dialog).getByRole('button', { name: 'Select account' }),
-    );
-    await waitFor(() =>
-      expect(screen.queryByRole('dialog')).not.toBeInTheDocument(),
-    );
-    expect(
-      screen.getByText('Account selected. Reopen Codex clients to use it.'),
-    ).toBeVisible();
-    await waitFor(() =>
-      expect(screen.getByRole('tab', { name: 'Codex' })).toHaveFocus(),
-    );
-    expect(
-      screen.getByRole('heading', { name: 'Personal Codex' }),
-    ).toBeVisible();
-  });
-  it('refreshes only the selected account and imports current explicitly', async () => {
-    const { call } = await setup();
-    await fireEvent.click(
-      screen.getByRole('button', {
-        name: 'Refresh Codex quota for Studio Codex',
-      }),
-    );
-    await waitFor(() =>
-      expect(call).toHaveBeenCalledWith('codex_refresh_account', {
-        id: 'codex-a',
-      }),
-    );
-    await fireEvent.click(
-      screen.getByRole('button', {
-        name: 'Account details and actions for Personal Codex',
-      }),
-    );
-    const dialog = screen.getByRole('dialog');
-    expect(
-      within(dialog).queryByRole('button', { name: /Refresh/ }),
-    ).not.toBeInTheDocument();
-    await fireEvent.click(
-      within(dialog).getByRole('button', { name: 'Close' }),
-    );
-    await fireEvent.click(screen.getByRole('button', { name: /Add account/ }));
-    await fireEvent.click(
-      screen.getByRole('button', { name: 'Import current Codex account' }),
-    );
-    await waitFor(() =>
-      expect(call).toHaveBeenCalledWith('codex_import_current', undefined),
-    );
-  });
-  it('confirms saved deletion without claiming logout or exposing API-key quota support', async () => {
-    const raw = codexSnapshot();
-    raw.accounts.push(
-      codexAccount('api-fixture', {
-        name: 'API workspace',
-        authKind: 'apiKey',
-        identityVerified: false,
-        selected: false,
-        quota: codexAccount().quota,
-        quotaReadAt: null,
-        manualSwitch: codexCapability('unsupportedAuth'),
-      }),
-    );
-    const { call } = await setup(raw);
-    const row = screen.getByText('API workspace').closest('tr')!;
-    expect(
-      within(row).getByRole('button', { name: 'Select account' }),
-    ).toBeDisabled();
-    const trigger = screen.getByRole('button', {
-      name: 'Account details and actions for API workspace',
-    });
-    await fireEvent.click(trigger);
-    expect(screen.getByRole('dialog')).toHaveTextContent(
-      'do not have ChatGPT subscription quota',
-    );
-    expect(
-      within(screen.getByRole('dialog')).queryByRole('meter'),
-    ).not.toBeInTheDocument();
-    await fireEvent.click(
-      within(screen.getByRole('dialog')).getByRole('button', {
-        name: 'Delete account API workspace',
-      }),
-    );
-    expect(screen.getByRole('dialog')).toHaveTextContent(
-      'current Codex sign-in remains unchanged',
-    );
-    expect(
-      call.mock.calls.some(([name]) => name === 'codex_delete_account'),
-    ).toBe(false);
-    await fireEvent.click(
-      within(screen.getByRole('dialog')).getByRole('button', {
-        name: 'Cancel',
-      }),
-    );
-    await waitFor(() => expect(trigger).toHaveFocus());
-  });
-  it('permits historical owned accounts after restart and rejects enabled claims-only rows', async () => {
-    const raw = codexSnapshot();
-    raw.accounts[1].identityVerified = false;
-    raw.accounts[1].identityEvidence = 'managedLogin';
-    raw.accounts[1].name = 'Historical managed';
-    raw.accounts.push(
-      codexAccount('historical-backend', {
-        name: 'Historical backend',
-        selected: false,
-        identityVerified: false,
-        identityEvidence: 'backendVerified',
-      }),
-    );
-    raw.accounts.push(
-      codexAccount('forged-claims', {
-        name: 'Unverified claims',
-        selected: false,
-        identityVerified: true,
-        identityEvidence: 'claimsOnly',
-      }),
-    );
-    const { call } = await setup(raw);
-    const managed = within(
-      screen.getByText('Historical managed').closest('tr')!,
-    ).getByRole('button', { name: 'Select account' });
-    expect(managed).toBeEnabled();
-    expect(
-      screen.getByText('Historical managed').closest('tr'),
-    ).toHaveTextContent(
-      'Quota ownership has not been verified in this session.',
-    );
-    expect(
-      within(screen.getByText('Historical backend').closest('tr')!).getByRole(
-        'button',
-        { name: 'Select account' },
-      ),
-    ).toBeEnabled();
-    expect(
-      within(screen.getByText('Unverified claims').closest('tr')!).getByRole(
-        'button',
-        { name: 'Select account' },
-      ),
-    ).toBeDisabled();
-    expect(
-      within(screen.getByText('Historical managed').closest('tr')!).queryByRole(
-        'meter',
-      ),
-    ).not.toBeInTheDocument();
-    call.mockResolvedValueOnce({
-      id: 'historical-prepare',
-      accountId: 'codex-b',
-      expiresAt: Math.floor(Date.now() / 1000) + 60,
-    });
-    await fireEvent.click(managed);
-    await waitFor(() =>
-      expect(call).toHaveBeenCalledWith('codex_prepare_switch', {
-        id: 'codex-b',
-      }),
-    );
-  });
-  it('shows unsupported stores explicitly and keeps restricted actions disabled', async () => {
-    const raw = codexSnapshot({
-      availability: 'unsupported',
-      blockedReason: 'unsupportedStore',
-    });
-    Object.keys(raw.capabilities).forEach((key) => {
-      raw.capabilities[key as keyof typeof raw.capabilities] =
-        codexCapability('unsupportedStore');
-    });
-    await setup(raw);
-    expect(
-      screen.getAllByText(/credential store is not supported yet/).length,
-    ).toBeGreaterThan(0);
-    expect(screen.getByRole('button', { name: /Add account/ })).toBeDisabled();
-    expect(
-      screen.getByRole('button', { name: 'Select account' }),
-    ).toBeDisabled();
-  });
-  it('retains global Romanian settings and read-only demo across providers', async () => {
-    const { call } = await setup(codexSnapshot({ demo: true }), 'ro');
+  it('keeps the Romanian demo read-only across providers', async () => {
+    const { call } = await setup(codexDemoSnapshot(), 'ro');
     expect(document.documentElement.lang).toBe('ro');
     expect(
-      screen.getByRole('button', { name: new RegExp(t('ro', 'addAccount')) }),
+      screen.getByText('Schimbă contul Codex fără să-ți închizi terminalele.'),
+    ).toBeVisible();
+    expect(screen.getByText('Codex Switcher rulează.')).toBeVisible();
+    expect(
+      screen.getByRole('button', { name: t('ro', 'codexSwitcherImport') }),
     ).toBeDisabled();
+    expect(
+      screen.getByRole('button', {
+        name: new RegExp(t('ro', 'codexAddAccount')),
+      }),
+    ).toBeDisabled();
+    expect(
+      within(
+        screen
+          .getByRole('heading', { name: t('ro', 'codexNextBest') })
+          .closest('section')!,
+      ).getByRole('button'),
+    ).toBeDisabled();
+    expect(
+      within(row('personal@example.invalid')).getByText('Limită atinsă'),
+    ).toBeVisible();
     expect(screen.getByRole('tab', { name: 'Codex' })).toBeEnabled();
     await fireEvent.click(
       screen.getByRole('button', { name: t('ro', 'openSettings') }),
@@ -398,9 +500,6 @@ describe('Codex dashboard and guarded workflows', () => {
     expect(
       within(dialog).getByRole('button', { name: t('ro', 'save') }),
     ).toBeDisabled();
-    expect(within(dialog).getByLabelText(t('ro', 'language'))).toHaveValue(
-      'ro',
-    );
     expect(
       call.mock.calls.every(([name]) => name === 'get_codex_snapshot'),
     ).toBe(true);

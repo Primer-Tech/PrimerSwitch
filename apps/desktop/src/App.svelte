@@ -33,8 +33,8 @@
       !!$codexController.pending ||
       !!$codexController.snapshot?.busy ||
       !!$codexController.snapshot?.demo ||
+      !!$codexController.snapshot?.switching ||
       $codexController.login.open ||
-      $codexController.preparation.open ||
       !!snapshot?.busy ||
       !!snapshot?.demo ||
       $controller.login.open ||

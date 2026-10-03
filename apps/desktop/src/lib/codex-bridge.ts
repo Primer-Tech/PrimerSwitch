@@ -7,14 +7,11 @@ export interface CodexCommandArgs {
   codex_poll_login: { id: string };
   codex_cancel_login: { id: string };
   codex_import_current: undefined;
+  codex_import_switcher: undefined;
   codex_refresh_account: { id: string };
+  codex_refresh_all: undefined;
+  codex_switch_account: { id: string };
   codex_delete_account: { id: string };
-  codex_prepare_switch: { id: string };
-  codex_cancel_preparation: { id: string };
-  codex_apply_switch: {
-    preparationId: string;
-    clientsClosedAcknowledged: true;
-  };
 }
 export type CodexCommand = keyof CodexCommandArgs;
 export interface CodexBridge {
@@ -31,11 +28,11 @@ const commands: readonly CodexCommand[] = [
   'codex_poll_login',
   'codex_cancel_login',
   'codex_import_current',
+  'codex_import_switcher',
   'codex_refresh_account',
+  'codex_refresh_all',
+  'codex_switch_account',
   'codex_delete_account',
-  'codex_prepare_switch',
-  'codex_cancel_preparation',
-  'codex_apply_switch',
 ];
 export const codexNativeBridge: CodexBridge = {
   call(command, args) {

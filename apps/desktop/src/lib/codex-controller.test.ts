@@ -6,8 +6,29 @@ import {
   type CodexController,
 } from './codex-controller';
 import type { CodexBridge } from './codex-bridge';
-import { codexSnapshot, codexCapability } from '../test/codex-fixtures';
-import { codexSnapshotSchema } from './codex-types';
+import {
+  codexAccount,
+  codexCapability,
+  codexMainLimit,
+  codexSnapshot,
+} from '../test/codex-fixtures';
+import {
+  codexReasonSchema,
+  codexSnapshotSchema,
+  type CodexSnapshot,
+} from './codex-types';
+import {
+  codexDuration,
+  codexExtraLimits,
+  codexLimitState,
+  codexMessage,
+  codexNextBest,
+  codexPlanLabel,
+  codexStatus,
+  codexWindowLabel,
+} from './codex-format';
+import { en } from './locales/en';
+import { ro } from './locales/ro';
 const controllers: CodexController[] = [];
 afterEach(() => {
   controllers.splice(0).forEach((c) => c.dispose());
@@ -29,21 +50,38 @@ function setup(raw = codexSnapshot()) {
 }
 function deferred() {
   let resolve!: (value: unknown) => void;
-  const promise = new Promise<unknown>((r) => (resolve = r));
-  return { promise, resolve };
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<unknown>((ok, fail) => {
+    resolve = ok;
+    reject = fail;
+  });
+  return { promise, resolve, reject };
 }
+const commands = (call: ReturnType<typeof setup>['call']) =>
+  call.mock.calls.map(([name]) => name);
 const login = { id: 'login-fixture', status: 'waiting', error: null };
-const preparation = () => ({
-  id: 'prepare-fixture',
-  accountId: 'codex-b',
-  expiresAt: Math.floor(Date.now() / 1000) + 60,
-});
-describe('Codex ownership, managed completion and redacted IPC', () => {
-  it('keeps every bucket and nullable permission without a Claude quota projection', () => {
+/** The snapshot the native side returns after switching to `id`. */
+function switched(
+  id: string,
+  revision: number,
+  outcome: Partial<NonNullable<CodexSnapshot['lastSwitch']>> = {},
+) {
+  const raw = codexSnapshot({ revision, selectedId: id });
+  raw.accounts.forEach((account) => (account.selected = account.id === id));
+  raw.lastSwitch = {
+    accountId: id,
+    at: Math.floor(Date.now() / 1000),
+    daemonRestarted: true,
+    otherClients: 0,
+    error: null,
+    ...outcome,
+  };
+  return raw;
+}
+describe('Codex contract and redacted IPC', () => {
+  it('parses the seamless-switch snapshot strictly and rejects retired or credential-shaped data', () => {
     const raw = codexSnapshot();
     expect(codexSnapshotSchema.parse(raw)).toEqual(raw);
-    expect(raw.accounts[0].quota?.limits).toHaveLength(2);
-    expect(raw.accounts[0].quota?.ordinaryUsageAllowed).toBeNull();
     expect(
       codexSnapshotSchema.safeParse({ ...raw, accessToken: 'secret-sentinel' })
         .success,
@@ -52,12 +90,54 @@ describe('Codex ownership, managed completion and redacted IPC', () => {
       codexSnapshotSchema.safeParse({ ...raw, error: 'Bearer secret-sentinel' })
         .success,
     ).toBe(false);
+    for (const retired of [
+      'clientsRunning',
+      'processInventoryUnavailable',
+      'reconciliationRequired',
+      'invalidPreparation',
+    ]) {
+      expect(codexReasonSchema.safeParse(retired).success).toBe(false);
+      expect(Object.keys(en)).not.toContain(`codexReason_${retired}`);
+    }
+    const legacy = {
+      ...raw,
+      capabilities: { ...raw.capabilities, manualSwitch: codexCapability() },
+    };
+    expect(codexSnapshotSchema.safeParse(legacy).success).toBe(false);
+    const withoutSignIn: Record<string, unknown> = { ...raw.accounts[0] };
+    delete withoutSignIn.needsSignIn;
+    expect(
+      codexSnapshotSchema.safeParse({ ...raw, accounts: [withoutSignIn] })
+        .success,
+    ).toBe(false);
+  });
+  it('gives every reason friendly text in English and Romanian', () => {
+    for (const reason of codexReasonSchema.options) {
+      const english = codexMessage(reason, 'en'),
+        romanian = codexMessage(reason, 'ro');
+      expect(english).not.toMatch(/codexReason_/);
+      expect(romanian).not.toMatch(/codexReason_/);
+      expect(romanian).not.toBe(english);
+    }
+    expect(codexMessage('activeAccount', 'en')).toBe(
+      'Switch to another account before removing this one.',
+    );
+    expect(codexMessage('activeAccount', 'ro')).toBe(
+      'Comută pe alt cont înainte să-l ștergi pe acesta.',
+    );
+    expect(Object.keys(ro).sort()).toEqual(Object.keys(en).sort());
+    const codexRomanian = Object.entries(ro)
+      .filter(([key]) => key.startsWith('codex'))
+      .map(([, text]) => text)
+      .join('');
+    expect(codexRomanian).not.toMatch(/[ŞşŢţ]/);
+    expect(codexRomanian).toMatch(/[șț]/);
   });
   it('retains cached data and hides arbitrary native errors and credential-shaped events', async () => {
     const { c, call, event } = setup();
     await c.start();
     call.mockRejectedValueOnce('Bearer secret-sentinel');
-    await c.action('codex_refresh_account', { id: 'codex-a' });
+    await c.refreshAccount('codex-studio');
     expect(get(c).error).toBe('actionFailed');
     event({
       ...codexSnapshot({ revision: 9 }),
@@ -65,7 +145,11 @@ describe('Codex ownership, managed completion and redacted IPC', () => {
     });
     expect(get(c).snapshot?.revision).toBe(1);
     expect(get(c).error).toBe('unsafeData');
-    expect(codexError('clientsRunning')).toBe('clientsRunning');
+    expect(codexError('switchInProgress')).toBe('switchInProgress');
+    expect(codexError(new Error('daemonRestartFailed'))).toBe(
+      'daemonRestartFailed',
+    );
+    expect(codexError('clientsRunning')).toBe('actionFailed');
     expect(codexError({ token: 'secret-sentinel' })).toBe('actionFailed');
   });
   it('reconciles late command replies against the latest event revision', async () => {
@@ -73,7 +157,7 @@ describe('Codex ownership, managed completion and redacted IPC', () => {
     await c.start();
     const result = deferred();
     call.mockReturnValueOnce(result.promise);
-    const action = c.action('codex_import_current');
+    const action = c.importCurrent();
     event(codexSnapshot({ revision: 7 }));
     result.resolve(codexSnapshot({ revision: 2 }));
     await action;
@@ -85,66 +169,245 @@ describe('Codex ownership, managed completion and redacted IPC', () => {
     const { c, call, unlisten } = setup();
     await c.start();
     await vi.advanceTimersByTimeAsync(15000);
+    expect(commands(call).filter((n) => n === 'codex_discover')).toHaveLength(
+      1,
+    );
     expect(
-      call.mock.calls.filter(([name]) => name === 'codex_discover'),
-    ).toHaveLength(1);
-    expect(
-      call.mock.calls.filter(([name]) => name === 'get_codex_snapshot'),
+      commands(call).filter((n) => n === 'get_codex_snapshot'),
     ).toHaveLength(4);
-    expect(
-      call.mock.calls.some(([name]) => name === 'codex_refresh_account'),
-    ).toBe(false);
+    expect(commands(call)).not.toContain('codex_refresh_account');
     c.dispose();
     expect(unlisten).toHaveBeenCalledOnce();
     await vi.advanceTimersByTimeAsync(5000);
     expect(call).toHaveBeenCalledTimes(5);
   });
-  it('blocks demo, unavailable capabilities, inactive refresh and overlapping actions', async () => {
+});
+describe('Codex one-call switching', () => {
+  it('switches with a single native call and derives the notice from lastSwitch', async () => {
     const { c, call, event } = setup();
     await c.start();
-    expect(await c.action('codex_refresh_account', { id: 'codex-b' })).toBe(
-      false,
-    );
     const result = deferred();
     call.mockReturnValueOnce(result.promise);
-    const first = c.action('codex_import_current');
-    expect(await c.action('codex_delete_account', { id: 'codex-b' })).toBe(
-      false,
+    const target = get(c).snapshot!.accounts[2];
+    const pending = c.switchAccount(target);
+    expect(get(c).pending).toBe('codex_switch_account');
+    expect(get(c).pendingId).toBe('codex-research');
+    event(
+      codexSnapshot({
+        revision: 2,
+        busy: true,
+        switching: {
+          targetId: 'codex-research',
+          stage: 'restarting',
+          startedAt: Math.floor(Date.now() / 1000),
+        },
+      }),
     );
-    result.resolve(codexSnapshot({ revision: 2 }));
-    await first;
-    const restricted = codexSnapshot({ revision: 3 });
-    restricted.capabilities.loginBrowser = codexCapability('unsupportedStore');
-    restricted.capabilities.refreshQuota = codexCapability('unsupportedStore');
-    event(restricted);
-    await c.beginLogin();
-    expect(await c.action('codex_refresh_account', { id: 'codex-a' })).toBe(
-      false,
+    expect(get(c).snapshot?.switching?.stage).toBe('restarting');
+    expect(await c.refreshAll()).toBe(false);
+    expect(await c.importCurrent()).toBe(false);
+    result.resolve(switched('codex-research', 3, { otherClients: 2 }));
+    expect(await pending).toBe(true);
+    expect(call).toHaveBeenCalledWith('codex_switch_account', {
+      id: 'codex-research',
+    });
+    expect(get(c).notice).toEqual({
+      kind: 'switched',
+      accountId: 'codex-research',
+      name: 'research@example.invalid',
+      daemonRestarted: true,
+      otherClients: 2,
+      warning: null,
+    });
+    expect(get(c).snapshot?.selectedId).toBe('codex-research');
+    expect(get(c).snapshot?.switching).toBeNull();
+    expect(get(c).pending).toBeNull();
+    expect(get(c).error).toBeNull();
+    expect(
+      commands(call).filter((n) => n === 'codex_switch_account'),
+    ).toHaveLength(1);
+    expect(commands(call)).not.toContain('codex_refresh_all');
+  });
+  it('reports a partial switch as a warning instead of a failure', async () => {
+    const { c, call } = setup();
+    await c.start();
+    call.mockResolvedValueOnce(
+      switched('codex-research', 2, {
+        daemonRestarted: false,
+        error: 'daemonRestartFailed',
+      }),
     );
+    expect(await c.switchAccount(get(c).snapshot!.accounts[2])).toBe(true);
+    expect(get(c).error).toBeNull();
+    expect(get(c).notice).toMatchObject({
+      kind: 'switched',
+      daemonRestarted: false,
+      warning: 'daemonRestartFailed',
+    });
+  });
+  it('keeps the selection and a friendly reason when the switch fails', async () => {
+    const { c, call } = setup();
+    await c.start();
+    call.mockRejectedValueOnce('switchInProgress');
+    expect(await c.switchAccount(get(c).snapshot!.accounts[2])).toBe(false);
+    expect(get(c).error).toBe('switchInProgress');
+    expect(get(c).notice).toBeNull();
+    expect(get(c).snapshot?.selectedId).toBe('codex-studio');
+    call.mockResolvedValueOnce(switched('codex-personal', 4));
+    expect(await c.switchAccount(get(c).snapshot!.accounts[2])).toBe(false);
+    expect(get(c).error).toBe('actionFailed');
+    expect(get(c).notice).toBeNull();
+  });
+  it('refuses active, blocked, signed-out and demo targets but trusts switchable over evidence', async () => {
+    const raw = codexSnapshot();
+    raw.accounts[1].switchable = codexCapability('identityUnverified');
+    raw.accounts.push(
+      codexAccount('codex-expired', {
+        needsSignIn: true,
+        switchable: codexCapability('signInRequired'),
+      }),
+      codexAccount('codex-imported', {
+        identityEvidence: 'claimsOnly',
+        identityVerified: false,
+      }),
+    );
+    const { c, call, event } = setup(raw);
+    await c.start();
+    const accounts = get(c).snapshot!.accounts;
+    expect(await c.switchAccount(accounts[0])).toBe(false);
+    expect(await c.switchAccount(accounts[1])).toBe(false);
+    expect(await c.switchAccount(accounts[3])).toBe(false);
+    expect(commands(call)).not.toContain('codex_switch_account');
+    call.mockResolvedValueOnce(switched('codex-imported', 2));
+    expect(await c.switchAccount(accounts[4])).toBe(true);
+    expect(call).toHaveBeenLastCalledWith('codex_switch_account', {
+      id: 'codex-imported',
+    });
+    const blocked = codexSnapshot({ revision: 3 });
+    blocked.capabilities.switchAccount = codexCapability('vaultUnavailable');
+    event(blocked);
+    expect(await c.switchAccount(get(c).snapshot!.accounts[2])).toBe(false);
     event(codexSnapshot({ revision: 4, demo: true }));
-    expect(await c.action('codex_import_current')).toBe(false);
-    expect(call).toHaveBeenCalledTimes(3);
+    expect(await c.switchAccount(get(c).snapshot!.accounts[2])).toBe(false);
+    expect(
+      commands(call).filter((n) => n === 'codex_switch_account'),
+    ).toHaveLength(1);
+  });
+  it('blocks every other mutation while a switch from elsewhere is running', async () => {
+    const { c, call, event } = setup();
+    await c.start();
+    const before = call.mock.calls.length;
+    event(
+      codexSnapshot({
+        revision: 2,
+        switching: {
+          targetId: 'codex-personal',
+          stage: 'saving',
+          startedAt: Math.floor(Date.now() / 1000),
+        },
+      }),
+    );
+    expect(await c.refreshAccount('codex-personal')).toBe(false);
+    expect(await c.deleteAccount('codex-personal')).toBe(false);
+    expect(await c.importSwitcher()).toBe(false);
+    await c.beginLogin();
+    expect(await c.switchAccount(get(c).snapshot!.accounts[2])).toBe(false);
+    expect(call.mock.calls.length).toBe(before);
+  });
+});
+describe('Codex refresh, import and delete', () => {
+  it('refreshes any ChatGPT account, refreshes all and imports from Codex Switcher', async () => {
+    const raw = codexSnapshot();
+    raw.accounts.push(
+      codexAccount('codex-api', { authKind: 'apiKey', quota: null }),
+    );
+    const { c, call, event } = setup(raw);
+    await c.start();
+    expect(await c.refreshAccount('codex-personal')).toBe(true);
+    expect(call).toHaveBeenLastCalledWith('codex_refresh_account', {
+      id: 'codex-personal',
+    });
+    expect(await c.refreshAccount('codex-api')).toBe(false);
+    expect(await c.refreshAccount('missing')).toBe(false);
+    expect(await c.refreshAll()).toBe(true);
+    expect(call).toHaveBeenLastCalledWith('codex_refresh_all', undefined);
+    expect(await c.importSwitcher()).toBe(false);
+    const enabled = codexSnapshot({ revision: 2 });
+    enabled.capabilities.importSwitcher = codexCapability();
+    event(enabled);
+    const imported = codexSnapshot({ revision: 3 });
+    imported.accounts.push(
+      codexAccount('codex-one'),
+      codexAccount('codex-two'),
+    );
+    call.mockResolvedValueOnce(imported);
+    expect(await c.importSwitcher()).toBe(true);
+    expect(call).toHaveBeenLastCalledWith('codex_import_switcher', undefined);
+    expect(get(c).notice).toEqual({ kind: 'importedSwitcher', added: 2 });
+    call.mockResolvedValueOnce(imported);
+    expect(await c.importCurrent()).toBe(true);
+    expect(get(c).notice).toEqual({ kind: 'importedCurrent', added: 0 });
+  });
+  it('never deletes the active account and confirms other deletions', async () => {
+    const { c, call } = setup();
+    await c.start();
+    expect(await c.deleteAccount('codex-studio')).toBe(false);
+    expect(commands(call)).not.toContain('codex_delete_account');
+    const remaining = codexSnapshot({ revision: 2 });
+    remaining.accounts.splice(1, 1);
+    call.mockResolvedValueOnce(remaining);
+    expect(await c.deleteAccount('codex-personal')).toBe(true);
+    expect(call).toHaveBeenLastCalledWith('codex_delete_account', {
+      id: 'codex-personal',
+    });
+    expect(get(c).notice).toEqual({ kind: 'deleteComplete' });
+    call.mockRejectedValueOnce('activeAccount');
+    expect(await c.deleteAccount('codex-research')).toBe(false);
+    expect(get(c).error).toBe('activeAccount');
   });
   it('never discovers or mutates a demo snapshot', async () => {
     const { c, call } = setup(codexSnapshot({ demo: true }));
     await c.start();
     await c.beginLogin();
+    expect(await c.refreshAll()).toBe(false);
+    expect(await c.switchAccount(get(c).snapshot!.accounts[2])).toBe(false);
     expect(call).toHaveBeenCalledTimes(1);
   });
+});
+describe('Codex managed browser sign-in', () => {
   it('completes managed browser login via its own poll without a pasted-code command', async () => {
     vi.useFakeTimers();
     const { c, call } = setup();
     await c.start();
     call.mockResolvedValueOnce(login);
     await c.beginLogin();
-    expect(await c.action('codex_import_current')).toBe(false);
+    expect(await c.importCurrent()).toBe(false);
     call.mockResolvedValueOnce(
       codexSnapshot({ revision: 2, login: { ...login, status: 'complete' } }),
     );
     await vi.advanceTimersByTimeAsync(1000);
     expect(call).toHaveBeenLastCalledWith('codex_poll_login', { id: login.id });
     expect(get(c).login.open).toBe(false);
-    expect(get(c).notice).toBe('loginComplete');
+    expect(get(c).notice).toEqual({ kind: 'loginComplete', accountId: null });
+  });
+  it('labels a sign-in-again flow with the saved account', async () => {
+    vi.useFakeTimers();
+    const raw = codexSnapshot();
+    raw.accounts[2].needsSignIn = true;
+    const { c, call } = setup(raw);
+    await c.start();
+    call.mockResolvedValueOnce(login);
+    await c.beginLogin(get(c).snapshot!.accounts[2]);
+    expect(get(c).login.accountId).toBe('codex-research');
+    expect(call).toHaveBeenLastCalledWith('codex_begin_login');
+    call.mockResolvedValueOnce(
+      codexSnapshot({ revision: 2, login: { ...login, status: 'complete' } }),
+    );
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(get(c).notice).toEqual({
+      kind: 'loginComplete',
+      accountId: 'codex-research',
+    });
   });
   it('retries shared-owner contention without ending managed login polling', async () => {
     vi.useFakeTimers();
@@ -160,7 +423,7 @@ describe('Codex ownership, managed completion and redacted IPC', () => {
       codexSnapshot({ revision: 2, login: { ...login, status: 'complete' } }),
     );
     await vi.advanceTimersByTimeAsync(1000);
-    expect(get(c).notice).toBe('loginComplete');
+    expect(get(c).notice).toMatchObject({ kind: 'loginComplete' });
   });
   it('cancels a managed session returned after cancellation or disposal', async () => {
     const { c, call } = setup();
@@ -194,118 +457,145 @@ describe('Codex ownership, managed completion and redacted IPC', () => {
     expect(get(c).login.open).toBe(false);
     expect(get(c).notice).toBeNull();
   });
-  it.each(['managedLogin', 'backendVerified'] as const)(
-    'permits durable %s evidence without claiming fresh quota verification',
-    async (evidence) => {
-      const raw = codexSnapshot();
-      raw.accounts[1].identityVerified = false;
-      raw.accounts[1].identityEvidence = evidence;
-      const { c, call } = setup(raw);
-      await c.start();
-      call.mockResolvedValueOnce(preparation());
-      await c.prepareSwitch(get(c).snapshot!.accounts[1]);
-      expect(call).toHaveBeenLastCalledWith('codex_prepare_switch', {
-        id: 'codex-b',
-      });
-      expect(get(c).snapshot?.accounts[1].identityVerified).toBe(false);
-      expect(get(c).preparation.value?.accountId).toBe('codex-b');
-    },
-  );
-  it('refuses forged enabled selection with claims-only evidence', async () => {
-    const raw = codexSnapshot();
-    raw.accounts[1].identityVerified = true;
-    raw.accounts[1].identityEvidence = 'claimsOnly';
-    const { c, call } = setup(raw);
-    await c.start();
-    await c.prepareSwitch(get(c).snapshot!.accounts[1]);
-    expect(
-      call.mock.calls.some(([name]) => name === 'codex_prepare_switch'),
-    ).toBe(false);
-    expect(get(c).preparation.open).toBe(false);
-  });
-  it('requires acknowledgment and a fresh owner-bound preparation', async () => {
-    const { c, call } = setup();
-    await c.start();
-    call.mockResolvedValueOnce(preparation());
-    await c.prepareSwitch(get(c).snapshot!.accounts[1]);
-    expect(await c.applySwitch(false)).toBe(false);
-    expect(call).toHaveBeenCalledTimes(3);
-    call.mockResolvedValueOnce(
-      codexSnapshot({ revision: 2, selectedId: 'codex-b' }),
+});
+describe('Codex view derivations', () => {
+  const now = 1_800_000_000;
+  it('derives limits from the main limit only and frees at the latest exhausted reset', () => {
+    const [studio, personal, research] = codexSnapshot().accounts;
+    expect(codexLimitState(studio).limited).toBe(false);
+    expect(codexLimitState(personal).limited).toBe(true);
+    expect(codexStatus(personal).kind).toBe('limited');
+    expect(codexStatus(studio).kind).toBe('active');
+    expect(codexStatus(research).kind).toBe('ready');
+    const both = codexAccount('codex-both', {
+      quota: {
+        ordinaryUsageAllowed: true,
+        resetCreditsAvailable: null,
+        limits: [
+          codexMainLimit(100, 100, {
+            primary: {
+              usedPercent: 100,
+              windowDurationMins: 300,
+              resetsAt: now + 600,
+            },
+            secondary: {
+              usedPercent: 104,
+              windowDurationMins: 10080,
+              resetsAt: now + 9000,
+            },
+          }),
+        ],
+      },
+    });
+    expect(codexLimitState(both)).toEqual({
+      limited: true,
+      freesAt: now + 9000,
+    });
+    const unknownReset = codexAccount('codex-unknown', {
+      quota: {
+        ordinaryUsageAllowed: true,
+        resetCreditsAvailable: null,
+        limits: [
+          codexMainLimit(100, 10, {
+            primary: {
+              usedPercent: 100,
+              windowDurationMins: 300,
+              resetsAt: null,
+            },
+          }),
+        ],
+      },
+    });
+    expect(codexLimitState(unknownReset)).toEqual({
+      limited: true,
+      freesAt: null,
+    });
+    const blocked = codexAccount('codex-blocked', {
+      quota: {
+        ordinaryUsageAllowed: false,
+        resetCreditsAvailable: null,
+        limits: [codexMainLimit(5, 5)],
+      },
+    });
+    expect(codexLimitState(blocked)).toEqual({ limited: true, freesAt: null });
+    const reached = codexAccount('codex-reached', {
+      quota: {
+        ordinaryUsageAllowed: null,
+        resetCreditsAvailable: null,
+        limits: [codexMainLimit(70, 20, { rateLimitReachedType: 'primary' })],
+      },
+    });
+    expect(codexLimitState(reached).limited).toBe(true);
+    const extraOnly = codexAccount('codex-extra', {
+      quota: {
+        ordinaryUsageAllowed: true,
+        resetCreditsAvailable: null,
+        limits: [
+          codexMainLimit(10, 10),
+          {
+            ...codexMainLimit(100, 100),
+            key: 'bucket:code-review',
+            limitId: 'code-review',
+            limitName: 'Code review',
+          },
+        ],
+      },
+    });
+    expect(codexLimitState(extraOnly).limited).toBe(false);
+    expect(codexStatus(codexAccount('codex-new', { quota: null })).kind).toBe(
+      'unread',
     );
-    expect(await c.applySwitch(true)).toBe(true);
-    expect(call).toHaveBeenLastCalledWith('codex_apply_switch', {
-      preparationId: 'prepare-fixture',
-      clientsClosedAcknowledged: true,
-    });
-    expect(get(c).notice).toBe('switchComplete');
-  });
-  it('rejects mismatched and expired preparation without writing', async () => {
-    const { c, call } = setup();
-    await c.start();
-    call.mockResolvedValueOnce({ ...preparation(), accountId: 'wrong' });
-    await c.prepareSwitch(get(c).snapshot!.accounts[1]);
-    expect(get(c).preparation.error).toBe('identityMismatch');
-    expect(await c.applySwitch(true)).toBe(false);
-    call.mockResolvedValueOnce({ ...preparation(), expiresAt: 0 });
-    await c.prepareSwitch(get(c).snapshot!.accounts[1]);
-    expect(await c.applySwitch(true)).toBe(false);
-    expect(get(c).preparation.error).toBe('invalidPreparation');
-    expect(call).toHaveBeenLastCalledWith('codex_cancel_preparation', {
-      id: 'prepare-fixture',
-    });
     expect(
-      call.mock.calls.some(([name]) => name === 'codex_apply_switch'),
-    ).toBe(false);
+      codexStatus(codexAccount('codex-gone', { needsSignIn: true })).kind,
+    ).toBe('signIn');
   });
-  it('cancels a valid native preparation by receipt and retains cache on blocked cleanup', async () => {
-    const { c, call } = setup();
-    await c.start();
-    call.mockResolvedValueOnce(preparation());
-    await c.prepareSwitch(get(c).snapshot!.accounts[1]);
-    call.mockRejectedValueOnce('externalChange');
-    await c.dismissPreparation();
-    expect(call).toHaveBeenLastCalledWith('codex_cancel_preparation', {
-      id: 'prepare-fixture',
-    });
-    expect(get(c).preparation.open).toBe(false);
-    expect(get(c).error).toBe('externalChange');
-    expect(get(c).snapshot?.selectedId).toBe('codex-a');
-    expect(get(c).notice).toBeNull();
+  it('picks the next best account by weekly usage, then 5-hour usage', () => {
+    const raw = codexSnapshot();
+    expect(codexNextBest(raw)?.id).toBe('codex-research');
+    raw.accounts.push(
+      codexAccount('codex-tie', {
+        quota: {
+          ordinaryUsageAllowed: true,
+          resetCreditsAvailable: null,
+          limits: [codexMainLimit(3, 14)],
+        },
+      }),
+    );
+    expect(codexNextBest(raw)?.id).toBe('codex-tie');
+    raw.accounts.at(-1)!.needsSignIn = true;
+    expect(codexNextBest(raw)?.id).toBe('codex-research');
+    raw.accounts[2].switchable = codexCapability('identityUnverified');
+    expect(codexNextBest(raw)).toBeNull();
+    raw.accounts.push(
+      codexAccount('codex-unread', { quota: null }),
+      codexAccount('codex-key', { authKind: 'apiKey' }),
+    );
+    raw.accounts.at(-1)!.switchable = codexCapability('unsupportedAuth');
+    expect(codexNextBest(raw)).toBeNull();
+    const all = codexSnapshot();
+    all.capabilities.switchAccount = codexCapability('notInstalled');
+    expect(codexNextBest(all)).toBeNull();
   });
-  it('cancels a held preparation on disposal without applying it', async () => {
-    const { c, call } = setup();
-    await c.start();
-    call.mockResolvedValueOnce(preparation());
-    await c.prepareSwitch(get(c).snapshot!.accounts[1]);
-    c.dispose();
-    expect(call).toHaveBeenLastCalledWith('codex_cancel_preparation', {
-      id: 'prepare-fixture',
-    });
+  it('labels windows from real durations, known plans and compact durations', () => {
+    expect(codexWindowLabel(300, 'short', 'en')).toBe('5 hours');
+    expect(codexWindowLabel(10080, 'long', 'en')).toBe('Weekly');
+    expect(codexWindowLabel(1440, 'short', 'en')).toBe('Daily');
+    expect(codexWindowLabel(120, 'short', 'en')).toBe('2 hours');
+    expect(codexWindowLabel(4320, 'long', 'en')).toBe('3 days');
+    expect(codexWindowLabel(null, 'short', 'en')).toBe('Short window');
+    expect(codexWindowLabel(300, 'short', 'ro')).toBe('5 ore');
+    expect(codexWindowLabel(10080, 'long', 'ro')).toBe('Săptămânal');
+    expect(codexPlanLabel('prolite', 'en')).toBe('Pro Lite');
+    expect(codexPlanLabel('pro_lite', 'en')).toBe('Pro Lite');
+    expect(codexPlanLabel('plus', 'ro')).toBe('Plus');
+    expect(codexPlanLabel('free', 'ro')).toBe('Gratuit');
+    expect(codexPlanLabel('future-plan', 'en')).toBeNull();
+    expect(codexPlanLabel(null, 'en')).toBeNull();
+    expect(codexDuration(2 * 3600 + 10 * 60, 'en')).toBe('2h 10m');
+    expect(codexDuration(26 * 3600, 'ro')).toBe('1z 2h');
+    expect(codexDuration(20, 'en')).toBe('1m');
     expect(
-      call.mock.calls.some(([name]) => name === 'codex_apply_switch'),
-    ).toBe(false);
-  });
-  it('ignores a canceled preparation response and never claims a native guard failure switched', async () => {
-    const { c, call } = setup();
-    await c.start();
-    const result = deferred();
-    call.mockReturnValueOnce(result.promise);
-    const pending = c.prepareSwitch(get(c).snapshot!.accounts[1]);
-    c.dismissPreparation();
-    result.resolve(preparation());
-    await pending;
-    expect(get(c).preparation.open).toBe(false);
-    expect(call).toHaveBeenLastCalledWith('codex_cancel_preparation', {
-      id: 'prepare-fixture',
-    });
-    call.mockResolvedValueOnce(preparation());
-    await c.prepareSwitch(get(c).snapshot!.accounts[1]);
-    call.mockRejectedValueOnce('clientsRunning');
-    expect(await c.applySwitch(true)).toBe(false);
-    expect(get(c).snapshot?.selectedId).toBe('codex-a');
-    expect(get(c).preparation.error).toBe('clientsRunning');
-    expect(get(c).preparation.value).toBeNull();
-    expect(get(c).notice).toBeNull();
+      codexExtraLimits(codexSnapshot().accounts[0]).map((l) => l.key),
+    ).toEqual(['bucket:code-review']);
   });
 });

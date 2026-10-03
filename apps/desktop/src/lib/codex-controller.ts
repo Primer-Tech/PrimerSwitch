@@ -7,16 +7,14 @@ import {
 import {
   codexSnapshotSchema,
   codexLoginSchema,
-  codexPreparationSchema,
   codexReasonSchema,
-  hasCodexSelectionEvidence,
   type CodexSnapshot,
   type CodexLogin,
-  type CodexPreparation,
   type CodexAccount,
   type CodexReason,
 } from './codex-types';
 export type CodexError = CodexReason | 'actionFailed' | 'unsafeData';
+/** Only stable native reason strings are shown; anything else becomes a generic failure. */
 export function codexError(error: unknown): CodexError {
   const parsed = codexReasonSchema.safeParse(
     typeof error === 'string'
@@ -27,21 +25,41 @@ export function codexError(error: unknown): CodexError {
   );
   return parsed.success ? parsed.data : 'actionFailed';
 }
+export type CodexNotice =
+  | { kind: 'loginComplete'; accountId: string | null }
+  | { kind: 'deleteComplete' }
+  | { kind: 'importedCurrent'; added: number }
+  | { kind: 'importedSwitcher'; added: number }
+  | {
+      kind: 'switched';
+      accountId: string;
+      name: string;
+      daemonRestarted: boolean;
+      otherClients: number;
+      warning: CodexReason | null;
+    };
+export type CodexPending =
+  | 'codex_discover'
+  | 'codex_import_current'
+  | 'codex_import_switcher'
+  | 'codex_refresh_account'
+  | 'codex_refresh_all'
+  | 'codex_delete_account'
+  | 'codex_switch_account'
+  | 'codex_begin_login'
+  | 'codex_cancel_login';
 export interface CodexState {
   snapshot: CodexSnapshot | null;
-  pending: string | null;
+  pending: CodexPending | null;
+  /** Account targeted by the pending refresh, delete or switch. */
+  pendingId: string | null;
   error: CodexError | null;
-  notice: 'loginComplete' | 'switchComplete' | 'deleteComplete' | null;
+  notice: CodexNotice | null;
   login: {
     open: boolean;
+    /** Saved account being signed in again, for display only. */
+    accountId: string | null;
     session: CodexLogin | null;
-    working: boolean;
-    error: CodexError | null;
-  };
-  preparation: {
-    open: boolean;
-    target: CodexAccount | null;
-    value: CodexPreparation | null;
     working: boolean;
     error: CodexError | null;
   };
@@ -49,30 +67,44 @@ export interface CodexState {
 type SnapshotCommand =
   | 'codex_discover'
   | 'codex_import_current'
+  | 'codex_import_switcher'
   | 'codex_refresh_account'
+  | 'codex_refresh_all'
   | 'codex_delete_account';
+const capabilityFor = {
+  codex_discover: null,
+  codex_import_current: 'importCurrent',
+  codex_import_switcher: 'importSwitcher',
+  codex_refresh_account: 'refreshQuota',
+  codex_refresh_all: 'refreshQuota',
+  codex_delete_account: 'deleteSaved',
+} as const satisfies Record<
+  SnapshotCommand,
+  keyof CodexSnapshot['capabilities'] | null
+>;
+const closedLogin = {
+  open: false,
+  accountId: null,
+  session: null,
+  working: false,
+  error: null,
+} satisfies CodexState['login'];
+const unsafe = Symbol('unsafeData');
 export function createCodexController(bridge: CodexBridge = codexNativeBridge) {
   let state: CodexState = {
     snapshot: null,
     pending: null,
+    pendingId: null,
     error: null,
     notice: null,
-    login: { open: false, session: null, working: false, error: null },
-    preparation: {
-      open: false,
-      target: null,
-      value: null,
-      working: false,
-      error: null,
-    },
+    login: closedLogin,
   };
   const store = writable(state);
   let disposed = false,
     started = false,
     reading = false,
     pollingLogin = false,
-    loginGeneration = 0,
-    switchGeneration = 0;
+    loginGeneration = 0;
   let cachePoll: ReturnType<typeof setInterval> | undefined,
     loginPoll: ReturnType<typeof setInterval> | undefined,
     unlisten: (() => void) | undefined;
@@ -82,6 +114,8 @@ export function createCodexController(bridge: CodexBridge = codexNativeBridge) {
       store.set(state);
     }
   };
+  const failure = (error: unknown): CodexError =>
+    error === unsafe ? 'unsafeData' : codexError(error);
   const stopLoginPoll = () => {
     if (loginPoll) clearInterval(loginPoll);
     loginPoll = undefined;
@@ -90,12 +124,16 @@ export function createCodexController(bridge: CodexBridge = codexNativeBridge) {
     disposed ||
     !!state.pending ||
     !!state.snapshot?.busy ||
-    !!state.snapshot?.demo;
-  const blocked = () => busy() || state.login.open || state.preparation.open;
-  function accept(raw: unknown) {
-    const next = codexSnapshotSchema.parse(raw);
+    !!state.snapshot?.demo ||
+    !!state.snapshot?.switching;
+  const blocked = () => busy() || state.login.open;
+  /** Validates a native snapshot and applies it unless a newer revision is already shown. */
+  function accept(raw: unknown): CodexSnapshot {
+    const parsed = codexSnapshotSchema.safeParse(raw);
+    if (!parsed.success) throw unsafe;
+    const next = parsed.data;
     if (disposed || (state.snapshot && next.revision < state.snapshot.revision))
-      return;
+      return next;
     set({ snapshot: next });
     const session = state.login.session;
     if (state.login.open && session && next.login?.id === session.id) {
@@ -103,8 +141,8 @@ export function createCodexController(bridge: CodexBridge = codexNativeBridge) {
         stopLoginPoll();
         loginGeneration++;
         set({
-          login: { open: false, session: null, working: false, error: null },
-          notice: 'loginComplete',
+          login: closedLogin,
+          notice: { kind: 'loginComplete', accountId: state.login.accountId },
         });
       } else if (next.login.status === 'failed') {
         stopLoginPoll();
@@ -119,6 +157,7 @@ export function createCodexController(bridge: CodexBridge = codexNativeBridge) {
       } else
         set({ login: { ...state.login, session: next.login, working: false } });
     }
+    return next;
   }
   async function read() {
     if (disposed || reading) return;
@@ -126,7 +165,7 @@ export function createCodexController(bridge: CodexBridge = codexNativeBridge) {
     try {
       accept(await bridge.call('get_codex_snapshot'));
     } catch (error) {
-      set({ error: codexError(error) });
+      set({ error: failure(error) });
     } finally {
       reading = false;
     }
@@ -144,7 +183,9 @@ export function createCodexController(bridge: CodexBridge = codexNativeBridge) {
       });
       if (disposed) cleanup();
       else unlisten = cleanup;
-    } catch {}
+    } catch {
+      /* Cache-only snapshot polling remains available without events. */
+    }
     if (disposed) return;
     await read();
     if (!disposed) {
@@ -158,35 +199,89 @@ export function createCodexController(bridge: CodexBridge = codexNativeBridge) {
     command: C,
     args?: CodexCommandArgs[C],
   ): Promise<boolean> {
+    const snapshot = state.snapshot;
     if (blocked()) return false;
-    const capability =
-      command === 'codex_import_current'
-        ? 'importCurrent'
-        : command === 'codex_refresh_account'
-          ? 'refreshQuota'
-          : command === 'codex_delete_account'
-            ? 'deleteSaved'
-            : null;
-    if (capability && !state.snapshot?.capabilities[capability].enabled)
-      return false;
-    if (
-      command === 'codex_refresh_account' &&
-      args &&
-      'id' in args &&
-      args.id !== state.snapshot?.selectedId
-    )
-      return false;
-    set({ pending: command, error: null, notice: null });
+    const capability = capabilityFor[command];
+    if (capability && !snapshot?.capabilities[capability].enabled) return false;
+    const target = args && 'id' in args ? args.id : null;
+    if (target !== null) {
+      const account = snapshot?.accounts.find((a) => a.id === target);
+      if (!account) return false;
+      if (command === 'codex_refresh_account' && account.authKind !== 'chatgpt')
+        return false;
+      // The account Codex is signed in with cannot be removed; switch away first.
+      if (command === 'codex_delete_account' && account.selected) return false;
+    }
+    const before = snapshot?.accounts.length ?? 0;
+    set({ pending: command, pendingId: target, error: null, notice: null });
     try {
-      accept(await bridge.call(command, args));
-      if (state.snapshot?.error) return false;
-      if (command === 'codex_delete_account') set({ notice: 'deleteComplete' });
+      const result = accept(await bridge.call(command, args));
+      if (result.error) return false;
+      const added = Math.max(0, result.accounts.length - before);
+      if (command === 'codex_delete_account')
+        set({ notice: { kind: 'deleteComplete' } });
+      else if (command === 'codex_import_current')
+        set({ notice: { kind: 'importedCurrent', added } });
+      else if (command === 'codex_import_switcher')
+        set({ notice: { kind: 'importedSwitcher', added } });
       return true;
     } catch (error) {
-      set({ error: codexError(error) });
+      set({ error: failure(error) });
+      void read();
       return false;
     } finally {
-      set({ pending: null });
+      set({ pending: null, pendingId: null });
+    }
+  }
+  /**
+   * One native call performs the whole switch. While it runs, snapshot events carry
+   * `switching`; the resolved snapshot's `lastSwitch` is the authoritative outcome.
+   */
+  async function switchAccount(target: CodexAccount): Promise<boolean> {
+    const snapshot = state.snapshot;
+    const account = snapshot?.accounts.find((a) => a.id === target.id);
+    if (
+      blocked() ||
+      !snapshot ||
+      !account ||
+      !snapshot.capabilities.switchAccount.enabled ||
+      !account.switchable.enabled ||
+      account.selected ||
+      account.needsSignIn
+    )
+      return false;
+    set({
+      pending: 'codex_switch_account',
+      pendingId: account.id,
+      error: null,
+      notice: null,
+    });
+    try {
+      const result = accept(
+        await bridge.call('codex_switch_account', { id: account.id }),
+      );
+      const outcome = result.lastSwitch;
+      if (!outcome || outcome.accountId !== account.id) {
+        set({ error: result.error ?? 'actionFailed' });
+        return false;
+      }
+      set({
+        notice: {
+          kind: 'switched',
+          accountId: account.id,
+          name: account.name,
+          daemonRestarted: outcome.daemonRestarted,
+          otherClients: outcome.otherClients,
+          warning: outcome.error,
+        },
+      });
+      return true;
+    } catch (error) {
+      set({ error: failure(error) });
+      void read();
+      return false;
+    } finally {
+      set({ pending: null, pendingId: null });
     }
   }
   async function pollLogin() {
@@ -200,7 +295,7 @@ export function createCodexController(bridge: CodexBridge = codexNativeBridge) {
         accept(result);
     } catch (error) {
       if (mine === loginGeneration) {
-        const reason = codexError(error);
+        const reason = failure(error);
         if (reason === 'busy') return;
         stopLoginPoll();
         set({
@@ -211,14 +306,21 @@ export function createCodexController(bridge: CodexBridge = codexNativeBridge) {
       pollingLogin = false;
     }
   }
-  async function beginLogin() {
+  /** Opens the managed browser sign-in; `forAccount` only labels a sign-in-again flow. */
+  async function beginLogin(forAccount: CodexAccount | null = null) {
     if (blocked() || !state.snapshot?.capabilities.loginBrowser.enabled) return;
     const mine = ++loginGeneration;
     set({
       pending: 'codex_begin_login',
       error: null,
       notice: null,
-      login: { open: true, session: null, working: true, error: null },
+      login: {
+        open: true,
+        accountId: forAccount?.id ?? null,
+        session: null,
+        working: true,
+        error: null,
+      },
     });
     try {
       const session = codexLoginSchema.parse(
@@ -230,7 +332,7 @@ export function createCodexController(bridge: CodexBridge = codexNativeBridge) {
       }
       set({
         login: {
-          open: true,
+          ...state.login,
           session,
           working: false,
           error:
@@ -241,8 +343,8 @@ export function createCodexController(bridge: CodexBridge = codexNativeBridge) {
       });
       if (session.status === 'complete') {
         set({
-          login: { open: false, session: null, working: false, error: null },
-          notice: 'loginComplete',
+          login: closedLogin,
+          notice: { kind: 'loginComplete', accountId: forAccount?.id ?? null },
         });
         await read();
       } else if (session.status !== 'failed') {
@@ -254,7 +356,7 @@ export function createCodexController(bridge: CodexBridge = codexNativeBridge) {
     } catch (error) {
       if (mine === loginGeneration)
         set({
-          login: { ...state.login, working: false, error: codexError(error) },
+          login: { ...state.login, working: false, error: failure(error) },
         });
     } finally {
       if (state.pending === 'codex_begin_login') set({ pending: null });
@@ -264,189 +366,26 @@ export function createCodexController(bridge: CodexBridge = codexNativeBridge) {
     const session = state.login.session;
     loginGeneration++;
     stopLoginPoll();
-    set({ login: { open: false, session: null, working: false, error: null } });
+    set({ login: closedLogin });
     if (session) {
       set({ pending: 'codex_cancel_login' });
       try {
         accept(await bridge.call('codex_cancel_login', { id: session.id }));
       } catch (error) {
-        set({ error: codexError(error) });
+        set({ error: failure(error) });
       } finally {
         if (state.pending === 'codex_cancel_login') set({ pending: null });
       }
     }
   }
-  async function prepareSwitch(target: CodexAccount) {
-    if (
-      busy() ||
-      state.login.open ||
-      !state.snapshot?.capabilities.manualSwitch.enabled ||
-      !target.manualSwitch.enabled ||
-      !hasCodexSelectionEvidence(target) ||
-      target.id === state.snapshot?.selectedId ||
-      target.selected
-    )
-      return;
-    const mine = ++switchGeneration;
-    set({
-      pending: 'codex_prepare_switch',
-      notice: null,
-      preparation: {
-        open: true,
-        target,
-        value: null,
-        working: true,
-        error: null,
-      },
-    });
-    try {
-      const value = codexPreparationSchema.parse(
-        await bridge.call('codex_prepare_switch', { id: target.id }),
-      );
-      if (value.accountId !== target.id) {
-        await cancelPreparation(value.id);
-        throw new Error('identityMismatch');
-      }
-      if (disposed || mine !== switchGeneration || !state.preparation.open) {
-        await cancelPreparation(value.id);
-        return;
-      }
-      set({
-        preparation: {
-          open: true,
-          target,
-          value,
-          working: false,
-          error: null,
-        },
-      });
-    } catch (error) {
-      if (mine === switchGeneration)
-        set({
-          preparation: {
-            ...state.preparation,
-            working: false,
-            error: codexError(error),
-          },
-        });
-    } finally {
-      if (state.pending === 'codex_prepare_switch') set({ pending: null });
-    }
-  }
-  async function cancelPreparation(id: string) {
-    try {
-      const raw = await bridge.call('codex_cancel_preparation', { id });
-      if (!disposed) accept(raw);
-    } catch (error) {
-      if (!disposed) set({ error: codexError(error) });
-    }
-  }
-  async function dismissPreparation() {
-    if (state.pending === 'codex_apply_switch') return;
-    const value = state.preparation.value;
-    switchGeneration++;
-    set({
-      preparation: {
-        open: false,
-        target: null,
-        value: null,
-        working: false,
-        error: null,
-      },
-    });
-    if (value) {
-      set({ pending: 'codex_cancel_preparation' });
-      try {
-        await cancelPreparation(value.id);
-      } finally {
-        if (state.pending === 'codex_cancel_preparation')
-          set({ pending: null });
-      }
-    }
-  }
-  async function applySwitch(acknowledged: boolean) {
-    const value = state.preparation.value;
-    if (!acknowledged || !value || busy() || !state.preparation.open)
-      return false;
-    if (value.expiresAt <= Math.floor(Date.now() / 1000)) {
-      set({
-        pending: 'codex_cancel_preparation',
-        preparation: {
-          ...state.preparation,
-          value: null,
-          error: 'invalidPreparation',
-        },
-      });
-      try {
-        await cancelPreparation(value.id);
-      } finally {
-        if (state.pending === 'codex_cancel_preparation')
-          set({ pending: null });
-      }
-      return false;
-    }
-    set({
-      pending: 'codex_apply_switch',
-      preparation: { ...state.preparation, working: true, error: null },
-    });
-    try {
-      accept(
-        await bridge.call('codex_apply_switch', {
-          preparationId: value.id,
-          clientsClosedAcknowledged: true,
-        }),
-      );
-      if (
-        state.snapshot?.error ||
-        state.snapshot?.selectedId !== value.accountId
-      ) {
-        set({
-          preparation: {
-            ...state.preparation,
-            working: false,
-            value: null,
-            error: state.snapshot?.error ?? 'identityMismatch',
-          },
-        });
-        return false;
-      }
-      set({
-        preparation: {
-          open: false,
-          target: null,
-          value: null,
-          working: false,
-          error: null,
-        },
-        notice: 'switchComplete',
-      });
-      return true;
-    } catch (error) {
-      set({
-        preparation: {
-          ...state.preparation,
-          value: null,
-          working: false,
-          error: codexError(error),
-        },
-      });
-      return false;
-    } finally {
-      set({ pending: null });
-    }
-  }
   function dispose() {
     if (disposed) return;
     const session = state.login.session;
-    const preparation = state.preparation.value;
-    const applying = state.pending === 'codex_apply_switch';
     disposed = true;
     loginGeneration++;
-    switchGeneration++;
     stopLoginPoll();
     if (cachePoll) clearInterval(cachePoll);
     unlisten?.();
-    if (preparation && !applying) void cancelPreparation(preparation.id);
     if (session)
       void bridge
         .call('codex_cancel_login', { id: session.id })
@@ -457,14 +396,19 @@ export function createCodexController(bridge: CodexBridge = codexNativeBridge) {
     start,
     read,
     action,
+    discover: () => action('codex_discover'),
+    importCurrent: () => action('codex_import_current'),
+    importSwitcher: () => action('codex_import_switcher'),
+    refreshAccount: (id: string) => action('codex_refresh_account', { id }),
+    refreshAll: () => action('codex_refresh_all'),
+    deleteAccount: (id: string) => action('codex_delete_account', { id }),
+    switchAccount,
     beginLogin,
     cancelLogin,
     pollLogin,
-    prepareSwitch,
-    dismissPreparation,
-    applySwitch,
     dispose,
-    dismissError: () => set({ error: null, notice: null }),
+    dismissError: () => set({ error: null }),
+    dismissNotice: () => set({ notice: null }),
   };
 }
 export type CodexController = ReturnType<typeof createCodexController>;

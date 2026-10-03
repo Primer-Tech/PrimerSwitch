@@ -191,128 +191,196 @@ export const ro: Record<keyof typeof en, string> = {
   settingsProviderScope:
     'Automatizarea se aplică pentru Claude. Aspectul și limba se aplică ambilor furnizori.',
   claudeAutomation: 'Automatizare Claude',
-  codexDescription:
-    'Gestionează conturile salvate pentru clienții Codex deschiși ulterior.',
+  codexDescription: 'Schimbă contul Codex fără să-ți închizi terminalele.',
   codexActionFailed:
-    'Acțiunea Codex nu a reușit. Conturile salvate sunt păstrate.',
-  codexPrimaryWindow: 'Fereastra principală',
-  codexSecondaryWindow: 'Fereastra secundară',
-  codexWindowDuration: 'Fereastră de {duration}',
-  codexWindowDays: 'Fereastră de {count} zile',
-  codexWindowHours: 'Fereastră de {count} ore',
-  codexWindowMinutes: 'Fereastră de {count} minute',
-  codexQuotaGroup: 'Limite de utilizare',
-  codexUsageAllowed: 'Utilizarea inclusă este disponibilă',
-  codexUsageBlocked: 'Utilizarea inclusă este momentan blocată',
-  codexUsageUnknown: 'Permisiunea de utilizare inclusă este necunoscută',
-  codexNoWindows: 'Nu au fost furnizate ferestre de utilizare.',
-  codexSpendBlocked: 'Limita de cheltuieli a spațiului de lucru a fost atinsă.',
-  codexLimitReached: 'O limită de utilizare a furnizorului a fost atinsă.',
-  codexCredits: 'Credite',
-  codexUnlimited: 'Nelimitat',
-  codexCreditsAvailable: 'Disponibile',
-  codexNoCredits: 'Nu sunt disponibile credite',
+    'Acțiunea nu a reușit. Conturile salvate au rămas neschimbate.',
+  codexLoading: 'Se încarcă conturile Codex…',
+  codexActiveAccount: 'Cont activ',
+  codexActiveBadge: 'Activ',
+  codexRefresh: 'Actualizează',
+  codexRefreshLabel: 'Actualizează utilizarea pentru {name}',
+  codexReadAge: 'Citit {age}',
+  codexViewDetails: 'Vezi detaliile',
+  codexNoActiveTitle: 'Niciun cont Codex activ',
+  codexNoActiveText:
+    'Autentifică-te cu ChatGPT sau importă contul pe care Codex îl folosește acum.',
+  codexSwitchTo: 'Comută pe {name}',
+  codexLimitReachedFreesIn: 'Limită atinsă · disponibil din nou în {duration}',
+  codexNoQuota:
+    'Utilizarea nu a fost verificată încă. Actualizează ca să citești limitele actuale.',
   codexApiQuota:
-    'Conturile cu cheie API nu au citiri ale limitelor abonamentului ChatGPT.',
-  codexNoQuota: 'Nu este încă disponibilă o citire verificată a utilizării.',
-  codexWorking: 'Actualizare conturi Codex…',
-  codexSetup: 'Configurare Codex',
+    'Acest cont folosește o cheie API, deci nu are limitele unui abonament ChatGPT.',
+  codexNoWindows: 'Nu au fost raportate limite de utilizare pentru acest cont.',
+  codexUsageBlocked: 'Utilizarea inclusă este blocată pentru acest cont.',
+  codexSpendBlocked: 'Limita de cheltuieli a spațiului de lucru a fost atinsă.',
+  codexCredits: 'Credite',
+  codexCreditsUnlimited: 'Nelimitate',
+  codexCreditsAvailable: 'Disponibile',
+  codexOtherLimit: 'Altă limită',
+  codexResetsIn: 'Resetare în {duration}',
+  codexPlanFree: 'Gratuit',
+  codexWindowShort: 'Fereastră scurtă',
+  codexWindowLong: 'Fereastră lungă',
+  codexWindowWeekly: 'Săptămânal',
+  codexWindowDaily: 'Zilnic',
+  codexSavedAccounts: 'Conturi salvate',
+  codexAddAccount: 'Adaugă cont',
+  codexAddActions: 'Adaugă sau importă un cont Codex',
+  codexAddSignIn: 'Autentifică-te cu ChatGPT…',
+  codexAddImportCurrent: 'Importă autentificarea Codex curentă',
+  codexAddImportSwitcher: 'Importă din Codex Switcher',
+  codexImporting: 'Se importă…',
+  codexEmptyTitle: 'Toate conturile Codex, într-un singur loc',
+  codexEmptyText:
+    'Autentifică-te cu ChatGPT sau importă contul pe care Codex îl folosește acum. Apoi comuți între ele dintr-un singur clic.',
+  codexColAccount: 'Cont',
+  codexColStatus: 'Stare',
+  codexColActions: 'Acțiuni',
+  codexStatusActive: 'Activ',
+  codexStatusLimited: 'Limită atinsă',
+  codexStatusFreesIn: 'Disponibil în {duration}',
+  codexStatusFreeAgain: 'Probabil disponibil · actualizează pentru confirmare',
+  codexStatusReady: 'Disponibil',
+  codexStatusSignIn: 'Autentifică-te din nou',
+  codexStatusUnread: 'Neverificat încă',
+  codexStatusChecking: 'Se verifică…',
+  codexStatusApiKey: 'Cheie API',
+  codexStatusApiKeyDetail: 'Fără limite de abonament ChatGPT',
+  codexStatusUnsupported: 'Autentificare neacceptată',
+  codexStatusCheckFailed: 'Ultima verificare a eșuat',
+  codexStatusSwitchBlocked: 'Nu se poate comuta pe acest cont',
+  codexSwitch: 'Comută',
+  codexSwitchLabel: 'Comută Codex pe {name}',
+  codexSwitchNow: 'Comută acum',
+  codexSwitchNowLabel: 'Comută acum pe {name}',
+  codexSwitchingShort: 'Se comută…',
+  codexSignIn: 'Autentifică-te',
+  codexSignInLabel: 'Autentifică-te din nou ca {name}',
+  codexMoreLabel: 'Mai multe acțiuni pentru {name}',
+  codexMenuDetails: 'Detalii',
+  codexMenuRefresh: 'Actualizează utilizarea',
+  codexMenuDelete: 'Șterge',
+  codexNextBest: 'Recomandat',
+  codexNextBestText:
+    'Are cea mai multă utilizare săptămânală rămasă dintre celelalte conturi.',
+  codexHowTitle: 'Cum funcționează comutarea',
+  codexHowText:
+    'PrimerSwitch salvează noua autentificare și repornește Codex în fundal. Terminalele deschise se reconectează singure și continuă de unde au rămas.',
+  codexHowApps:
+    'Aplicația Codex și VS Code rulează separat și păstrează contul anterior până le repornești.',
+  codexEnvDaemon:
+    'Codex rulează în fundal, așa că terminalele deschise se vor reconecta.',
+  codexEnvNoDaemon:
+    'Niciun terminal Codex nu este conectat acum. Următoarea sesiune folosește noul cont.',
+  codexEnvOtherClients:
+    'Aplicația Codex sau VS Code este deschisă și își păstrează contul până la repornire.',
+  codexSetupTitle: 'Configurare Codex',
   codexCheckSetup: 'Verifică configurarea',
-  codexSelectedAccount: 'Selectat pentru clienți noi',
-  codexRefreshLabel: 'Actualizează utilizarea Codex pentru {name}',
-  codexSelected: 'Selectat',
-  codexChatGPT: 'ChatGPT',
-  codexApiKey: 'Cheie API',
-  codexUnsupportedAuth: 'Autentificare neacceptată',
-  codexNoSelected: 'Niciun cont Codex selectat',
-  codexImportOrAdd:
-    'Autentifică-te cu ChatGPT sau importă contul Codex curent.',
-  codexAddAccount: 'Adaugă un cont Codex',
-  codexImportCurrent: 'Importă contul Codex curent',
-  codexSavedQuota: 'Ultima citire salvată',
-  codexNoQuotaShort: 'Nicio citire',
-  codexSelect: 'Selectează contul',
-  codexEmptyTitle: 'Conturile tale Codex, împreună',
-  codexManualTitle: 'Selectare manuală a contului',
-  codexManualDescription:
-    'Selectarea se aplică clienților Codex deschiși după schimbare.',
-  codexCloseClients:
-    'Închide aplicațiile Codex și terminalele care folosesc Codex înainte de selectarea contului. Redeschide-le după schimbare.',
-  codexManualOnly: 'Doar selectare manuală',
-  codexCompatibility: 'Compatibilitate',
-  codexVersion: 'Versiune Codex',
-  codexBrowserLogin: 'Autentificare în browser',
-  codexAvailable: 'Disponibilă',
-  codexUnavailable: 'Indisponibilă',
-  codexSupportScope:
-    'Sunt acceptate conturi ChatGPT gestionate cu Codex 0.160.0 și stocarea autentificării FILE. Alte versiuni, tipuri de autentificare și moduri de stocare rămân restricționate.',
-  codexResetCredits: 'Credite de resetare',
-  codexReadOnly: 'Doar citire',
-  codexNoCreditActions:
-    'PrimerSwitch nu consumă automat credite sau resetări Codex.',
-  codexLoginDescription:
-    'Finalizează autentificarea în browser. Fereastra se actualizează când autorizarea se încheie; nu trebuie lipit niciun cod.',
-  codexIsolatedLogin:
-    'Adăugarea unui cont păstrează autentificarea Codex curentă.',
-  codexVerifyingLogin: 'Verificare cont…',
-  codexWaitingLogin: 'Se așteaptă autentificarea în browser…',
-  codexSelectTitle: 'Selectezi un cont Codex?',
-  codexSelectDescription:
-    'Selectează {name} pentru clienții Codex deschiși ulterior.',
-  codexNativeGuard:
-    'PrimerSwitch verifică existența clienților activi și modificările autentificării curente înainte de aplicarea selecției.',
-  codexClosedAcknowledgement:
-    'Am închis clienții Codex care folosesc această autentificare.',
-  codexCheckAgain: 'Verifică din nou',
-  codexAuthKind: 'Tip de autentificare',
-  codexQuotaVerification: 'Verificarea actuală a utilizării',
-  codexQuotaUnverified:
-    'Contul asociat utilizării nu a fost verificat în această sesiune.',
-  codexIdentity: 'Identitate',
-  codexWorkspace: 'Spațiu de lucru',
-  codexVerified: 'Verificată',
-  codexActiveQuotaOnly:
-    'Poate fi actualizat doar contul ChatGPT gestionat și selectat. Alte citiri rămân salvate.',
-  codexDeleteDescription:
-    'Elimini {name} din PrimerSwitch? Autentificarea Codex curentă rămâne neschimbată.',
+  codexSetupChecking: 'Se verifică configurarea Codex…',
+  codexSetupReady: 'Codex {version} · pregătit',
+  codexSetupReadyUnknown: 'Codex · pregătit',
+  codexSetupNotInstalled: 'Codex nu este instalat',
+  codexSetupAttention: 'Codex {version} · necesită atenție',
+  codexSetupAttentionUnknown: 'Codex · necesită atenție',
+  codexSwitchingTo: 'Se comută pe {name}',
+  codexStageSaving: 'Se salvează noua autentificare…',
+  codexStageRestarting:
+    'Codex repornește în fundal. Terminalele deschise se reconectează singure; ce rulează deja se termină mai întâi (până la un minut).',
+  codexStageVerifying: 'Se verifică noul cont…',
+  codexStepSave: 'Salvare',
+  codexStepRestart: 'Repornire',
+  codexStepVerify: 'Verificare',
+  codexSwitchedLive:
+    'Codex folosește acum {name}. Terminalele deschise se reconectează automat.',
+  codexSwitchedNext:
+    'Codex folosește acum {name}. Schimbarea se aplică de la următoarea sesiune Codex pe care o pornești.',
+  codexSwitchedOtherClients:
+    'Aplicația Codex și VS Code păstrează contul anterior până le repornești.',
+  codexSwitcherTitle: 'Codex Switcher rulează.',
+  codexSwitcherText:
+    'Rescrie aceeași autentificare și închide forțat terminalele Codex când comută. Închide-l ca să eviți conflictele.',
+  codexSwitcherImport: 'Importă-i conturile',
+  codexWarnings: 'Avertismente de configurare',
+  codexBusy: 'Codex finalizează o altă acțiune pe conturi…',
   codexLoginComplete:
-    'Contul Codex a fost adăugat. Autentificarea curentă este păstrată.',
-  codexSwitchComplete:
-    'Cont selectat. Redeschide clienții Codex pentru a-l folosi.',
-  codexDeleteComplete: 'Contul Codex salvat a fost eliminat.',
+    'Cont adăugat. Codex folosește în continuare contul curent până când comuți.',
+  codexSignedInAgain: 'Te-ai autentificat din nou ca {name}.',
+  codexDeleteComplete: 'Contul salvat a fost șters din PrimerSwitch.',
+  codexImportedCurrent: 'Autentificarea Codex curentă a fost salvată.',
+  codexImportedCurrentExisting:
+    'Autentificarea Codex curentă era deja salvată, așa că a fost actualizată.',
+  codexImportedSwitcherOne: 'A fost importat {count} cont din Codex Switcher.',
+  codexImportedSwitcherFew:
+    'Au fost importate {count} conturi din Codex Switcher.',
+  codexImportedSwitcherOther:
+    'Au fost importate {count} de conturi din Codex Switcher.',
+  codexImportedSwitcherNone:
+    'Nu există conturi noi în Codex Switcher; toate erau deja salvate.',
+  codexUpdatedAge: 'Actualizat {age}',
+  codexNoReadings: 'Nicio citire a utilizării încă',
+  codexRefreshAll: 'Actualizează toate',
+  codexRefreshing: 'Se actualizează…',
+  codexLoginTitle: 'Autentificare cu ChatGPT',
+  codexLoginAgainTitle: 'Autentifică-te din nou',
+  codexLoginDescription:
+    'Finalizează autentificarea în browser. Fereastra se actualizează singură când termini, deci nu trebuie să lipești niciun cod.',
+  codexLoginAgainDescription:
+    'Autentifică-te în browser ca {name}. Fereastra se actualizează singură când termini, deci nu trebuie să lipești niciun cod.',
+  codexLoginKeepsCurrent:
+    'Adăugarea unui cont nu schimbă contul folosit de Codex.',
+  codexLoginOpening: 'Se deschide browserul…',
+  codexLoginWaiting: 'Se așteaptă finalizarea în browser…',
+  codexLoginVerifying: 'Se verifică contul…',
+  codexDetailsSignIn: 'Autentificare',
+  codexAuthChatGPT: 'Cont ChatGPT',
+  codexAuthApiKey: 'Cheie API',
+  codexAuthUnsupported: 'Autentificare neacceptată',
+  codexDetailsPlan: 'Abonament',
+  codexDetailsWorkspace: 'Spațiu de lucru',
+  codexDetailsChecked: 'Ultima verificare',
+  codexDetailsDelete: 'Șterge din PrimerSwitch',
+  codexDeleteTitle: 'Ștergi contul salvat?',
+  codexDeleteDescription:
+    '{name} va fi eliminat din PrimerSwitch. Nu te deconectează din ChatGPT și nu schimbă contul pe care Codex îl folosește acum.',
+  codexDeleteConfirm: 'Șterge',
+  codexDeleting: 'Se șterge…',
   codexReason_notInstalled:
-    'Instalează Codex local, apoi verifică din nou configurarea.',
+    'Codex nu este instalat pe acest computer. Instalează-l, apoi verifică din nou configurarea.',
   codexReason_unsupportedVersion:
-    'Această versiune Codex nu a fost verificată pentru compatibilitate. Modificarea conturilor nu este disponibilă.',
+    'Această versiune Codex nu este încă acceptată, așa că schimbarea conturilor este dezactivată.',
   codexReason_unsupportedStore:
-    'Acest mod de stocare a autentificării nu este încă acceptat. Configurarea curentă este păstrată.',
+    'Codex își păstrează autentificarea într-un loc pe care PrimerSwitch nu îl poate folosi încă. Nu s-a schimbat nimic.',
   codexReason_unsupportedAuth:
-    'Acest tip de autentificare nu permite selectarea conturilor ChatGPT gestionate.',
+    'Acest cont folosește o cheie API sau o altă autentificare care nu poate fi comutată.',
   codexReason_policyRestricted:
-    'Politica gestionată Codex nu permite această schimbare de cont.',
+    'Politica Codex a organizației tale nu permite schimbarea conturilor.',
   codexReason_externalCredentials:
-    'Această configurare folosește autentificare gestionată extern. Selectarea conturilor nu este disponibilă.',
+    'Codex este configurat să folosească o autentificare din altă parte, de exemplu o variabilă de mediu, care poate înlocui contul ales aici.',
   codexReason_storeConflict:
-    'Au fost găsite autentificări salvate în conflict. Clarifică configurarea Codex curentă înainte de a continua.',
+    'Codex are autentificări salvate care intră în conflict. Autentifică-te din nou în Codex, apoi verifică configurarea.',
   codexReason_vaultUnavailable:
-    'Stocarea securizată nu este disponibilă. Conturile salvate nu au fost modificate.',
-  codexReason_identityUnverified: 'Identitatea contului nu a fost verificată.',
+    'Stocarea securizată de pe acest computer este blocată sau indisponibilă. Conturile salvate au rămas neschimbate.',
+  codexReason_identityUnverified:
+    'Acest cont nu a fost confirmat încă. Actualizează-l sau autentifică-te din nou.',
   codexReason_identityMismatch:
-    'Contul sau spațiul de lucru returnat nu corespunde. Datele salvate sunt păstrate.',
-  codexReason_clientsRunning:
-    'Închide clienții Codex care folosesc această autentificare, apoi verifică din nou.',
-  codexReason_processInventoryUnavailable:
-    'Clienții Codex activi nu au putut fi verificați. Selectarea contului este blocată.',
+    'ChatGPT a returnat alt cont decât cel așteptat. Nu s-a schimbat nimic.',
   codexReason_externalChange:
-    'Autentificarea Codex curentă s-a schimbat. Verifică din nou înainte de a continua.',
-  codexReason_reconciliationRequired:
-    'O schimbare de cont trebuie reconciliată. Alte selecții sunt blocate pentru a păstra autentificarea curentă.',
+    'Autentificarea Codex a fost schimbată din afara PrimerSwitch. Verifică configurarea, apoi încearcă din nou.',
   codexReason_loginExpired:
-    'Autentificarea a expirat. Închide fereastra și încearcă din nou.',
+    'Autentificarea a durat prea mult și a expirat. Încearcă din nou.',
   codexReason_loginCanceled: 'Autentificarea a fost anulată.',
   codexReason_providerUnavailable:
-    'Codex nu a furnizat un răspuns verificat. Încearcă mai târziu.',
-  codexReason_invalidPreparation:
-    'Verificarea selecției a expirat sau nu mai este validă. Verifică din nou.',
-  codexReason_busy: 'O altă acțiune asupra conturilor este în curs.',
+    'Codex nu a răspuns cum era de așteptat. Încearcă din nou peste câteva momente.',
+  codexReason_busy:
+    'O altă acțiune pe conturi este încă în curs. Încearcă din nou peste câteva momente.',
+  codexReason_daemonRestartFailed:
+    'Noua autentificare este salvată, dar Codex nu a putut reporni în fundal. Terminalele deschise păstrează contul anterior până le repornești.',
+  codexReason_signInRequired:
+    'Autentificarea salvată nu mai este validă. Autentifică-te din nou ca să folosești acest cont.',
+  codexReason_switchInProgress:
+    'O altă comutare este deja în curs. Așteaptă să se termine.',
+  codexReason_switcherUnavailable:
+    'Conturile din Codex Switcher nu au fost găsite sau nu au putut fi citite.',
+  codexReason_activeAccount:
+    'Comută pe alt cont înainte să-l ștergi pe acesta.',
 };

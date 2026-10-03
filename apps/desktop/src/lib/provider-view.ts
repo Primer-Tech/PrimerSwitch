@@ -17,6 +17,8 @@ export interface MeterView {
   resetsAt: number | null;
   /** A short visible hint under the bar, for example "Using credits". */
   note: string | null;
+  /** A tiny tag beside the value, for example the model whose window binds. */
+  tag: string | null;
   tone: 'blue' | 'green' | 'violet';
 }
 
@@ -213,7 +215,14 @@ export interface AccountRowView {
   /** A switch to this account is running. */
   switching: boolean;
   fiveHour: MeterView;
+  /** The account-wide weekly window (the active card and the details). */
   weekly: MeterView;
+  /**
+   * The weekly value automation uses (the list and Next up): for Claude the higher
+   * of the account-wide and the selected model's window, tagged with the model when
+   * that window binds; for Codex the same as `weekly`.
+   */
+  weeklyBinding: MeterView;
   /** Other windows: Claude's per-model weekly limits, Codex's other limits. */
   extras: MeterView[];
   status: StatusView;
@@ -326,8 +335,9 @@ export function meter(
   resetsAt: number | null,
   tone: MeterView['tone'],
   note: string | null = null,
+  tag: string | null = null,
 ): MeterView {
-  return { key, label, value, resetsAt, note, tone };
+  return { key, label, value, resetsAt, note, tag, tone };
 }
 
 /**

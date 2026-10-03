@@ -106,7 +106,12 @@
           ><td class="cell-meter"
             ><QuotaBar compact meter={row.fiveHour} {now} {threshold} /></td
           ><td class="cell-meter"
-            ><QuotaBar compact meter={row.weekly} {now} {threshold} /></td
+            ><QuotaBar
+              compact
+              meter={row.weeklyBinding}
+              {now}
+              {threshold}
+            /></td
           ><td class="cell-status"
             ><StatusLabel status={row.status} id={status} /></td
           ><td class="cell-actions"
@@ -223,7 +228,7 @@
     padding-right: 18px !important;
   }
   /* The column header names the window; the card layout below shows it again. */
-  .cell-meter :global(.quota-label > span) {
+  .cell-meter :global(.quota-name) {
     display: none;
   }
   .table-identity {
@@ -389,7 +394,7 @@
     .cell-account {
       grid-area: account;
     }
-    .cell-meter :global(.quota-label > span) {
+    .cell-meter :global(.quota-name) {
       display: block;
     }
     .cell-meter:nth-child(2) {

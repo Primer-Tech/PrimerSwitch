@@ -45,7 +45,12 @@
   data-tone={meter.tone}
 >
   <div class="quota-label">
-    <span>{meter.label}</span><strong>{percent}</strong>
+    <span class="quota-name">{meter.label}</span><span class="quota-value"
+      ><strong>{percent}</strong>{#if meter.tag && value !== null}<small
+          class="quota-tag"
+          aria-hidden="true">· {meter.tag}</small
+        >{/if}</span
+    >
   </div>
   <div
     class="quota-track"
@@ -60,6 +65,7 @@
       ? t($language, 'dataUnavailable')
       : [
           t($language, 'usageMeter', { value: percentage(value, $language) }),
+          meter.tag,
           meter.note,
         ]
           .filter(Boolean)
@@ -106,6 +112,21 @@
     letter-spacing: -0.03em;
     color: var(--text);
     font-variant-numeric: tabular-nums;
+  }
+  .quota-value {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 4px;
+    min-width: 0;
+  }
+  .quota-tag {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--subtle);
+    font-size: 0.64rem;
+    font-weight: 500;
   }
   .quota-track {
     height: 7px;

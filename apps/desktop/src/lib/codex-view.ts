@@ -178,6 +178,7 @@ function row(
     now,
     locale,
   );
+  const weekly = primaryMeter(windows.long, 'long', account, locale);
   return {
     id: account.id,
     name: account.name,
@@ -188,7 +189,9 @@ function row(
     next: snapshot.nextId === account.id && !account.selected,
     switching: switchingId === account.id,
     fiveHour: primaryMeter(windows.short, 'short', account, locale),
-    weekly: primaryMeter(windows.long, 'long', account, locale),
+    // Codex has one main weekly window: it is also the one automation uses.
+    weekly,
+    weeklyBinding: weekly,
     extras: extraMeters(account, locale),
     // The active row is busy refreshing: say so beside "Active".
     status:

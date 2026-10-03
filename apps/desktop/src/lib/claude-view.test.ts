@@ -61,8 +61,29 @@ describe('Claude adapter: meters', () => {
     const studio = row(empty, 'a');
     expect(studio.fiveHour.value).toBeNull();
     expect(studio.weekly.value).toBeNull();
+    expect(studio.weeklyBinding).toMatchObject({ value: null, tag: null });
     expect(studio.extras).toEqual([]);
     expect(studio.readAt).toBeNull();
+  });
+  it('lists the weekly value automation uses and names the model whose window binds', () => {
+    const raw = snapshot();
+    const now3d = now + 3 * 86400;
+    raw.accounts[0].usage!.weeklyModelResetsAt = now3d + 3600;
+    // Sonnet's window (58%) is higher than the account-wide week (47%).
+    expect(row(raw, 'a').weeklyBinding).toMatchObject({
+      label: 'Weekly',
+      value: 58,
+      tag: 'Sonnet',
+      resetsAt: now3d + 3600,
+    });
+    // The card keeps the account-wide week.
+    expect(row(raw, 'a').weekly).toMatchObject({ value: 47, tag: null });
+    // The runtime matches the model loosely; the tag uses the limit's own name.
+    raw.activeModel = 'claude-sonnet-4-5';
+    expect(row(raw, 'a').weeklyBinding.tag).toBe('Sonnet');
+    // When the account-wide week binds, there is no tag.
+    raw.accounts[0].usage!.weeklyModel = 47;
+    expect(row(raw, 'a').weeklyBinding).toMatchObject({ value: 47, tag: null });
   });
 });
 

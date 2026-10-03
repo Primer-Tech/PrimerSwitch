@@ -43,7 +43,7 @@
       /><QuotaBar
         compact
         reset={false}
-        meter={next.weekly}
+        meter={next.weeklyBinding}
         {now}
         threshold={view.threshold}
       />

@@ -43,6 +43,9 @@ describe('Codex adapter: meters', () => {
       value: 35,
       resetsAt: now + 4 * day + 6 * hour,
     });
+    // Codex has one main weekly window: the list shows the same one.
+    expect(studio.weeklyBinding).toBe(studio.weekly);
+    expect(studio.weekly.tag).toBeNull();
     // The per-id copy of the main limit is not repeated.
     expect(studio.extras.map((extra) => [extra.label, extra.value])).toEqual([
       ['Weekly · Code review', 12],

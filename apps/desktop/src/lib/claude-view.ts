@@ -44,8 +44,31 @@ function limitOf(account: AccountView): LimitKind | null {
     : 'near';
 }
 
+type ScopedLimit = NonNullable<AccountView['usage']>['scopedLimits'][number];
+/** The weekly limit of the selected model, matched as the runtime matches it. */
+function modelLimit(
+  limits: readonly ScopedLimit[],
+  model: string | null,
+): ScopedLimit | null {
+  const needle = model?.trim().toLowerCase();
+  if (!needle) return null;
+  return (
+    limits.find((limit) => {
+      const name = limit.label.toLowerCase();
+      return (
+        !!name &&
+        (needle.startsWith(name) ||
+          name.startsWith(needle) ||
+          needle.includes(name) ||
+          name.includes(needle))
+      );
+    }) ?? null
+  );
+}
+
 function row(
   account: AccountView,
+  model: string | null,
   { locale, now, switchingId = null }: ClaudeViewOptions,
 ): AccountRowView {
   const usage = account.usage;
@@ -85,6 +108,12 @@ function row(
   )
     notes.push({ tone: 'muted', text: t(locale, 'scopedStale') });
   const weekly = t(locale, 'weekly');
+  // Automation ranks and limits on the higher of the account-wide week and the
+  // selected model's week; the list names the model when its window is the higher.
+  const modelBinds = !!usage && usage.weeklyModel > usage.weeklyOverall;
+  const bindingModel = modelBinds
+    ? (modelLimit(usage!.scopedLimits, model)?.label ?? model)
+    : null;
   return {
     id: account.id,
     name: account.name,
@@ -108,6 +137,16 @@ function row(
       usage?.weeklyOverall ?? null,
       usage?.weeklyOverallResetsAt ?? null,
       'green',
+    ),
+    // Its countdown follows the binding window, as the runtime projects it.
+    weeklyBinding: meter(
+      'weekly',
+      weekly,
+      usage?.weeklyModel ?? null,
+      usage?.weeklyModelResetsAt ?? null,
+      'green',
+      null,
+      bindingModel,
     ),
     extras: (usage?.scopedLimits ?? []).map((limit) =>
       meter(
@@ -195,7 +234,9 @@ export function claudeView(
     };
   const settings = snapshot.settings;
   const plan = snapshot.consumptionPlan ?? [];
-  const unsorted = snapshot.accounts.map((account) => row(account, options));
+  const unsorted = snapshot.accounts.map((account) =>
+    row(account, snapshot.activeModel, options),
+  );
   const rows = rankRows(unsorted, plan);
   const active =
     rows.find((r) => r.id === snapshot.activeId) ??

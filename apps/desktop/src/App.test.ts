@@ -94,6 +94,17 @@ describe('desktop workflows', () => {
       order.getAllByRole('listitem').map((item) => item.textContent),
     ).toEqual(['1Personal']);
     expect(row('Personal').getByText('Next')).toBeVisible();
+    // The list and Next up show the weekly value automation uses: here Sonnet's.
+    const listWeekly = row('Studio').getByRole('meter', { name: 'Weekly' });
+    expect(listWeekly).toHaveAttribute('aria-valuenow', '58');
+    expect(listWeekly).toHaveAttribute(
+      'aria-valuetext',
+      '58 percent used · Sonnet',
+    );
+    expect(listWeekly.closest('.usage-quota')).toHaveTextContent('58%· Sonnet');
+    expect(
+      section('Next up').getByRole('meter', { name: 'Weekly' }),
+    ).toHaveAttribute('aria-valuenow', '24');
     const dialog = await details('Studio');
     expect(dialog).toHaveTextContent('Available resets');
     expect(dialog).toHaveTextContent('Weekly window started');

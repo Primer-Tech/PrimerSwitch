@@ -392,6 +392,12 @@ mod mac {
     use super::*;
     use security_framework::os::macos::keychain::SecKeychain;
 
+    fn debug_phase(name: &str) {
+        if std::env::var_os("PRIMERSWITCH_MACOS_DEBUG").is_some() {
+            eprintln!("macOS Keychain update phase: {name}");
+        }
+    }
+
     // Static source inspection of installed public Claude 2.1.287, not native Mac
     // acceptance. Older username/service-only selectors are intentionally not guessed.
     const SERVICE: &str = "Claude Code-credentials";
@@ -421,6 +427,14 @@ mod mac {
         }
     }
     pub(super) fn update_current(bytes: &[u8]) -> Result<()> {
+        debug_phase("update-start");
+        // A headless CLI must fail closed when the keychain would otherwise
+        // open an authorization prompt. Keeping the interaction lock alive for
+        // the complete replacement also prevents a prompt from blocking the
+        // delete/add sequence indefinitely on a hosted runner.
+        let _interaction =
+            SecKeychain::disable_user_interaction().map_err(|_| PlatformError::KeyUnavailable)?;
+        debug_phase("interaction-disabled");
         // Use an explicit handle to the user's default keychain. Updating the
         // existing item in-place is not durable on all supported macOS
         // versions (the Security.framework call can report success while a
@@ -429,15 +443,19 @@ mod mac {
         // the item instead. The old bytes stay in memory until the replacement
         // has been verified so a failed add can restore the previous value.
         let keychain = SecKeychain::default().map_err(|_| PlatformError::KeyUnavailable)?;
+        debug_phase("default-keychain-opened");
         let (old_password, item) = keychain
             .find_generic_password(SERVICE, ACCOUNT)
             .map_err(|_| PlatformError::Conflict)?;
+        debug_phase("item-found");
         let old_bytes = old_password.to_owned();
         // Release the buffer returned by SecKeychainFindGenericPassword before
         // deleting the item; Security.framework can otherwise wait on the
         // content allocation while the keychain record is being replaced.
         drop(old_password);
+        debug_phase("old-content-released");
         item.delete();
+        debug_phase("item-delete-returned");
 
         if keychain
             .add_generic_password(SERVICE, ACCOUNT, bytes)
@@ -448,10 +466,12 @@ mod mac {
             let _ = keychain.add_generic_password(SERVICE, ACCOUNT, &old_bytes);
             return Err(PlatformError::KeyUnavailable);
         }
+        debug_phase("replacement-added");
 
         match keychain.find_generic_password(SERVICE, ACCOUNT) {
             Ok((current, replacement)) if current.as_ref() == bytes => {
                 drop(replacement);
+                debug_phase("replacement-verified");
                 Ok(())
             }
             Ok((_, replacement)) => {

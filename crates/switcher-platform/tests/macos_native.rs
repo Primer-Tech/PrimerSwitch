@@ -13,6 +13,12 @@ const SERVICE: &str = "Claude Code-credentials";
 const ACCOUNT: &str = "claude-code-user";
 const PASSWORD: &str = "PrimerSwitch-native-fixture-keychain-password";
 
+fn phase(name: &str) {
+    if env::var_os("PRIMERSWITCH_MACOS_DEBUG").is_some() {
+        eprintln!("macOS native qualification phase: {name}");
+    }
+}
+
 fn security<I, S>(arguments: I) -> Result<Output, String>
 where
     I: IntoIterator<Item = S>,
@@ -223,9 +229,12 @@ fn isolated_keychain_and_vault_round_trip() {
             "emailAddress": "fixture@example.invalid"
         });
         let keychain = KeychainFixture::create(&root_path)?;
+        phase("fixture-created");
         keychain.add_claude_item(&old_credentials)?;
+        phase("fixture-item-added");
         let store = switcher_platform::ActiveStore::new(paths.clone());
         let before = store.read().map_err(|error| error.to_string())?;
+        phase("initial-store-read");
         if before.credentials != old_credentials {
             return Err("native Keychain read did not return the fixture payload".to_owned());
         }
@@ -233,12 +242,14 @@ fn isolated_keychain_and_vault_round_trip() {
         let vault_directory = home.join(".primer-vault");
         let vault = switcher_platform::Vault::open(vault_directory.clone())
             .map_err(|error| error.to_string())?;
+        phase("vault-opened");
         let vault_payload = json!({"native": true, "sentinel": "fixture-vault-value"});
         vault
             .save("macos-native", &vault_payload)
             .map_err(|error| error.to_string())?;
         let reopened_vault = switcher_platform::Vault::open(vault_directory.clone())
             .map_err(|error| error.to_string())?;
+        phase("vault-reopened");
         if reopened_vault
             .load::<Value>("macos-native")
             .map_err(|error| error.to_string())?
@@ -253,7 +264,9 @@ fn isolated_keychain_and_vault_round_trip() {
         store
             .switch(&new_credentials, &new_identity, &vault)
             .map_err(|error| error.to_string())?;
+        phase("switch-complete");
         let after = store.read().map_err(|error| error.to_string())?;
+        phase("post-switch-store-read");
         if after.credentials != new_credentials || after.identity != new_identity {
             let credentials_equal = after.credentials == new_credentials;
             let identity_equal = after.identity == new_identity;

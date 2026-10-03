@@ -23,6 +23,7 @@ def main() -> int:
     environment = os.environ.copy()
     environment["PRIMERSWITCH_MACOS_KEYCHAIN_QUALIFICATION"] = "1"
     environment["PRIMERSWITCH_MACOS_REPORT"] = str(REPORT)
+    environment["PRIMERSWITCH_MACOS_DEBUG"] = "1"
     command = [
         "cargo",
         "test",
@@ -36,7 +37,23 @@ def main() -> int:
         "--nocapture",
         "--test-threads=1",
     ]
-    completed = subprocess.run(command, cwd=ROOT, env=environment, check=False)
+    timeout_seconds = int(
+        environment.get("PRIMERSWITCH_MACOS_TIMEOUT_SECONDS", "180")
+    )
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=ROOT,
+            env=environment,
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        print(
+            f"macOS native qualification timed out after {timeout_seconds} seconds",
+            file=sys.stderr,
+        )
+        return 124
     if completed.returncode != 0:
         print("macOS native qualification failed", file=sys.stderr)
         return completed.returncode or 1

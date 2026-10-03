@@ -8,7 +8,7 @@ mod paths;
 mod protection;
 mod vault;
 
-pub use active::{ActiveSnapshot, ActiveStore};
+pub use active::{ActiveSnapshot, ActiveStore, Recovery};
 pub use paths::{CliPaths, app_data_dir};
 pub use vault::Vault;
 
@@ -33,6 +33,12 @@ pub enum PlatformError {
     UnsupportedSecretService,
     #[error("This Claude configuration or authentication mode is not supported for switching")]
     UnsupportedContext,
+    /// Carries only the fixed variable name from the reviewed list, never its value.
+    #[error("The environment variable {0} selects a Claude mode that does not support switching")]
+    UnsupportedEnvironment(&'static str),
+    /// Carries only the fixed settings key or variable name, never its value.
+    #[error("{0} in Claude Code's settings.json selects a mode that does not support switching")]
+    UnsupportedSetting(&'static str),
     #[error("A storage operation is already in progress")]
     Busy,
     #[error("Claude credentials changed externally; automatic recovery was stopped")]

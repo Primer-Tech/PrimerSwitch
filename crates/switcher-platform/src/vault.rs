@@ -8,7 +8,7 @@ use serde::{Serialize, de::DeserializeOwned};
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 use std::path::Path;
 use std::{fmt, path::PathBuf};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 const MAGIC: &[u8; 8] = b"PRMSV001";
 
@@ -66,23 +66,7 @@ impl Vault {
         let Some(envelope) = files::read_optional(&path)? else {
             return Ok(None);
         };
-        if envelope.len() < 8 + 24 + 16 || &envelope[..8] != MAGIC {
-            return Err(PlatformError::Authentication);
-        }
-        let cipher = XChaCha20Poly1305::new_from_slice(self.key.as_ref())
-            .map_err(|_| PlatformError::Authentication)?;
-        let aad = associated_data(name);
-        let plaintext = Zeroizing::new(
-            cipher
-                .decrypt(
-                    XNonce::from_slice(&envelope[8..32]),
-                    Payload {
-                        msg: &envelope[32..],
-                        aad: aad.as_bytes(),
-                    },
-                )
-                .map_err(|_| PlatformError::Authentication)?,
-        );
+        let plaintext = self.open_envelope(name, &envelope)?;
         // A schema parse failure preserves the authentic envelope as well.
         Ok(Some(serde_json::from_slice(&plaintext)?))
     }
@@ -95,6 +79,54 @@ impl Vault {
             self.authenticate(name, &envelope)?;
         }
         let plaintext = Zeroizing::new(serde_json::to_vec(value)?);
+        files::atomic_write(&path, &self.seal(name, &plaintext)?)
+    }
+
+    /// Moves an authentic record to the first free `<name>-set-aside-<n>` name,
+    /// re-encrypted for that name. A record that can no longer be applied stays
+    /// available for diagnostics without blocking the name it was stored under.
+    pub(crate) fn set_aside(&self, name: &str) -> Result<Option<String>> {
+        let path = self.record_path(name)?;
+        let _lock = files::Lock::acquire(&self.directory.join(".vault.lock"))?;
+        let Some(envelope) = files::read_optional(&path)? else {
+            return Ok(None);
+        };
+        let plaintext = self.open_envelope(name, &envelope)?;
+        for index in 1..=999 {
+            let target = format!("{name}-set-aside-{index}");
+            let target_path = self.record_path(&target)?;
+            // Never replace an earlier retained record, authentic or not.
+            if files::read_optional(&target_path)?.is_some() {
+                continue;
+            }
+            files::atomic_write(&target_path, &self.seal(&target, &plaintext)?)?;
+            files::remove(&path)?;
+            return Ok(Some(target));
+        }
+        Err(PlatformError::Io)
+    }
+
+    fn open_envelope(&self, name: &str, envelope: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+        if envelope.len() < 8 + 24 + 16 || &envelope[..8] != MAGIC {
+            return Err(PlatformError::Authentication);
+        }
+        let cipher = XChaCha20Poly1305::new_from_slice(self.key.as_ref())
+            .map_err(|_| PlatformError::Authentication)?;
+        let aad = associated_data(name);
+        Ok(Zeroizing::new(
+            cipher
+                .decrypt(
+                    XNonce::from_slice(&envelope[8..32]),
+                    Payload {
+                        msg: &envelope[32..],
+                        aad: aad.as_bytes(),
+                    },
+                )
+                .map_err(|_| PlatformError::Authentication)?,
+        ))
+    }
+
+    fn seal(&self, name: &str, plaintext: &[u8]) -> Result<Vec<u8>> {
         let cipher = XChaCha20Poly1305::new_from_slice(self.key.as_ref())
             .map_err(|_| PlatformError::Authentication)?;
         let mut nonce = [0u8; 24];
@@ -106,7 +138,7 @@ impl Vault {
             .encrypt(
                 XNonce::from_slice(&nonce),
                 Payload {
-                    msg: &plaintext,
+                    msg: plaintext,
                     aad: aad.as_bytes(),
                 },
             )
@@ -115,7 +147,7 @@ impl Vault {
         envelope.extend_from_slice(MAGIC);
         envelope.extend_from_slice(&nonce);
         envelope.extend_from_slice(&encrypted);
-        files::atomic_write(&path, &envelope)
+        Ok(envelope)
     }
 
     pub fn remove(&self, name: &str) -> Result<()> {
@@ -128,23 +160,8 @@ impl Vault {
     }
 
     fn authenticate(&self, name: &str, envelope: &[u8]) -> Result<()> {
-        if envelope.len() < 48 || &envelope[..8] != MAGIC {
-            return Err(PlatformError::Authentication);
-        }
-        let cipher = XChaCha20Poly1305::new_from_slice(self.key.as_ref())
-            .map_err(|_| PlatformError::Authentication)?;
-        let aad = associated_data(name);
-        let mut plaintext = cipher
-            .decrypt(
-                XNonce::from_slice(&envelope[8..32]),
-                Payload {
-                    msg: &envelope[32..],
-                    aad: aad.as_bytes(),
-                },
-            )
-            .map_err(|_| PlatformError::Authentication)?;
-        plaintext.zeroize();
-        Ok(())
+        // The opened plaintext is zeroized when dropped.
+        self.open_envelope(name, envelope).map(|_| ())
     }
 
     fn record_path(&self, name: &str) -> Result<PathBuf> {
@@ -271,6 +288,40 @@ mod tests {
         ] {
             assert!(vault.save(name, &1).is_err());
         }
+    }
+
+    #[test]
+    fn set_aside_retains_authentic_records_under_fresh_names_only() {
+        let root = crate::files::test_root();
+        let vault = Vault::with_key(root.path().join("vault"), [5; 32]).unwrap();
+        assert_eq!(vault.set_aside("journal").unwrap(), None);
+        vault.save("journal", &json!({"generation":1})).unwrap();
+        assert_eq!(
+            vault.set_aside("journal").unwrap().as_deref(),
+            Some("journal-set-aside-1")
+        );
+        assert!(vault.load::<Value>("journal").unwrap().is_none());
+        vault.save("journal", &json!({"generation":2})).unwrap();
+        assert_eq!(
+            vault.set_aside("journal").unwrap().as_deref(),
+            Some("journal-set-aside-2")
+        );
+        // Each retained record is re-bound to its new name and never overwritten.
+        assert_eq!(
+            vault.load::<Value>("journal-set-aside-1").unwrap().unwrap(),
+            json!({"generation":1})
+        );
+        assert_eq!(
+            vault.load::<Value>("journal-set-aside-2").unwrap().unwrap(),
+            json!({"generation":2})
+        );
+        let path = vault.record_path("journal").unwrap();
+        std::fs::write(&path, b"damaged envelope").unwrap();
+        assert!(matches!(
+            vault.set_aside("journal"),
+            Err(PlatformError::Authentication)
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), b"damaged envelope");
     }
 
     #[test]

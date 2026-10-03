@@ -36,28 +36,37 @@ impl CliPaths {
 
     // Empty secure-storage override has distinct semantics in Claude. Global
     // identity resolution under overrides remains unqualified, so fail closed.
+    const CONTEXT_VARIABLES: &'static [&'static str] = &[
+        "CLAUDE_CONFIG_DIR",
+        "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+        "CLAUDE_CODE_HOST_CREDS_FILE",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_BASE_URL",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CODE_USE_FOUNDRY",
+        "CLAUDE_CODE_CUSTOM_OAUTH_URL",
+        "CLAUDE_LOCAL_OAUTH_API_BASE",
+        "CLAUDE_CODE_OAUTH_CLIENT_ID",
+        "CLAUDE_CODE_HOST_GATEWAY_LINEAGE",
+    ];
+
+    /// Names the first blocking variable (never its value) so the user can fix it.
+    fn blocking_variable(get: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<&'static str> {
+        Self::CONTEXT_VARIABLES
+            .iter()
+            .copied()
+            .find(|name| get(name).is_some())
+    }
+
     fn validate_environment(get: impl Fn(&str) -> Option<std::ffi::OsString>) -> Result<()> {
-        const CONTEXT: &[&str] = &[
-            "CLAUDE_CONFIG_DIR",
-            "CLAUDE_SECURESTORAGE_CONFIG_DIR",
-            "CLAUDE_CODE_HOST_CREDS_FILE",
-            "CLAUDE_CODE_OAUTH_TOKEN",
-            "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
-            "ANTHROPIC_API_KEY",
-            "ANTHROPIC_AUTH_TOKEN",
-            "ANTHROPIC_BASE_URL",
-            "CLAUDE_CODE_USE_BEDROCK",
-            "CLAUDE_CODE_USE_VERTEX",
-            "CLAUDE_CODE_USE_FOUNDRY",
-            "CLAUDE_CODE_CUSTOM_OAUTH_URL",
-            "CLAUDE_LOCAL_OAUTH_API_BASE",
-            "CLAUDE_CODE_OAUTH_CLIENT_ID",
-            "CLAUDE_CODE_HOST_GATEWAY_LINEAGE",
-        ];
-        if CONTEXT.iter().any(|name| get(name).is_some()) {
-            return Err(PlatformError::UnsupportedContext);
+        match Self::blocking_variable(get) {
+            Some(name) => Err(PlatformError::UnsupportedEnvironment(name)),
+            None => Ok(()),
         }
-        Ok(())
     }
 
     pub fn default_model(&self) -> Result<Option<String>> {
@@ -86,15 +95,18 @@ impl CliPaths {
         if !settings.is_object() {
             return Err(PlatformError::InvalidJson);
         }
-        if settings.get("apiKeyHelper").is_some()
-            || settings.get("forceLoginMethod").is_some()
-            || settings.get("forceLoginOrgUUID").is_some()
-        {
-            return Err(PlatformError::UnsupportedContext);
+        for key in ["apiKeyHelper", "forceLoginMethod", "forceLoginOrgUUID"] {
+            if settings.get(key).is_some() {
+                return Err(PlatformError::UnsupportedSetting(key));
+            }
         }
         if let Some(environment) = settings.get("env") {
             let object = environment.as_object().ok_or(PlatformError::InvalidJson)?;
-            Self::validate_environment(|name| object.get(name).map(|_| std::ffi::OsString::new()))?;
+            if let Some(name) =
+                Self::blocking_variable(|name| object.get(name).map(|_| std::ffi::OsString::new()))
+            {
+                return Err(PlatformError::UnsupportedSetting(name));
+            }
         }
         Ok(())
     }
@@ -182,7 +194,7 @@ pub fn app_data_dir() -> Result<PathBuf> {
 mod tests {
     use super::*;
     #[test]
-    fn overrides_and_provider_modes_fail_closed() {
+    fn overrides_and_provider_modes_fail_closed_and_name_the_variable() {
         for name in [
             "CLAUDE_CONFIG_DIR",
             "CLAUDE_SECURESTORAGE_CONFIG_DIR",
@@ -190,11 +202,17 @@ mod tests {
             "CLAUDE_CODE_USE_BEDROCK",
         ] {
             for value in ["", "custom", "0"] {
-                assert!(
-                    CliPaths::validate_environment(|n| (n == name).then(|| value.into())).is_err()
-                );
+                let error = CliPaths::validate_environment(|n| (n == name).then(|| value.into()))
+                    .unwrap_err();
+                assert!(matches!(error, PlatformError::UnsupportedEnvironment(n) if n == name));
+                assert!(error.to_string().contains(name));
             }
         }
+        let error = CliPaths::validate_environment(|n| {
+            (n == "ANTHROPIC_API_KEY").then(|| "SECRET_VALUE_SENTINEL".into())
+        })
+        .unwrap_err();
+        assert!(!error.to_string().contains("SENTINEL"));
         assert!(CliPaths::validate_environment(|_| None).is_ok());
     }
     #[test]
@@ -227,15 +245,25 @@ mod tests {
         let root = crate::files::test_root();
         let paths = CliPaths::for_home(root.path().join("fixture-home"));
         std::fs::create_dir_all(&paths.config_dir).unwrap();
-        for settings in [
-            serde_json::json!({"apiKeyHelper":"SECRET_HELPER_SENTINEL"}),
-            serde_json::json!({"env":{"ANTHROPIC_API_KEY":"SECRET_KEY_SENTINEL"}}),
-            serde_json::json!({"forceLoginOrgUUID":"managed-org"}),
+        for (settings, name) in [
+            (
+                serde_json::json!({"apiKeyHelper":"SECRET_HELPER_SENTINEL"}),
+                "apiKeyHelper",
+            ),
+            (
+                serde_json::json!({"env":{"ANTHROPIC_API_KEY":"SECRET_KEY_SENTINEL"}}),
+                "ANTHROPIC_API_KEY",
+            ),
+            (
+                serde_json::json!({"forceLoginOrgUUID":"managed-org"}),
+                "forceLoginOrgUUID",
+            ),
         ] {
             let bytes = serde_json::to_vec(&settings).unwrap();
             std::fs::write(&paths.settings_file, &bytes).unwrap();
             let error = paths.validate_subscription_mode().unwrap_err();
-            assert!(matches!(error, PlatformError::UnsupportedContext));
+            assert!(matches!(error, PlatformError::UnsupportedSetting(n) if n == name));
+            assert!(error.to_string().contains(name));
             assert!(!error.to_string().contains("SENTINEL"));
             assert_eq!(std::fs::read(&paths.settings_file).unwrap(), bytes);
         }

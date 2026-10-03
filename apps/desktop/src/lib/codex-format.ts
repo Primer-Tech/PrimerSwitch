@@ -233,31 +233,16 @@ export function codexCanSwitch(
 }
 
 /**
- * The best other account: switchable, read, not limited, with the lowest weekly
- * usage and then the lowest short-window usage.
+ * The account automatic switching uses next. The native side ranks it with the
+ * rules shared with Claude; the window never ranks accounts itself.
  */
-export function codexNextBest(snapshot: CodexSnapshot): CodexAccount | null {
-  const score = (window: CodexWindow | null) =>
-    window ? window.usedPercent : Number.POSITIVE_INFINITY;
-  const candidates = snapshot.accounts
-    .filter(
-      (account) =>
-        account.authKind === 'chatgpt' &&
-        !!account.quota &&
-        codexCanSwitch(snapshot, account) &&
-        !codexLimitState(account).limited,
-    )
-    .map((account) => ({
-      account,
-      windows: codexWindows(codexMainLimit(account)),
-    }))
-    .filter(({ windows }) => windows.short || windows.long);
-  candidates.sort(
-    (a, b) =>
-      score(a.windows.long) - score(b.windows.long) ||
-      score(a.windows.short) - score(b.windows.short),
+export function codexNextAccount(snapshot: CodexSnapshot): CodexAccount | null {
+  if (!snapshot.nextId) return null;
+  return (
+    snapshot.accounts.find(
+      (account) => account.id === snapshot.nextId && !account.selected,
+    ) ?? null
   );
-  return candidates[0]?.account ?? null;
 }
 
 /** Credits are shown only when the main limit reports some. */

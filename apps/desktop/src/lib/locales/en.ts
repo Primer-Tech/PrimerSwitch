@@ -101,7 +101,7 @@ export const en = {
   pollInterval: 'Check interval',
   minutes: '{count} min',
   pollingHelp:
-    "To read the active account's limits, PrimerSwitch sends one very short message at each check. Checks run more often near the limit.",
+    "At each check PrimerSwitch reads the active account's limits: for Claude it sends one very short message, for Codex none. Checks run more often near the limit.",
   switchThreshold: 'Switch threshold',
   appearance: 'Appearance',
   system: 'System',
@@ -221,8 +221,9 @@ export const en = {
   providers: 'Account providers',
   globalPreferences: 'Appearance and language',
   settingsProviderScope:
-    'Automation applies to Claude. Appearance and language apply to both providers.',
-  claudeAutomation: 'Claude automation',
+    'Automatic switching, the weekly reset order, the check interval and the switch threshold apply to Claude and Codex. Starting the weekly window and using resets apply to Claude only. Appearance and language apply to both.',
+  sharedAutomation: 'Automation for Claude and Codex',
+  claudeOnlyAutomation: 'Claude only',
   codexDescription: 'Switch Codex accounts without closing your terminals.',
   codexActionFailed: 'That didn’t work. Your saved accounts are unchanged.',
   codexLoading: 'Loading Codex accounts…',
@@ -292,7 +293,12 @@ export const en = {
   codexMenuRefresh: 'Refresh usage',
   codexMenuDelete: 'Delete',
   codexNextBest: 'Next best',
-  codexNextBestText: 'Most weekly usage left among your other accounts.',
+  codexNextSoonest:
+    'Usable accounts whose weekly limit resets soonest go first.',
+  codexNextMostLeft:
+    'Usable accounts with the most weekly usage left go first.',
+  codexNextAutomatic:
+    'PrimerSwitch switches to it automatically when the active account reaches {threshold}%.',
   codexHowTitle: 'How switching works',
   codexHowText:
     'PrimerSwitch saves the new sign-in and restarts Codex in the background. Open terminals reconnect on their own and continue where they left off.',

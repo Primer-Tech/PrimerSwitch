@@ -6,10 +6,11 @@
     codexImportedMessage,
     codexLastRead,
     codexMessage,
-    codexNextBest,
+    codexNextAccount,
   } from '../lib/codex-format';
   import type { CodexController, CodexNotice } from '../lib/codex-controller';
   import type { CodexAccount } from '../lib/codex-types';
+  import type { Settings } from '../lib/types';
   import Icon from './Icon.svelte';
   import CodexIcon from './CodexIcon.svelte';
   import ProviderTabs from './ProviderTabs.svelte';
@@ -29,6 +30,7 @@
     externalBlocked = false,
     externalDemo = false,
     settingsAvailable = true,
+    automation = null,
   }: {
     controller: CodexController;
     now: number;
@@ -37,6 +39,8 @@
     externalBlocked?: boolean;
     externalDemo?: boolean;
     settingsAvailable?: boolean;
+    /** The automation settings Codex shares with Claude. */
+    automation?: Settings | null;
   } = $props();
   let snapshot = $derived($controller.snapshot);
   let pending = $derived($controller.pending);
@@ -57,7 +61,7 @@
       !!switching ||
       $controller.login.open,
   );
-  let nextBest = $derived(snapshot ? codexNextBest(snapshot) : null);
+  let nextBest = $derived(snapshot ? codexNextAccount(snapshot) : null);
   let switchTargetId = $derived(
     switching?.targetId ?? (switchPending ? $controller.pendingId : null),
   );
@@ -535,6 +539,7 @@
             {now}
             {locked}
             {nextBest}
+            {automation}
             checkingSetup={pending === 'codex_discover'}
             onswitch={(account, trigger) => switchTo(account, trigger)}
             ondiscover={() => controller.discover()}

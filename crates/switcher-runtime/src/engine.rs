@@ -3,7 +3,7 @@ use crate::views::*;
 mod codex_runtime;
 use crate::{
     CodexLoginLaunch,
-    codex_engine::{CodexCommand, CodexEngine, CodexOutput},
+    codex_engine::{CodexCommand, CodexEngine, CodexOutput, CodexPolicy},
     codex_views::*,
 };
 use provider_claude::{ClaudeClient, ClientError, PendingLogin};
@@ -460,7 +460,7 @@ impl RuntimeHandle {
         let codex = CodexEngine::load(&vault);
         let codex_intent = codex.intent.clone();
         let (codex_snapshots, _) = broadcast::channel(64);
-        let codex_snapshot = codex.snapshot(false, now);
+        let codex_snapshot = codex.snapshot(false, now, &CodexPolicy::from(&saved.settings));
         let mut engine = Engine {
             codex,
             saved,
@@ -559,7 +559,7 @@ impl RuntimeHandle {
         let codex = CodexEngine::demo(now);
         let codex_intent = codex.intent.clone();
         let (codex_snapshots, _) = broadcast::channel(64);
-        let codex_snapshot = codex.snapshot(false, now);
+        let codex_snapshot = codex.snapshot(false, now, &CodexPolicy::from(&saved.settings));
         let engine = Engine {
             codex,
             saved,
@@ -689,7 +689,9 @@ impl RuntimeHandle {
     }
     fn publish_codex(&self, engine: &mut Engine, busy: bool) {
         engine.codex.revision = engine.codex.revision.saturating_add(1);
-        let snapshot = engine.codex.snapshot(busy, engine.clock.now());
+        // Codex shares Claude's automation settings, so its next account follows them.
+        let policy = CodexPolicy::from(&engine.saved.settings);
+        let snapshot = engine.codex.snapshot(busy, engine.clock.now(), &policy);
         *self
             .inner
             .codex_cache
@@ -1175,10 +1177,10 @@ impl Engine {
         }
     }
     fn notify(&self, body: String) {
-        let _ = self.notifications.send(Notification {
-            title: "PrimerSwitch".into(),
-            body,
-        });
+        self.notify_with("PrimerSwitch".into(), body);
+    }
+    fn notify_with(&self, title: String, body: String) {
+        let _ = self.notifications.send(Notification { title, body });
     }
     /// Notification label for an account: its email, else its saved name.
     fn label(&self, id: &str) -> String {

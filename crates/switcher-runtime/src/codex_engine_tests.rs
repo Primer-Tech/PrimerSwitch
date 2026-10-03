@@ -1,8 +1,19 @@
 //! Hermetic runtime fixtures: no real homes, Codex processes, daemons or providers.
 use super::*;
+use crate::{Clock, RuntimeHandle};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use provider_claude::{ClaudeClient, ClientError, HttpRequest, HttpResponse, Transport};
 use serde_json::json;
-use std::{collections::VecDeque, fs, sync::Mutex};
+use std::{
+    collections::VecDeque,
+    fs,
+    sync::{
+        Mutex,
+        atomic::{AtomicI64, Ordering},
+    },
+    time::Duration,
+};
+use switcher_platform::{ActiveStore, CliPaths};
 
 fn jwt(claims: serde_json::Value) -> String {
     format!(
@@ -384,7 +395,7 @@ impl Fixture {
     }
     fn view(&self, id: &str) -> CodexAccountView {
         self.engine
-            .snapshot(false, 300)
+            .snapshot(false, 300, &CodexPolicy::default())
             .accounts
             .into_iter()
             .find(|a| a.id == id)
@@ -437,7 +448,8 @@ async fn switch_keeps_outgoing_tokens_writes_incoming_and_restarts_running_daemo
         fs::read(f.home.join("config.toml")).unwrap(),
         b"cli_auth_credentials_store = \"file\"\nmodel = \"fixture-model\"\n"
     );
-    let snapshot = serde_json::to_string(&f.engine.snapshot(false, 300)).unwrap();
+    let snapshot =
+        serde_json::to_string(&f.engine.snapshot(false, 300, &CodexPolicy::default())).unwrap();
     assert!(!snapshot.contains("secret-sentinel"));
     f.claude_untouched();
 }
@@ -653,7 +665,11 @@ fn background_readings_prefer_the_active_account_then_the_oldest_inactive_one() 
     let a = f.id_of("ws-a");
     let b = f.add("user-b", "ws-b", "saved");
     let c = f.add("user-c", "ws-c", "saved");
-    assert_eq!(f.engine.due_quota(1000).as_deref(), Some(a.as_str()));
+    let policy = CodexPolicy::default();
+    assert_eq!(
+        f.engine.due_quota(1000, &policy).as_deref(),
+        Some(a.as_str())
+    );
     let set = |f: &mut Fixture, id: &str, read: i64| {
         let index = f.engine.account_index(id).unwrap();
         let account = &mut f.engine.saved.accounts[index];
@@ -667,24 +683,33 @@ fn background_readings_prefer_the_active_account_then_the_oldest_inactive_one() 
     };
     set(&mut f, &a, 1000);
     set(&mut f, &b, 900);
-    assert_eq!(f.engine.due_quota(1000).as_deref(), Some(c.as_str()));
-    set(&mut f, &c, 1000);
-    assert_eq!(f.engine.due_quota(1100), None);
     assert_eq!(
-        f.engine.due_quota(1000 + ACTIVE_QUOTA_INTERVAL).as_deref(),
+        f.engine.due_quota(1000, &policy).as_deref(),
+        Some(c.as_str())
+    );
+    set(&mut f, &c, 1000);
+    assert_eq!(f.engine.due_quota(1100, &policy), None);
+    assert_eq!(
+        f.engine
+            .due_quota(1000 + policy.poll_interval, &policy)
+            .as_deref(),
         Some(a.as_str())
     );
-    // The active account is read every ACTIVE_QUOTA_INTERVAL; once it is fresh, the
+    // The active account is read at Claude's check interval; once it is fresh, the
     // oldest inactive reading is next.
     set(&mut f, &a, 900 + INACTIVE_QUOTA_INTERVAL);
     assert_eq!(
-        f.engine.due_quota(900 + INACTIVE_QUOTA_INTERVAL).as_deref(),
+        f.engine
+            .due_quota(900 + INACTIVE_QUOTA_INTERVAL, &policy)
+            .as_deref(),
         Some(b.as_str())
     );
     let index = f.engine.account_index(&b).unwrap();
     f.engine.saved.accounts[index].needs_sign_in = true;
     assert_ne!(
-        f.engine.due_quota(900 + INACTIVE_QUOTA_INTERVAL).as_deref(),
+        f.engine
+            .due_quota(900 + INACTIVE_QUOTA_INTERVAL, &policy)
+            .as_deref(),
         Some(b.as_str())
     );
 }
@@ -713,7 +738,7 @@ async fn codex_switcher_accounts_are_imported_with_their_names_and_newer_tokens_
     f.engine.observe(&f.vault, 300).unwrap();
     assert!(
         f.engine
-            .snapshot(false, 300)
+            .snapshot(false, 300, &CodexPolicy::default())
             .capabilities
             .import_switcher
             .enabled
@@ -857,7 +882,7 @@ fn snapshot_reports_environment_warnings_and_capabilities() {
         daemon_pid: Some(7),
     };
     f.engine.observe(&f.vault, 300).unwrap();
-    let snapshot = f.engine.snapshot(false, 300);
+    let snapshot = f.engine.snapshot(false, 300, &CodexPolicy::default());
     assert_eq!(snapshot.environment.daemon_running, Some(true));
     assert!(snapshot.environment.codex_switcher_running);
     assert_eq!(snapshot.environment.other_clients, 1);
@@ -878,7 +903,8 @@ async fn demo_has_three_read_only_accounts_without_an_installation_or_client() {
     engine.factory = factory.clone();
     assert!(engine.installation.is_none());
     assert!(!engine.writable);
-    let snapshot = engine.snapshot(false, 1000);
+    let snapshot = engine.snapshot(false, 1000, &CodexPolicy::default());
+    assert_eq!(snapshot.next_id, None);
     assert!(snapshot.demo);
     assert_eq!(snapshot.accounts.len(), 3);
     assert_eq!(snapshot.selected_id.as_deref(), Some("codex-demo-0"));
@@ -1078,12 +1104,19 @@ async fn an_expiring_active_token_does_not_starve_the_other_accounts() {
     f.engine.observe(&f.vault, 700).unwrap();
     let a = f.id_of("ws-a");
     let b = f.add("user-b", "ws-b", "saved");
-    assert_eq!(f.engine.due_quota(700).as_deref(), Some(a.as_str()));
+    let policy = CodexPolicy::default();
+    assert_eq!(
+        f.engine.due_quota(700, &policy).as_deref(),
+        Some(a.as_str())
+    );
     assert_eq!(
         f.engine.plan_quota(&a, 700, false).err(),
         Some(CodexReason::Busy)
     );
-    assert_eq!(f.engine.due_quota(701).as_deref(), Some(b.as_str()));
+    assert_eq!(
+        f.engine.due_quota(701, &policy).as_deref(),
+        Some(b.as_str())
+    );
 }
 
 #[tokio::test]
@@ -1164,4 +1197,566 @@ async fn an_elevated_app_never_half_switches_while_the_daemon_runs() {
     *f.daemon.state.lock().unwrap() = Ok(DaemonState::NotRunning);
     f.switch(&b).await.unwrap();
     assert_eq!(f.active(), auth("user-b", "ws-b", "saved"));
+}
+
+// Automation shared with Claude: ranking, cadence, automatic switching, credits.
+const NOW: i64 = 1_000_000;
+/// The main limit with a 5-hour window resetting at `five_reset` and a weekly window
+/// resetting at `week_reset`.
+fn main_quota_at(five: i32, five_reset: i64, week: i32, week_reset: i64) -> CodexQuotaView {
+    let window = |used: i32, minutes: i64, reset: i64| CodexWindowView {
+        used_percent: used,
+        window_duration_mins: Some(minutes),
+        resets_at: Some(reset),
+    };
+    CodexQuotaView {
+        ordinary_usage_allowed: Some(true),
+        limits: vec![CodexLimitView {
+            key: "default".into(),
+            limit_id: Some("codex".into()),
+            limit_name: None,
+            normal_model_slug: None,
+            primary: Some(window(five, 300, five_reset)),
+            secondary: Some(window(week, 10080, week_reset)),
+            plan_type: Some("plus".into()),
+            credits: None,
+            spend_control_reached: Some(false),
+            rate_limit_reached_type: None,
+        }],
+        reset_credits_available: None,
+    }
+}
+fn main_quota(five: i32, week: i32) -> CodexQuotaView {
+    main_quota_at(five, NOW + 3600, week, NOW + 5 * 86400)
+}
+/// A successful reading of `id` at `at` that named its workspace.
+fn record_reading(engine: &mut CodexEngine, id: &str, quota: CodexQuotaView, at: i64) {
+    let index = engine.account_index(id).unwrap();
+    let account = &mut engine.saved.accounts[index];
+    account.quota = Some(quota);
+    account.quota_read_at = Some(at);
+    account.last_attempt_at = Some(at);
+    engine.verified_now.insert(id.into());
+    engine.account_errors.remove(id);
+}
+impl Fixture {
+    fn read(&mut self, id: &str, quota: CodexQuotaView, at: i64) {
+        record_reading(&mut self.engine, id, quota, at);
+    }
+    fn next(&self, policy: &CodexPolicy) -> Option<String> {
+        self.engine.snapshot(false, NOW, policy).next_id
+    }
+    fn quota_mut(&mut self, id: &str) -> &mut CodexQuotaView {
+        let index = self.engine.account_index(id).unwrap();
+        self.engine.saved.accounts[index].quota.as_mut().unwrap()
+    }
+}
+fn switch_to(f: &Fixture, id: &str, peak: i32) -> CodexAutomation {
+    let name = |id: &str| {
+        let index = f.engine.account_index(id).unwrap();
+        f.engine.saved.accounts[index].name.clone()
+    };
+    let active = f.engine.selected_id.clone().unwrap();
+    CodexAutomation::Switch(CodexAutoSwitch {
+        target_id: id.into(),
+        target_name: name(id),
+        previous_name: name(&active),
+        peak: Some(peak),
+    })
+}
+
+#[test]
+fn the_next_codex_account_is_ranked_in_rust_with_the_order_shared_with_claude() {
+    let mut f = Fixture::new();
+    let a = f.id_of("ws-a");
+    let b = f.add("user-b", "ws-b", "saved");
+    let c = f.add("user-c", "ws-c", "saved");
+    let soonest = CodexPolicy::default();
+    let most_left = CodexPolicy {
+        order: CandidateOrder::MostWeeklyLeft,
+        ..soonest
+    };
+    // Accounts without a reading are never next.
+    assert_eq!(f.next(&soonest), None);
+    f.read(&a, main_quota(40, 30), NOW);
+    // b's week resets within the hour with 70% used; c resets in six days, 20% used.
+    f.read(&b, main_quota_at(10, NOW + 3600, 70, NOW + 3600), NOW);
+    f.read(&c, main_quota_at(30, NOW + 3600, 20, NOW + 6 * 86400), NOW);
+    assert_eq!(f.next(&soonest), Some(b.clone()));
+    assert_eq!(f.next(&most_left), Some(c.clone()));
+    // The active account is never next, even when it would rank first.
+    f.read(&a, main_quota_at(1, NOW + 60, 1, NOW + 60), NOW);
+    assert_eq!(f.next(&soonest), Some(b.clone()));
+    // Equal weekly usage: the earlier weekly reset, then the lower 5-hour usage.
+    f.read(&b, main_quota_at(10, NOW + 3600, 20, NOW + 2 * 86400), NOW);
+    assert_eq!(f.next(&most_left), Some(b.clone()));
+    f.read(
+        &b,
+        main_quota_at(40, NOW + 3600, 20, NOW + 6 * 86400 + 60),
+        NOW,
+    );
+    assert_eq!(f.next(&most_left), Some(c.clone()));
+    // Preferred headroom (both windows at most 90% at a 95% threshold) comes first...
+    f.read(&b, main_quota_at(91, NOW + 3600, 10, NOW + 3600), NOW);
+    assert_eq!(f.next(&soonest), Some(c.clone()));
+    // ...but an account without it is still the usable fallback.
+    f.read(&c, main_quota(100, 20), NOW);
+    assert_eq!(f.next(&soonest), Some(b.clone()));
+    assert_eq!(
+        f.engine.snapshot(false, NOW, &soonest).next_id,
+        Some(b.clone())
+    );
+    // A lower threshold rules b out.
+    assert_eq!(
+        f.next(&CodexPolicy {
+            threshold: 90.0,
+            ..soonest
+        }),
+        None
+    );
+}
+
+#[test]
+fn limited_unread_failed_or_unswitchable_accounts_are_never_next() {
+    let mut f = Fixture::new();
+    let b = f.add("user-b", "ws-b", "saved");
+    let policy = CodexPolicy::default();
+    let usable = main_quota(10, 10);
+    f.read(&b, usable.clone(), NOW);
+    assert_eq!(f.next(&policy), Some(b.clone()));
+    // At or above the threshold.
+    f.read(&b, main_quota(95, 10), NOW);
+    assert_eq!(f.next(&policy), None);
+    // Over 100% on purchased credits counts as limited.
+    let mut credits = main_quota(10, 105);
+    credits.limits[0].credits = Some(CodexCreditsView {
+        has_credits: true,
+        unlimited: false,
+        balance: Some("12.50".into()),
+    });
+    assert!(quota_limited(&credits));
+    f.read(&b, credits, NOW);
+    assert_eq!(f.next(&policy), None);
+    // A reached-limit flag, or blocked included usage, with low percentages.
+    f.read(&b, usable.clone(), NOW);
+    f.quota_mut(&b).limits[0].rate_limit_reached_type = Some("primary".into());
+    assert_eq!(f.next(&policy), None);
+    f.read(&b, usable.clone(), NOW);
+    f.quota_mut(&b).ordinary_usage_allowed = Some(false);
+    assert_eq!(f.next(&policy), None);
+    // A missing main window is not evidence of free usage.
+    f.read(&b, usable.clone(), NOW);
+    f.quota_mut(&b).limits[0].secondary = None;
+    assert_eq!(f.next(&policy), None);
+    // A failed latest reading, a rejected sign-in or a switch in progress.
+    f.read(&b, usable.clone(), NOW);
+    f.engine
+        .account_errors
+        .insert(b.clone(), CodexReason::ProviderUnavailable);
+    assert_eq!(f.next(&policy), None);
+    f.read(&b, usable.clone(), NOW);
+    let index = f.engine.account_index(&b).unwrap();
+    f.engine.saved.accounts[index].needs_sign_in = true;
+    assert_eq!(f.next(&policy), None);
+    f.engine.saved.accounts[index].needs_sign_in = false;
+    f.engine.switching = Some(CodexSwitchView {
+        target_id: b.clone(),
+        stage: CodexSwitchStage::Restarting,
+        started_at: NOW,
+    });
+    assert_eq!(f.next(&policy), None);
+    f.engine.switching = None;
+    assert_eq!(f.next(&policy), Some(b.clone()));
+    // An API-key login has no plan limits and cannot be selected.
+    let index = f
+        .engine
+        .adopt_or_import(
+            OpaqueAuth::parse(api_key_auth_payload("sk-secret-sentinel").unwrap()).unwrap(),
+            CodexIdentityEvidence::ClaimsOnly,
+            NOW,
+        )
+        .unwrap();
+    let api = f.engine.saved.accounts[index].id.clone();
+    f.read(&api, main_quota(1, 1), NOW);
+    assert_eq!(f.next(&policy), Some(b));
+}
+
+#[tokio::test]
+async fn automatic_switching_needs_a_fresh_active_reading_at_the_threshold() {
+    let mut f = Fixture::new();
+    let a = f.id_of("ws-a");
+    let b = f.add("user-b", "ws-b", "saved");
+    let policy = CodexPolicy::default();
+    f.read(&b, main_quota(10, 10), NOW);
+    f.read(&a, main_quota(94, 40), NOW);
+    assert_eq!(f.engine.automation(NOW, &policy), CodexAutomation::Idle);
+    f.read(&a, main_quota(96, 40), NOW);
+    assert_eq!(f.engine.automation(NOW, &policy), switch_to(&f, &b, 96));
+    // Automatic switching off: nothing.
+    let off = CodexPolicy {
+        auto_switch: false,
+        ..policy
+    };
+    assert_eq!(f.engine.automation(NOW, &off), CodexAutomation::Idle);
+    // The shared threshold decides.
+    f.read(&a, main_quota(80, 40), NOW);
+    assert_eq!(f.engine.automation(NOW, &policy), CodexAutomation::Idle);
+    let lower = CodexPolicy {
+        threshold: 80.0,
+        ..policy
+    };
+    assert_eq!(f.engine.automation(NOW, &lower), switch_to(&f, &b, 80));
+    // A reached-limit flag switches below the threshold.
+    f.read(&a, main_quota(50, 40), NOW);
+    f.quota_mut(&a).limits[0].rate_limit_reached_type = Some("primary".into());
+    assert_eq!(f.engine.automation(NOW, &policy), switch_to(&f, &b, 50));
+    // Usage continuing on credits (over 100%) is a limit too.
+    f.read(&a, main_quota(103, 40), NOW);
+    assert_eq!(f.engine.automation(NOW, &policy), switch_to(&f, &b, 103));
+    // Older than 15 minutes, failed or not proven this session: no decision.
+    f.read(&a, main_quota(97, 40), NOW - 901);
+    assert_eq!(f.engine.automation(NOW, &policy), CodexAutomation::Idle);
+    f.read(&a, main_quota(97, 40), NOW - 900);
+    assert_eq!(f.engine.automation(NOW, &policy), switch_to(&f, &b, 97));
+    f.engine
+        .account_errors
+        .insert(a.clone(), CodexReason::ProviderUnavailable);
+    assert_eq!(f.engine.automation(NOW, &policy), CodexAutomation::Idle);
+    f.read(&a, main_quota(97, 40), NOW);
+    f.engine.verified_now.remove(&a);
+    assert_eq!(f.engine.automation(NOW, &policy), CodexAutomation::Idle);
+    f.read(&a, main_quota(97, 40), NOW);
+    // Never during a switch or a sign-in.
+    f.engine.switching = Some(CodexSwitchView {
+        target_id: b.clone(),
+        stage: CodexSwitchStage::Restarting,
+        started_at: NOW,
+    });
+    assert_eq!(f.engine.automation(NOW, &policy), CodexAutomation::Idle);
+    f.engine.switching = None;
+    let mut plan = Plan::quota(Err(CodexError::ServiceUnavailable));
+    plan.login = LoginPoll::Pending;
+    f.factory.enqueue(plan);
+    let launch = f.engine.begin_login(0).await.unwrap();
+    assert_eq!(f.engine.automation(NOW, &policy), CodexAutomation::Idle);
+    f.engine.cancel_login(&launch.session.id).await.unwrap();
+    assert_eq!(f.engine.automation(NOW, &policy), switch_to(&f, &b, 97));
+    // Never on a read-only store.
+    f.engine.writable = false;
+    assert_eq!(f.engine.automation(NOW, &policy), CodexAutomation::Idle);
+    f.claude_untouched();
+}
+
+#[test]
+fn automatic_switching_rereads_an_old_target_first_and_cools_down() {
+    let mut f = Fixture::new();
+    let a = f.id_of("ws-a");
+    let b = f.add("user-b", "ws-b", "saved");
+    let policy = CodexPolicy::default();
+    f.read(&a, main_quota(97, 40), NOW);
+    // The target was read 20 minutes ago: read it again before switching to it.
+    f.read(&b, main_quota(10, 10), NOW - 1200);
+    assert_eq!(
+        f.engine.automation(NOW, &policy),
+        CodexAutomation::Refresh(b.clone())
+    );
+    f.read(&b, main_quota(10, 10), NOW);
+    assert_eq!(f.engine.automation(NOW, &policy), switch_to(&f, &b, 97));
+    // At most one automatic switch per ten minutes.
+    f.engine.begin_auto_switch(NOW);
+    assert_eq!(f.engine.automation(NOW, &policy), CodexAutomation::Idle);
+    assert_eq!(
+        f.engine.automation(NOW + AUTO_SWITCH_COOLDOWN - 1, &policy),
+        CodexAutomation::Idle
+    );
+    assert_eq!(
+        f.engine.automation(NOW + AUTO_SWITCH_COOLDOWN, &policy),
+        switch_to(&f, &b, 97)
+    );
+    // Failure notices for the same target and reason repeat at most every 30 minutes.
+    let reason = CodexReason::DaemonRestartFailed;
+    assert!(f.engine.failure_notice_due(&b, reason, NOW));
+    assert!(
+        !f.engine
+            .failure_notice_due(&b, reason, NOW + AUTO_NOTICE_INTERVAL - 1)
+    );
+    assert!(
+        f.engine
+            .failure_notice_due(&b, CodexReason::StoreConflict, NOW + 1)
+    );
+    assert!(
+        f.engine
+            .failure_notice_due(&b, reason, NOW + AUTO_NOTICE_INTERVAL + 1)
+    );
+}
+
+#[test]
+fn without_a_usable_account_nothing_switches_and_all_limited_is_reported_when_known() {
+    let mut f = Fixture::new();
+    let a = f.id_of("ws-a");
+    let b = f.add("user-b", "ws-b", "saved");
+    let c = f.add("user-c", "ws-c", "saved");
+    let policy = CodexPolicy::default();
+    f.read(&a, main_quota_at(100, NOW + 7200, 40, NOW + 86400), NOW);
+    f.read(
+        &b,
+        main_quota_at(100, NOW + 600, 60, NOW + 86400),
+        NOW - 3000,
+    );
+    // c was never read: "every account is limited" is unproven, so nothing happens.
+    assert_eq!(f.engine.automation(NOW, &policy), CodexAutomation::Idle);
+    f.read(&c, main_quota_at(30, NOW + 600, 99, NOW + 7200), NOW - 3000);
+    let b_name = f.view(&b).name;
+    assert_eq!(
+        f.engine.automation(NOW, &policy),
+        CodexAutomation::Exhausted {
+            frees_first: Some((b_name, NOW + 600)),
+        }
+    );
+    assert_eq!(f.next(&policy), None);
+    // A signed-out account might be free: no claim that every account is limited.
+    let index = f.engine.account_index(&c).unwrap();
+    f.engine.saved.accounts[index].needs_sign_in = true;
+    assert_eq!(f.engine.automation(NOW, &policy), CodexAutomation::Idle);
+    // A single saved account at its limit is "every account".
+    let mut alone = Fixture::new();
+    let only = alone.id_of("ws-a");
+    alone.read(&only, main_quota_at(99, NOW + 7200, 40, NOW + 86400), NOW);
+    let only_name = alone.view(&only).name;
+    assert_eq!(
+        alone.engine.automation(NOW, &policy),
+        CodexAutomation::Exhausted {
+            frees_first: Some((only_name, NOW + 7200)),
+        }
+    );
+    // The notice repeats at most every 30 minutes.
+    assert!(alone.engine.exhausted_notice_due(NOW));
+    assert!(
+        !alone
+            .engine
+            .exhausted_notice_due(NOW + AUTO_NOTICE_INTERVAL - 1)
+    );
+    assert!(
+        alone
+            .engine
+            .exhausted_notice_due(NOW + AUTO_NOTICE_INTERVAL)
+    );
+}
+
+#[test]
+fn the_active_account_is_read_at_the_check_interval_and_every_minute_near_the_threshold() {
+    let mut f = Fixture::new();
+    let a = f.id_of("ws-a");
+    let policy = CodexPolicy::default();
+    assert_eq!(policy.poll_interval, 300);
+    f.read(&a, main_quota(40, 30), NOW);
+    assert_eq!(f.engine.active_interval(&policy), 300);
+    assert_eq!(f.engine.due_quota(NOW + 299, &policy), None);
+    assert_eq!(f.engine.due_quota(NOW + 300, &policy), Some(a.clone()));
+    let slower = CodexPolicy {
+        poll_interval: 600,
+        ..policy
+    };
+    assert_eq!(f.engine.due_quota(NOW + 300, &slower), None);
+    assert_eq!(f.engine.due_quota(NOW + 600, &slower), Some(a.clone()));
+    // Within ten points of the threshold (85% at 95%) with automatic switching on.
+    f.read(&a, main_quota(30, 85), NOW);
+    assert_eq!(
+        f.engine.active_interval(&policy),
+        ACTIVE_NEAR_LIMIT_INTERVAL
+    );
+    assert_eq!(f.engine.due_quota(NOW + 59, &policy), None);
+    assert_eq!(f.engine.due_quota(NOW + 60, &policy), Some(a.clone()));
+    let off = CodexPolicy {
+        auto_switch: false,
+        ..policy
+    };
+    assert_eq!(f.engine.active_interval(&off), 300);
+    f.read(&a, main_quota(84, 30), NOW);
+    assert_eq!(f.engine.active_interval(&policy), 300);
+    // Limited by Codex at low usage counts as near.
+    f.read(&a, main_quota(5, 5), NOW);
+    f.quota_mut(&a).ordinary_usage_allowed = Some(false);
+    assert_eq!(
+        f.engine.active_interval(&policy),
+        ACTIVE_NEAR_LIMIT_INTERVAL
+    );
+    // A failed attempt is retried at the same cadence, never sooner.
+    let index = f.engine.account_index(&a).unwrap();
+    f.engine.saved.accounts[index].last_attempt_at = Some(NOW + 30);
+    assert_eq!(f.engine.due_quota(NOW + 60, &policy), None);
+    assert_eq!(f.engine.due_quota(NOW + 90, &policy), Some(a));
+}
+
+/// Claude is never contacted by Codex automation.
+struct NoClaude;
+#[async_trait]
+impl Transport for NoClaude {
+    async fn send(&self, _: HttpRequest) -> Result<HttpResponse, ClientError> {
+        Err(ClientError::InvalidResponse)
+    }
+}
+struct TestClock(AtomicI64);
+impl Clock for TestClock {
+    fn now(&self) -> i64 {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+/// A runtime whose Codex engine is the fixture's (fake seams, fixture home), with the
+/// given shared settings.
+async fn runtime(f: &mut Fixture, settings: Settings) -> (TempDir, RuntimeHandle) {
+    let parent = std::env::temp_dir().canonicalize().unwrap();
+    let temp = tempfile::Builder::new()
+        .prefix("primerswitch-codex-runtime-")
+        .tempdir_in(parent)
+        .unwrap();
+    let paths = CliPaths::for_home(temp.path().join("claude-home"));
+    fs::create_dir_all(&paths.config_dir).unwrap();
+    fs::write(&paths.settings_file, b"{}").unwrap();
+    let handle = RuntimeHandle::from_parts(
+        Vault::with_key(temp.path().join("vault"), [11; 32]).unwrap(),
+        ActiveStore::file(paths),
+        ClaudeClient::with_transport("2.1.287", Arc::new(NoClaude)).unwrap(),
+        Arc::new(TestClock(AtomicI64::new(NOW))),
+    )
+    .unwrap();
+    // Already discovered: a tick never looks for the real installation.
+    f.engine.discovered_at = Some(NOW);
+    let codex = std::mem::replace(&mut f.engine, CodexEngine::empty(false));
+    handle
+        .edit_codex_for_test(move |engine, shared| {
+            *engine = codex;
+            *shared = settings;
+        })
+        .await;
+    (temp, handle)
+}
+async fn until(condition: impl Fn() -> bool) {
+    for _ in 0..400 {
+        if condition() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("the fixture condition was never reached");
+}
+
+#[tokio::test]
+async fn the_background_tick_switches_codex_automatically_and_notifies() {
+    let mut f = Fixture::new();
+    let a = f.id_of("ws-a");
+    let b = f.add("user-b", "ws-b", "saved");
+    f.read(&a, main_quota(97, 40), NOW);
+    f.read(&b, main_quota(10, 10), NOW);
+    // The new active account is read right after the switch.
+    f.factory
+        .enqueue(Plan::quota(Ok(quota(Some("ws-b"), 12, 11))));
+    let (daemon, factory) = (f.daemon.clone(), f.factory.clone());
+    let settings = Settings {
+        language: "en".into(),
+        ..Settings::default()
+    };
+    let (_temp, handle) = runtime(&mut f, settings).await;
+    assert_eq!(handle.get_codex_snapshot().next_id, Some(b.clone()));
+    let mut notifications = handle.notifications();
+    handle.codex_tick().await;
+    let notice = notifications.try_recv().unwrap();
+    assert_eq!(notice.title, "Codex switched to user-b@example.invalid");
+    assert_eq!(
+        notice.body,
+        "user-a@example.invalid reached 97% · open terminals reconnect automatically."
+    );
+    let snapshot = handle.get_codex_snapshot();
+    assert_eq!(snapshot.selected_id.as_deref(), Some(b.as_str()));
+    assert_eq!(
+        snapshot
+            .last_switch
+            .map(|s| (s.account_id, s.daemon_restarted)),
+        Some((b.clone(), true))
+    );
+    assert_eq!(f.active(), auth("user-b", "ws-b", "saved"));
+    assert_eq!(*daemon.calls.lock().unwrap(), vec!["state", "restart"]);
+    until(|| factory.calls().iter().any(|call| call == "shutdown")).await;
+    until(|| {
+        handle.get_codex_snapshot().accounts.iter().any(|account| {
+            account.id == b
+                && account.quota.as_ref().is_some_and(|q| {
+                    q.limits[0].primary.as_ref().map(|w| w.used_percent) == Some(12)
+                })
+        })
+    })
+    .await;
+    // Within the cooldown nothing switches back, even with b at its limit and a free.
+    handle
+        .edit_codex_for_test(|engine, _| {
+            record_reading(engine, &b, main_quota(99, 10), NOW);
+            record_reading(engine, &a, main_quota(5, 5), NOW);
+        })
+        .await;
+    assert_eq!(handle.get_codex_snapshot().next_id, Some(a.clone()));
+    handle.codex_tick().await;
+    assert_eq!(
+        handle.get_codex_snapshot().selected_id.as_deref(),
+        Some(b.as_str())
+    );
+    assert_eq!(daemon.calls.lock().unwrap().len(), 2);
+    assert!(notifications.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn when_every_codex_account_is_limited_the_tick_notifies_once_and_never_switches() {
+    let mut f = Fixture::new();
+    let a = f.id_of("ws-a");
+    let b = f.add("user-b", "ws-b", "saved");
+    f.read(&a, main_quota_at(100, NOW + 3000, 40, NOW + 86400), NOW);
+    f.read(&b, main_quota_at(100, NOW + 1200, 50, NOW + 86400), NOW);
+    let daemon = f.daemon.clone();
+    let settings = Settings {
+        language: "ro".into(),
+        ..Settings::default()
+    };
+    let (_temp, handle) = runtime(&mut f, settings).await;
+    let mut notifications = handle.notifications();
+    handle.codex_tick().await;
+    let notice = notifications.try_recv().unwrap();
+    assert_eq!(notice.title, "PrimerSwitch");
+    assert!(
+        notice.body.starts_with(
+            "Toate conturile Codex sunt la limită. Primul cont liber va fi user-b@example.invalid, în 20 min ("
+        ),
+        "{}",
+        notice.body
+    );
+    handle.codex_tick().await;
+    assert!(notifications.try_recv().is_err());
+    let snapshot = handle.get_codex_snapshot();
+    assert_eq!(snapshot.selected_id.as_deref(), Some(a.as_str()));
+    assert_eq!(snapshot.next_id, None);
+    assert!(daemon.calls.lock().unwrap().is_empty());
+    assert!(f.factory.calls().is_empty());
+}
+
+#[tokio::test]
+async fn automatic_switching_stays_off_when_the_shared_setting_is_off() {
+    let mut f = Fixture::new();
+    let a = f.id_of("ws-a");
+    let b = f.add("user-b", "ws-b", "saved");
+    f.read(&a, main_quota(100, 40), NOW);
+    f.read(&b, main_quota(10, 10), NOW);
+    let daemon = f.daemon.clone();
+    let settings = Settings {
+        auto_switch_enabled: false,
+        ..Settings::default()
+    };
+    let (_temp, handle) = runtime(&mut f, settings).await;
+    let mut notifications = handle.notifications();
+    handle.codex_tick().await;
+    assert_eq!(
+        handle.get_codex_snapshot().selected_id.as_deref(),
+        Some(a.as_str())
+    );
+    // The window still recommends the next account.
+    assert_eq!(handle.get_codex_snapshot().next_id, Some(b));
+    assert!(daemon.calls.lock().unwrap().is_empty());
+    assert!(notifications.try_recv().is_err());
 }

@@ -45,14 +45,15 @@ if (codexScenario === 'switching')
     stage: 'restarting',
     startedAt: Math.floor(Date.now() / 1000) - 23,
   };
-else if (codexScenario === 'signin')
+else if (codexScenario === 'signin') {
   Object.assign(codexDemo.accounts[2], {
     needsSignIn: true,
     quotaState: 'unavailable',
     error: 'signInRequired',
     switchable: codexCapability('signInRequired'),
   });
-else if (codexScenario === 'limited')
+  codexDemo.nextId = null;
+} else if (codexScenario === 'limited')
   Object.assign(codexDemo.accounts[0].quota!.limits[0].primary!, {
     usedPercent: 100,
     resetsAt: Math.floor(Date.now() / 1000) + 47 * 60,
@@ -64,7 +65,7 @@ else if (codexScenario === 'setup')
     executableVersion: null,
   });
 else if (codexScenario === 'empty')
-  Object.assign(codexDemo, { accounts: [], selectedId: null });
+  Object.assign(codexDemo, { accounts: [], selectedId: null, nextId: null });
 const codexController = createCodexController({
   call: async (command) => {
     if (command === 'get_codex_snapshot') return codexDemo;

@@ -47,7 +47,7 @@
       {t(locale, 'settingsProviderScope')}
     </p>
     <fieldset disabled={disabled || saving}>
-      <legend class="sr-only">{t(locale, 'claudeAutomation')}</legend>
+      <legend class="sr-only">{t(locale, 'sharedAutomation')}</legend>
       <label class="toggle-row"
         ><span
           ><strong>{t(locale, 'automaticSwitch')}</strong><small
@@ -68,28 +68,6 @@
           type="checkbox"
           role="switch"
           bind:checked={draft.preferSoonestWeeklyReset}
-        /></label
-      >
-      <label class="toggle-row"
-        ><span
-          ><strong>{t(locale, 'primeWindow')}</strong><small
-            >{t(locale, 'primeHelp')}</small
-          ></span
-        ><input
-          type="checkbox"
-          role="switch"
-          bind:checked={draft.autoStartWindowEnabled}
-        /></label
-      >
-      <label class="toggle-row"
-        ><span
-          ><strong>{t(locale, 'autoResets')}</strong><small
-            >{t(locale, 'resetsHelp')}</small
-          ></span
-        ><input
-          type="checkbox"
-          role="switch"
-          bind:checked={draft.autoUseResetsEnabled}
         /></label
       >
       <div class="settings-control">
@@ -133,6 +111,32 @@
       </div>
     </fieldset>
     <fieldset disabled={disabled || saving}>
+      <legend class="settings-group">{t(locale, 'claudeOnlyAutomation')}</legend
+      >
+      <label class="toggle-row"
+        ><span
+          ><strong>{t(locale, 'primeWindow')}</strong><small
+            >{t(locale, 'primeHelp')}</small
+          ></span
+        ><input
+          type="checkbox"
+          role="switch"
+          bind:checked={draft.autoStartWindowEnabled}
+        /></label
+      >
+      <label class="toggle-row"
+        ><span
+          ><strong>{t(locale, 'autoResets')}</strong><small
+            >{t(locale, 'resetsHelp')}</small
+          ></span
+        ><input
+          type="checkbox"
+          role="switch"
+          bind:checked={draft.autoUseResetsEnabled}
+        /></label
+      >
+    </fieldset>
+    <fieldset disabled={disabled || saving}>
       <legend class="sr-only">{t(locale, 'globalPreferences')}</legend>
       <div class="settings-control">
         <label for="appearance">{t(locale, 'appearance')}</label><select
@@ -163,3 +167,15 @@
     </div>
   </form>
 </Modal>
+
+<style>
+  .settings-group {
+    width: 100%;
+    margin-top: 6px;
+    padding: 16px 0 4px;
+    border-top: 1px solid var(--line);
+    font-size: 0.72rem;
+    font-weight: 600;
+    color: var(--subtle);
+  }
+</style>

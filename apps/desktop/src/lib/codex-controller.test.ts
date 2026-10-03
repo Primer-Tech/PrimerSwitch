@@ -22,7 +22,7 @@ import {
   codexExtraLimits,
   codexLimitState,
   codexMessage,
-  codexNextBest,
+  codexNextAccount,
   codexPlanLabel,
   codexStatus,
   codexWindowLabel,
@@ -104,6 +104,13 @@ describe('Codex contract and redacted IPC', () => {
       capabilities: { ...raw.capabilities, manualSwitch: codexCapability() },
     };
     expect(codexSnapshotSchema.safeParse(legacy).success).toBe(false);
+    // The next account always comes from the native side, even when there is none.
+    const withoutNext: Record<string, unknown> = { ...raw };
+    delete withoutNext.nextId;
+    expect(codexSnapshotSchema.safeParse(withoutNext).success).toBe(false);
+    expect(
+      codexSnapshotSchema.safeParse({ ...raw, nextId: null }).success,
+    ).toBe(true);
     const withoutSignIn: Record<string, unknown> = { ...raw.accounts[0] };
     delete withoutSignIn.needsSignIn;
     expect(
@@ -549,32 +556,29 @@ describe('Codex view derivations', () => {
       codexStatus(codexAccount('codex-gone', { needsSignIn: true })).kind,
     ).toBe('signIn');
   });
-  it('picks the next best account by weekly usage, then 5-hour usage', () => {
+  it('shows the account the native side ranks next and never ranks accounts itself', () => {
     const raw = codexSnapshot();
-    expect(codexNextBest(raw)?.id).toBe('codex-research');
+    expect(codexNextAccount(raw)?.id).toBe('codex-research');
+    // An account with more weekly usage left changes nothing by itself.
     raw.accounts.push(
       codexAccount('codex-tie', {
         quota: {
           ordinaryUsageAllowed: true,
           resetCreditsAvailable: null,
-          limits: [codexMainLimit(3, 14)],
+          limits: [codexMainLimit(3, 1)],
         },
       }),
     );
-    expect(codexNextBest(raw)?.id).toBe('codex-tie');
-    raw.accounts.at(-1)!.needsSignIn = true;
-    expect(codexNextBest(raw)?.id).toBe('codex-research');
-    raw.accounts[2].switchable = codexCapability('identityUnverified');
-    expect(codexNextBest(raw)).toBeNull();
-    raw.accounts.push(
-      codexAccount('codex-unread', { quota: null }),
-      codexAccount('codex-key', { authKind: 'apiKey' }),
-    );
-    raw.accounts.at(-1)!.switchable = codexCapability('unsupportedAuth');
-    expect(codexNextBest(raw)).toBeNull();
-    const all = codexSnapshot();
-    all.capabilities.switchAccount = codexCapability('notInstalled');
-    expect(codexNextBest(all)).toBeNull();
+    expect(codexNextAccount(raw)?.id).toBe('codex-research');
+    raw.nextId = 'codex-tie';
+    expect(codexNextAccount(raw)?.id).toBe('codex-tie');
+    // No pick, an unknown id or the active account show nothing.
+    raw.nextId = null;
+    expect(codexNextAccount(raw)).toBeNull();
+    raw.nextId = 'codex-missing';
+    expect(codexNextAccount(raw)).toBeNull();
+    raw.nextId = 'codex-studio';
+    expect(codexNextAccount(raw)).toBeNull();
   });
   it('labels windows from real durations, known plans and compact durations', () => {
     expect(codexWindowLabel(300, 'short', 'en')).toBe('5 hours');

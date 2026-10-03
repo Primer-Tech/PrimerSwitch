@@ -210,6 +210,41 @@ describe('desktop workflows', () => {
       }),
     ).not.toBeChecked();
   });
+  it('says which automation applies to Codex and keeps the Claude-only settings apart', async () => {
+    setup();
+    await screen.findAllByText('a@example.invalid');
+    await fireEvent.click(
+      screen.getByRole('button', { name: 'Open settings' }),
+    );
+    const dialog = screen.getByRole('dialog');
+    expect(dialog).toHaveTextContent(t('en', 'settingsProviderScope'));
+    expect(dialog).not.toHaveTextContent('Automation applies to Claude.');
+    const shared = within(
+      screen.getByRole('group', { name: t('en', 'sharedAutomation') }),
+    );
+    expect(
+      shared
+        .getAllByRole('switch')
+        .map(
+          (toggle) =>
+            toggle.closest('label')?.querySelector('strong')?.textContent,
+        ),
+    ).toEqual([t('en', 'automaticSwitch'), t('en', 'preferSoonestReset')]);
+    expect(shared.getByRole('slider')).toBeVisible();
+    expect(shared.getByRole('spinbutton')).toBeVisible();
+    expect(shared.getByText(t('en', 'pollingHelp'))).toBeVisible();
+    const claudeOnly = within(
+      screen.getByRole('group', { name: 'Claude only' }),
+    );
+    expect(
+      claudeOnly
+        .getAllByRole('switch')
+        .map(
+          (toggle) =>
+            toggle.closest('label')?.querySelector('strong')?.textContent,
+        ),
+    ).toEqual([t('en', 'primeWindow'), t('en', 'autoResets')]);
+  });
   it('disables every mutation in demo while keeping details readable', async () => {
     const { call } = setup(snapshot({ demo: true }));
     await screen.findByText('Preview');

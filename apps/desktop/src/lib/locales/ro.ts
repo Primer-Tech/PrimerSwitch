@@ -103,7 +103,7 @@ export const ro: Record<keyof typeof en, string> = {
   pollInterval: 'Interval de verificare',
   minutes: '{count} min',
   pollingHelp:
-    'Pentru a citi limitele contului activ, PrimerSwitch trimite câte un mesaj foarte scurt la fiecare verificare. Aproape de limită, verificările sunt mai dese.',
+    'La fiecare verificare, PrimerSwitch citește limitele contului activ: pentru Claude trimite un mesaj foarte scurt, pentru Codex nu trimite nimic. Aproape de limită, verificările sunt mai dese.',
   switchThreshold: 'Prag de comutare',
   appearance: 'Aspect',
   system: 'Sistem',
@@ -226,8 +226,9 @@ export const ro: Record<keyof typeof en, string> = {
   providers: 'Furnizori de conturi',
   globalPreferences: 'Aspect și limbă',
   settingsProviderScope:
-    'Automatizarea se aplică pentru Claude. Aspectul și limba se aplică ambilor furnizori.',
-  claudeAutomation: 'Automatizare Claude',
+    'Comutarea automată, ordinea resetărilor săptămânale, intervalul de verificare și pragul de comutare se aplică pentru Claude și Codex. Pornirea ferestrei săptămânale și folosirea resetărilor se aplică doar pentru Claude. Aspectul și limba se aplică ambilor furnizori.',
+  sharedAutomation: 'Automatizare pentru Claude și Codex',
+  claudeOnlyAutomation: 'Doar pentru Claude',
   codexDescription: 'Schimbă contul Codex fără să-ți închizi terminalele.',
   codexActionFailed:
     'Acțiunea nu a reușit. Conturile salvate au rămas neschimbate.',
@@ -298,8 +299,12 @@ export const ro: Record<keyof typeof en, string> = {
   codexMenuRefresh: 'Actualizează utilizarea',
   codexMenuDelete: 'Șterge',
   codexNextBest: 'Recomandat',
-  codexNextBestText:
-    'Are cea mai multă utilizare săptămânală rămasă dintre celelalte conturi.',
+  codexNextSoonest:
+    'Conturile disponibile a căror limită săptămânală se resetează cel mai curând sunt folosite primele.',
+  codexNextMostLeft:
+    'Conturile disponibile cu cea mai multă utilizare săptămânală rămasă sunt folosite primele.',
+  codexNextAutomatic:
+    'PrimerSwitch comută automat pe acest cont când contul activ ajunge la {threshold}%.',
   codexHowTitle: 'Cum funcționează comutarea',
   codexHowText:
     'PrimerSwitch salvează noua autentificare și repornește Codex în fundal. Terminalele deschise se reconectează singure și continuă de unde au rămas.',

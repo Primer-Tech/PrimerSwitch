@@ -133,6 +133,8 @@ export const codexSnapshotSchema = z
     executableVersion: text.nullable(),
     accounts: z.array(codexAccountSchema),
     selectedId: id.nullable(),
+    /** The account automatic switching uses next, ranked natively. */
+    nextId: id.nullable(),
     activeModel: text.nullable(),
     capabilities: z
       .object({

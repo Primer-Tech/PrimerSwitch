@@ -14,15 +14,22 @@ import type { CodexBridge } from './lib/codex-bridge';
 import type { CodexSnapshot } from './lib/codex-types';
 import {
   codexAccount,
+  codexAccounts,
   codexCapability,
   codexDemoSnapshot,
+  codexMainLimit,
   codexSnapshot,
 } from './test/codex-fixtures';
 import { snapshot } from './test/fixtures';
 import { language, t } from './lib/i18n';
-async function setup(raw = codexSnapshot(), locale: 'en' | 'ro' = 'en') {
+import type { Settings } from './lib/types';
+async function setup(
+  raw = codexSnapshot(),
+  locale: 'en' | 'ro' = 'en',
+  settings: Partial<Settings> = {},
+) {
   const claude = snapshot();
-  claude.settings.language = locale;
+  claude.settings = { ...claude.settings, ...settings, language: locale };
   claude.demo = raw.demo;
   let emit: (value: unknown) => void = () => {};
   const claudeCall = vi.fn().mockResolvedValue(claude),
@@ -209,6 +216,84 @@ describe('Codex accounts page', () => {
       call.mock.calls.filter(([name]) => name === 'codex_switch_account'),
     ).toHaveLength(1);
   });
+  it('recommends exactly the account the native side ranks next', async () => {
+    const tie = () =>
+      codexAccount('codex-tie', {
+        quota: {
+          ordinaryUsageAllowed: true,
+          resetCreditsAvailable: null,
+          limits: [codexMainLimit(3, 1)],
+        },
+      });
+    const raw = codexSnapshot();
+    raw.accounts.push(tie());
+    const { emit } = await setup(raw);
+    const next = () =>
+      screen
+        .queryByRole('heading', { name: 'Next best' })
+        ?.closest('section') ?? null;
+    expect(within(next()!).getByText('research@example.invalid')).toBeVisible();
+    emit(
+      codexSnapshot({
+        revision: 2,
+        accounts: [...codexAccounts(), tie()],
+        nextId: 'codex-tie',
+      }),
+    );
+    await waitFor(() =>
+      expect(within(next()!).getByText('tie@example.invalid')).toBeVisible(),
+    );
+    emit(codexSnapshot({ revision: 3, nextId: null }));
+    await waitFor(() => expect(next()).toBeNull());
+  });
+  it('offers the next account on a limited active card only when there is one', async () => {
+    const limited = (revision: number, nextId: string | null) => {
+      const raw = codexSnapshot({ revision, nextId });
+      raw.accounts[0].quota!.limits[0].primary!.usedPercent = 100;
+      return raw;
+    };
+    const { emit } = await setup(limited(1, 'codex-research'));
+    const active = within(
+      screen
+        .getByRole('heading', { name: 'Active account' })
+        .closest('section')!,
+    );
+    expect(active.getByText(/^Limit reached/)).toBeVisible();
+    expect(
+      active.getByRole('button', {
+        name: 'Switch to research@example.invalid',
+      }),
+    ).toBeEnabled();
+    emit(limited(2, null));
+    await waitFor(() =>
+      expect(active.queryByRole('button', { name: /^Switch to/ })).toBeNull(),
+    );
+  });
+  it('explains the shared reset order and automatic switching on the next account', async () => {
+    await setup(codexSnapshot(), 'en', {
+      preferSoonestWeeklyReset: false,
+      threshold: 90,
+    });
+    const next = within(
+      screen.getByRole('heading', { name: 'Next best' }).closest('section')!,
+    );
+    expect(next.getByText(t('en', 'codexNextMostLeft'))).toBeVisible();
+    expect(
+      next.getByText(
+        'PrimerSwitch switches to it automatically when the active account reaches 90%.',
+      ),
+    ).toBeVisible();
+  });
+  it('uses the soonest-reset wording by default and none about automation when it is off', async () => {
+    await setup(codexSnapshot(), 'ro', { autoSwitchEnabled: false });
+    const next = within(
+      screen
+        .getByRole('heading', { name: t('ro', 'codexNextBest') })
+        .closest('section')!,
+    );
+    expect(next.getByText(t('ro', 'codexNextSoonest'))).toBeVisible();
+    expect(next.queryByText(/PrimerSwitch comută automat/)).toBeNull();
+  });
   it('shows a partial switch as a warning and moves focus to the result', async () => {
     const { call } = await setup();
     call.mockResolvedValueOnce(
@@ -311,6 +396,8 @@ describe('Codex accounts page', () => {
       quotaState: 'unavailable',
       switchable: codexCapability('signInRequired'),
     });
+    // The native side never ranks a signed-out account next.
+    raw.nextId = null;
     const { call } = await setup(raw);
     const research = within(row('research@example.invalid'));
     expect(research.getByText('Sign in again')).toBeVisible();
@@ -427,6 +514,7 @@ describe('Codex accounts page', () => {
     const raw = codexSnapshot({
       availability: 'unsupported',
       blockedReason: 'unsupportedStore',
+      nextId: null,
     });
     Object.keys(raw.capabilities).forEach((key) => {
       raw.capabilities[key as keyof typeof raw.capabilities] =
@@ -496,7 +584,12 @@ describe('Codex accounts page', () => {
       screen.getByRole('button', { name: t('ro', 'openSettings') }),
     );
     const dialog = screen.getByRole('dialog');
-    expect(dialog).toHaveTextContent(t('ro', 'claudeAutomation'));
+    expect(dialog).toHaveTextContent(t('ro', 'settingsProviderScope'));
+    expect(
+      within(dialog).getByRole('group', {
+        name: t('ro', 'claudeOnlyAutomation'),
+      }),
+    ).toBeVisible();
     expect(
       within(dialog).getByRole('button', { name: t('ro', 'save') }),
     ).toBeDisabled();

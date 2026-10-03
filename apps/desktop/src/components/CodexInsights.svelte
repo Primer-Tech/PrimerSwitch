@@ -9,6 +9,8 @@
     codexWindows,
   } from '../lib/codex-format';
   import type { CodexAccount, CodexSnapshot } from '../lib/codex-types';
+  import type { Settings } from '../lib/types';
+  import { percentage } from '../lib/format';
   import Icon from './Icon.svelte';
   import CodexIcon from './CodexIcon.svelte';
   import QuotaBar from './QuotaBar.svelte';
@@ -17,6 +19,7 @@
     now,
     locked,
     nextBest,
+    automation = null,
     checkingSetup,
     onswitch,
     ondiscover,
@@ -25,6 +28,8 @@
     now: number;
     locked: boolean;
     nextBest: CodexAccount | null;
+    /** The automation settings shared with Claude, when loaded. */
+    automation?: Settings | null;
     checkingSetup: boolean;
     onswitch: (account: CodexAccount, trigger: HTMLElement) => void;
     ondiscover: () => void;
@@ -98,7 +103,19 @@
           tone="green"
         />{/if}
     </div>
-    <p>{t($language, 'codexNextBestText')}</p>
+    <p>
+      {t(
+        $language,
+        automation?.preferSoonestWeeklyReset === false
+          ? 'codexNextMostLeft'
+          : 'codexNextSoonest',
+      )}
+    </p>
+    {#if automation?.autoSwitchEnabled}<p class="next-automatic">
+        {t($language, 'codexNextAutomatic', {
+          threshold: percentage(automation.threshold, $language),
+        })}
+      </p>{/if}
     <button
       class="primary switch-now"
       disabled={locked || !snapshot || !codexCanSwitch(snapshot, nextBest)}
@@ -171,6 +188,9 @@
   .switch-now {
     width: 100%;
     margin-top: 15px;
+  }
+  .panel > p.next-automatic {
+    margin-top: 6px;
   }
   .codex-how .apps {
     font-size: 0.72rem;

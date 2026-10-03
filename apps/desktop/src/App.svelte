@@ -132,6 +132,7 @@
     onclaude={() => (provider = 'claude')}
     onsettings={() => (settingsOpen = true)}
     settingsAvailable={!!snapshot}
+    automation={snapshot?.settings ?? null}
     externalDemo={!!snapshot?.demo}
     externalBlocked={!!$controller.pending ||
       !!snapshot?.busy ||

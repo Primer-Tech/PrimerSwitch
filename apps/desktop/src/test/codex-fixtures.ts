@@ -201,6 +201,7 @@ export function codexSnapshot(
     executableVersion: '0.160.0',
     accounts: codexAccounts(),
     selectedId: 'codex-studio',
+    nextId: 'codex-research',
     activeModel: null,
     capabilities: {
       loginBrowser: codexCapability(),

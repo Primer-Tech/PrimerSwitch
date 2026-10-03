@@ -19,7 +19,10 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
 };
-use switcher_core::ProviderId;
+use switcher_core::{
+    CandidateOrder, CandidateRank, HEADROOM_MARGIN, ProviderId, Settings, compare_candidates,
+    reset_hour_bucket,
+};
 use switcher_platform::{
     Vault,
     codex::{CodexStoreError, *},
@@ -29,8 +32,11 @@ use zeroize::{Zeroize, Zeroizing};
 
 const RECORD: &str = "codex-state";
 const QUARANTINE: &str = "codex-state-quarantine";
-/// Background reading of the active account. The terminal shows live usage itself.
-pub(crate) const ACTIVE_QUOTA_INTERVAL: i64 = 600;
+/// Background reading of the active account while it is within `NEAR_LIMIT_BAND`
+/// points of the switch threshold, or at a limit, with automatic switching on.
+/// Otherwise the active account follows Claude's check interval.
+pub(crate) const ACTIVE_NEAR_LIMIT_INTERVAL: i64 = 60;
+const NEAR_LIMIT_BAND: f64 = 10.0;
 /// Inactive accounts only change when their windows reset.
 pub(crate) const INACTIVE_QUOTA_INTERVAL: i64 = 3600;
 const ERROR_RETRY: i64 = 900;
@@ -39,6 +45,112 @@ const SIGN_IN_RETRY: i64 = 6 * 3600;
 const FRESH_SECONDS: i64 = 900;
 /// Leave a nearly expired active token to Codex's own refresh in the background.
 const ACTIVE_EXPIRY_MARGIN: i64 = 600;
+/// At most one automatic switch attempt per ten minutes.
+pub(crate) const AUTO_SWITCH_COOLDOWN: i64 = 600;
+/// An automatic-switch failure (per target and reason) and the every-account-limited
+/// notice repeat at most this often.
+pub(crate) const AUTO_NOTICE_INTERVAL: i64 = 1800;
+
+/// The automation settings Codex shares with Claude. They are persisted once, in the
+/// Claude runtime record, and passed in wherever Codex needs them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct CodexPolicy {
+    pub auto_switch: bool,
+    pub threshold: f64,
+    /// Ordinary cadence of active readings, in seconds: Claude's check interval.
+    pub poll_interval: i64,
+    pub order: CandidateOrder,
+}
+impl From<&Settings> for CodexPolicy {
+    fn from(settings: &Settings) -> Self {
+        Self {
+            auto_switch: settings.auto_switch_enabled,
+            threshold: settings.threshold,
+            poll_interval: i64::try_from(settings.poll_interval).unwrap_or(i64::MAX),
+            order: settings.candidate_order(),
+        }
+    }
+}
+impl Default for CodexPolicy {
+    fn default() -> Self {
+        Self::from(&Settings::default())
+    }
+}
+/// What automatic switching should do now (see `CodexEngine::automation`).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum CodexAutomation {
+    Idle,
+    /// The best target was not read recently: read it, then decide again.
+    Refresh(String),
+    Switch(CodexAutoSwitch),
+    /// The active account needs replacing, but every other account is at its limit.
+    Exhausted {
+        /// The account whose blocking windows reopen first, and when.
+        frees_first: Option<(String, i64)>,
+    },
+}
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CodexAutoSwitch {
+    pub target_id: String,
+    pub target_name: String,
+    pub previous_name: String,
+    /// The active account's highest main-window usage; below the threshold when only
+    /// a reached-limit flag triggered the switch.
+    pub peak: Option<i32>,
+}
+
+/// The main Codex limit: `primary` is its 5-hour window, `secondary` the weekly one.
+fn main_limit(quota: &CodexQuotaView) -> Option<&CodexLimitView> {
+    quota.limits.iter().find(|limit| limit.key == "default")
+}
+fn main_windows(quota: &CodexQuotaView) -> impl Iterator<Item = &CodexWindowView> {
+    main_limit(quota)
+        .into_iter()
+        .flat_map(|limit| [&limit.primary, &limit.secondary])
+        .flatten()
+}
+/// Codex says the plan's usage is unavailable: a main window is spent (above 100 means
+/// usage continues on purchased credits), a limit was reached or included usage is off.
+pub(crate) fn quota_limited(quota: &CodexQuotaView) -> bool {
+    quota.ordinary_usage_allowed == Some(false)
+        || main_limit(quota).is_some_and(|limit| limit.rate_limit_reached_type.is_some())
+        || main_windows(quota).any(|window| window.used_percent >= 100)
+}
+/// A main window is at or above `level` percent, or the account is limited.
+fn reaches(quota: &CodexQuotaView, level: f64) -> bool {
+    quota_limited(quota) || main_windows(quota).any(|w| f64::from(w.used_percent) >= level)
+}
+/// Ranking inputs of an account whose two main windows are known and strictly below
+/// `threshold` with nothing else limiting it; `None` when it is not usable.
+fn usable_rank(account: &SavedAccount, threshold: f64) -> Option<CandidateRank<'_>> {
+    let quota = account.quota.as_ref()?;
+    if quota_limited(quota) {
+        return None;
+    }
+    let limit = main_limit(quota)?;
+    let (five, week) = (limit.primary.as_ref()?, limit.secondary.as_ref()?);
+    let (five_used, week_used) = (f64::from(five.used_percent), f64::from(week.used_percent));
+    if five_used >= threshold || week_used >= threshold {
+        return None;
+    }
+    let margin = threshold - HEADROOM_MARGIN;
+    Some(CandidateRank {
+        id: &account.id,
+        headroom: five_used <= margin && week_used <= margin,
+        weekly_used: week_used,
+        weekly_reset_bucket: week.resets_at.map(reset_hour_bucket),
+        five_hour_used: five_used,
+    })
+}
+/// When the main windows at or above `threshold` reopen: the latest of their resets.
+/// `None` when one is unknown, or when only a flag limits the account.
+fn frees_at(quota: &CodexQuotaView, threshold: f64) -> Option<i64> {
+    let resets: Option<Vec<i64>> = main_windows(quota)
+        .filter(|window| f64::from(window.used_percent) >= threshold)
+        .map(|window| window.resets_at)
+        .collect();
+    resets?.into_iter().max()
+}
 
 pub struct CodexLoginLaunch {
     pub session: CodexLoginView,
@@ -485,6 +597,11 @@ pub(crate) struct CodexEngine {
     environment: CodexEnvironmentView,
     switcher_available: bool,
     discovered_at: Option<i64>,
+    /// Automation state, kept in memory only: the last automatic switch attempt, the
+    /// last every-account-limited notice and the last failure notice.
+    last_auto_switch_at: Option<i64>,
+    last_exhausted_notice_at: Option<i64>,
+    last_auto_failure: Option<(String, CodexReason, i64)>,
 }
 impl CodexEngine {
     pub fn load(vault: &Vault) -> Self {
@@ -536,6 +653,9 @@ impl CodexEngine {
             environment: CodexEnvironmentView::default(),
             switcher_available: false,
             discovered_at: None,
+            last_auto_switch_at: None,
+            last_exhausted_notice_at: None,
+            last_auto_failure: None,
         }
     }
     /// Discover once at startup, and retry a failed discovery every `retry` seconds.
@@ -694,7 +814,150 @@ impl CodexEngine {
         });
         reason.map_or_else(CodexCapability::allowed, CodexCapability::blocked)
     }
-    pub fn snapshot(&self, busy: bool, now: i64) -> CodexSnapshot {
+    fn selected(&self) -> Option<&SavedAccount> {
+        let id = self.selected_id.as_deref()?;
+        self.saved.accounts.iter().find(|a| a.id == id)
+    }
+    fn quota_state(&self, account: &SavedAccount, now: i64) -> CodexQuotaState {
+        if self.account_errors.contains_key(&account.id) {
+            CodexQuotaState::Unavailable
+        } else if account.quota.is_none() {
+            CodexQuotaState::Unread
+        } else if self.verified_now.contains(&account.id)
+            && account
+                .quota_read_at
+                .is_some_and(|time| now >= time && now - time <= FRESH_SECONDS)
+        {
+            CodexQuotaState::Fresh
+        } else {
+            CodexQuotaState::Cached
+        }
+    }
+    /// Accounts automatic switching may use, with their ranking inputs: switchable
+    /// saved ChatGPT sign-ins (not active, not signed out) whose latest reading
+    /// succeeded and shows both main windows below the threshold and no limit.
+    fn candidates(
+        &self,
+        threshold: f64,
+    ) -> impl Iterator<Item = (&SavedAccount, CandidateRank<'_>)> {
+        self.saved
+            .accounts
+            .iter()
+            .filter(move |a| {
+                !self.account_errors.contains_key(&a.id) && self.switch_capability(a).enabled
+            })
+            .filter_map(move |a| Some((a, usable_rank(a, threshold)?)))
+    }
+    /// The account automatic switching uses next, by the order shared with Claude:
+    /// preferred headroom, then `policy.order`, then the lower 5-hour usage, then id.
+    fn next_candidate(&self, policy: &CodexPolicy) -> Option<&SavedAccount> {
+        self.candidates(policy.threshold)
+            .min_by(|(_, a), (_, b)| compare_candidates(a, b, policy.order))
+            .map(|(account, _)| account)
+    }
+    /// Decide automatic switching. A switch needs automatic switching on, no switch,
+    /// sign-in or cooldown in progress, a fresh reading of the active account at the
+    /// threshold (or limited), and a fresh reading of the best target; an older
+    /// target reading is refreshed first. Without any target nothing switches.
+    pub(crate) fn automation(&self, now: i64, policy: &CodexPolicy) -> CodexAutomation {
+        let cooling = self
+            .last_auto_switch_at
+            .is_some_and(|at| now >= at && now - at < AUTO_SWITCH_COOLDOWN);
+        if !policy.auto_switch
+            || cooling
+            || self.common_block().is_some()
+            || self.switching.is_some()
+            || self.pending_login.is_some()
+        {
+            return CodexAutomation::Idle;
+        }
+        let Some(active) = self
+            .selected()
+            .filter(|a| self.quota_state(a, now) == CodexQuotaState::Fresh)
+        else {
+            return CodexAutomation::Idle;
+        };
+        let Some(quota) = active
+            .quota
+            .as_ref()
+            .filter(|q| reaches(q, policy.threshold))
+        else {
+            return CodexAutomation::Idle;
+        };
+        match self.next_candidate(policy) {
+            Some(target) if self.quota_state(target, now) == CodexQuotaState::Fresh => {
+                CodexAutomation::Switch(CodexAutoSwitch {
+                    target_id: target.id.clone(),
+                    target_name: target.name.clone(),
+                    previous_name: active.name.clone(),
+                    peak: main_windows(quota).map(|w| w.used_percent).max(),
+                })
+            }
+            Some(target) => CodexAutomation::Refresh(target.id.clone()),
+            None if self.others_known_unusable(policy.threshold) => CodexAutomation::Exhausted {
+                frees_first: self
+                    .saved
+                    .accounts
+                    .iter()
+                    .filter_map(|a| Some((frees_at(a.quota.as_ref()?, policy.threshold)?, a)))
+                    .min_by_key(|(at, _)| *at)
+                    .map(|(at, a)| (a.name.clone(), at)),
+            },
+            None => CodexAutomation::Idle,
+        }
+    }
+    /// Every other saved ChatGPT account has a successful reading that rules it out;
+    /// an unread, failed or signed-out account leaves "all limited" unproven.
+    fn others_known_unusable(&self, threshold: f64) -> bool {
+        self.saved
+            .accounts
+            .iter()
+            .filter(|a| {
+                self.selected_id.as_deref() != Some(&a.id)
+                    && a.auth_kind == AuthKind::ManagedChatgpt
+            })
+            .all(|a| {
+                !a.needs_sign_in
+                    && !self.account_errors.contains_key(&a.id)
+                    && a.quota.is_some()
+                    && usable_rank(a, threshold).is_none()
+            })
+    }
+    /// An automatic switch is starting: the cooldown runs whatever its outcome.
+    pub(crate) fn begin_auto_switch(&mut self, now: i64) {
+        self.last_auto_switch_at = Some(now);
+    }
+    /// Whether to send the every-account-limited notice now (and record it).
+    pub(crate) fn exhausted_notice_due(&mut self, now: i64) -> bool {
+        if self
+            .last_exhausted_notice_at
+            .is_some_and(|at| now >= at && now - at < AUTO_NOTICE_INTERVAL)
+        {
+            return false;
+        }
+        self.last_exhausted_notice_at = Some(now);
+        true
+    }
+    /// Whether to notify this automatic switch failure now (and record it).
+    pub(crate) fn failure_notice_due(
+        &mut self,
+        target: &str,
+        reason: CodexReason,
+        now: i64,
+    ) -> bool {
+        if self
+            .last_auto_failure
+            .as_ref()
+            .is_some_and(|(id, last, at)| {
+                id == target && *last == reason && now >= *at && now - at < AUTO_NOTICE_INTERVAL
+            })
+        {
+            return false;
+        }
+        self.last_auto_failure = Some((target.into(), reason, now));
+        true
+    }
+    pub fn snapshot(&self, busy: bool, now: i64, policy: &CodexPolicy) -> CodexSnapshot {
         let mut result = CodexSnapshot::empty(self.demo);
         result.revision = self.revision;
         result.busy = busy;
@@ -703,6 +966,7 @@ impl CodexEngine {
         result.blocked_reason = self.reason;
         result.login = self.login_view.clone();
         result.selected_id = self.selected_id.clone();
+        result.next_id = self.next_candidate(policy).map(|a| a.id.clone());
         result.switching = self.switching.clone();
         result.last_switch = self.last_switch.clone();
         result.environment = self.environment.clone();
@@ -774,19 +1038,7 @@ impl CodexEngine {
                     switchable: self.switch_capability(account),
                     quota: account.quota.clone(),
                     quota_read_at: account.quota_read_at,
-                    quota_state: if self.account_errors.contains_key(&account.id) {
-                        CodexQuotaState::Unavailable
-                    } else if account.quota.is_none() {
-                        CodexQuotaState::Unread
-                    } else if self.verified_now.contains(&account.id)
-                        && account
-                            .quota_read_at
-                            .is_some_and(|time| now >= time && now - time <= FRESH_SECONDS)
-                    {
-                        CodexQuotaState::Fresh
-                    } else {
-                        CodexQuotaState::Cached
-                    },
+                    quota_state: self.quota_state(account, now),
                     error: self.account_errors.get(&account.id).copied(),
                     needs_sign_in: account.needs_sign_in,
                 }
@@ -1421,28 +1673,39 @@ impl CodexEngine {
         Ok(true)
     }
 
+    /// Seconds between background readings of the active account: Claude's check
+    /// interval, or every minute while its latest reading is within `NEAR_LIMIT_BAND`
+    /// points of the threshold (or limited) and automatic switching is on.
+    pub(crate) fn active_interval(&self, policy: &CodexPolicy) -> i64 {
+        let near = self
+            .selected()
+            .and_then(|a| a.quota.as_ref())
+            .is_some_and(|q| reaches(q, policy.threshold - NEAR_LIMIT_BAND));
+        if policy.auto_switch && near {
+            ACTIVE_NEAR_LIMIT_INTERVAL
+        } else {
+            policy.poll_interval
+        }
+    }
     /// Choose the next background reading: the active account first, then the inactive
     /// account with the oldest reading or a window that has reset since it was read.
-    pub(crate) fn due_quota(&self, now: i64) -> Option<String> {
+    pub(crate) fn due_quota(&self, now: i64, policy: &CodexPolicy) -> Option<String> {
         if self.common_block().is_some() || self.switching.is_some() {
             return None;
         }
+        let interval = self.active_interval(policy);
         let eligible = |a: &&SavedAccount| {
             a.auth_kind == AuthKind::ManagedChatgpt
                 && (!a.needs_sign_in
                     || a.last_attempt_at
                         .is_none_or(|t| now < t || now - t >= SIGN_IN_RETRY))
                 && a.last_attempt_at
-                    .is_none_or(|t| now < t || now - t >= ERROR_RETRY.min(ACTIVE_QUOTA_INTERVAL))
+                    .is_none_or(|t| now < t || now - t >= ERROR_RETRY.min(interval))
         };
-        if let Some(active) = self
-            .selected_id
-            .as_ref()
-            .and_then(|id| self.saved.accounts.iter().find(|a| &a.id == id))
-            .filter(eligible)
+        if let Some(active) = self.selected().filter(eligible)
             && active
                 .quota_read_at
-                .is_none_or(|t| now < t || now - t >= ACTIVE_QUOTA_INTERVAL)
+                .is_none_or(|t| now < t || now - t >= interval)
         {
             return Some(active.id.clone());
         }

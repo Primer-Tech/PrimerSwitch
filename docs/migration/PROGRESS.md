@@ -69,6 +69,8 @@ Stable IDs replace filenames/name identity. Saved credentials and switch journal
 
 Claude defaults remain 300-second polling, a 95% threshold and all three automation toggles enabled. Fast active ticks remain inference-only. New installations start dark/en; explicit saved settings are preserved. Effective model countdowns follow the binding weekly window, with tied windows requiring both reset dates.
 
+Claude daily-use reliability (2026-10-03): observation and switching compare only the login, the `claudeAiOauth` blob and the `oauthAccount` owner, never other bytes the CLI rewrites; only another account's login or a logout invalidates proofs, and only for the previous and new active accounts, while a CLI token rotation is adopted after its owner check. Switch writes patch their own key into the current files, a failed switch restores the original login at once, and recovery sets an inapplicable journal aside (encrypted, renamed) with a dismissable notice instead of blocking startup or later switches. Fast-tick automatic switches keep the normal model-row freshness; switching away never re-checks an unchanged CLI token and keeps an unverifiable rotated one as a candidate adopted only once its owner is proven. One account's failed reset revalidation no longer stops automation, and offers are revalidated only when one could act; a refused refresh token yields a sign-in state with a daily background retry. The all-exhausted notice uses when the blocking windows reopen; banked resets still switch with automatic switching off (B17), now explained in Settings; errors cross IPC as catalog codes.
+
 ## Work packages and resumption
 
 | Package | State | Next evidence or implementation |

@@ -143,7 +143,14 @@ fn isolated_keychain_and_vault_round_trip() {
     }
     let result = (|| -> Result<Value, String> {
         let root = tempfile::tempdir().map_err(|error| error.to_string())?;
-        let home = root.path().join("fixture-home");
+        // macOS exposes /var through a symlink to /private/var; the production
+        // path guard deliberately rejects symlinked ancestors, so qualify using
+        // the canonical temporary directory just as the native test helpers do.
+        let root_path = root
+            .path()
+            .canonicalize()
+            .map_err(|error| error.to_string())?;
+        let home = root_path.join("fixture-home");
         fs::create_dir_all(home.join(".claude")).map_err(|error| error.to_string())?;
         let paths = switcher_platform::CliPaths::for_home(home.clone());
         fs::write(
@@ -173,7 +180,7 @@ fn isolated_keychain_and_vault_round_trip() {
             "accountUuid": "fixture-owner-after",
             "emailAddress": "fixture@example.invalid"
         });
-        let keychain = KeychainFixture::create(root.path())?;
+        let keychain = KeychainFixture::create(&root_path)?;
         keychain.add_claude_item(&old_credentials)?;
         let store = switcher_platform::ActiveStore::new(paths.clone());
         let before = store.read().map_err(|error| error.to_string())?;

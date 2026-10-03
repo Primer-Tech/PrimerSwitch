@@ -390,27 +390,19 @@ fn is_desired(current: &RawSnapshot, journal: &Journal) -> bool {
 #[cfg(target_os = "macos")]
 mod mac {
     use super::*;
-    use security_framework::os::macos::keychain::SecKeychain;
-
-    fn debug_phase(name: &str) {
-        if std::env::var_os("PRIMERSWITCH_MACOS_DEBUG").is_some() {
-            eprintln!("macOS Keychain update phase: {name}");
-        }
-    }
-
+    use security_framework::os::macos::passwords::find_generic_password;
     // Static source inspection of installed public Claude 2.1.287, not native Mac
     // acceptance. Older username/service-only selectors are intentionally not guessed.
     const SERVICE: &str = "Claude Code-credentials";
     const ACCOUNT: &str = "claude-code-user";
     pub(super) fn read_current() -> Result<Option<Vec<u8>>> {
-        let keychain = SecKeychain::default().map_err(|_| PlatformError::KeyUnavailable)?;
-        match keychain.find_generic_password(SERVICE, ACCOUNT) {
+        match find_generic_password(None, SERVICE, ACCOUNT) {
             Ok((bytes, _)) => Ok(Some(bytes.to_owned())),
             Err(error) if error.code() == -25300 => {
                 // The original Mac app used NSUserName. A legacy OAuth item is an
                 // ambiguous CLI version/context, not permission to write a fallback file.
                 let username = native_username()?;
-                match keychain.find_generic_password(SERVICE, &username) {
+                match find_generic_password(None, SERVICE, &username) {
                     Ok((bytes, _)) => {
                         let value = parse_object(Some(bytes.as_ref()))?;
                         if value.get("claudeAiOauth").is_some() {
@@ -427,65 +419,13 @@ mod mac {
         }
     }
     pub(super) fn update_current(bytes: &[u8]) -> Result<()> {
-        debug_phase("update-start");
-        // A headless CLI must fail closed when the keychain would otherwise
-        // open an authorization prompt. Keeping the interaction lock alive for
-        // the complete replacement also prevents a prompt from blocking the
-        // delete/add sequence indefinitely on a hosted runner.
-        let _interaction =
-            SecKeychain::disable_user_interaction().map_err(|_| PlatformError::KeyUnavailable)?;
-        debug_phase("interaction-disabled");
-        // Use an explicit handle to the user's default keychain. Updating the
-        // existing item in-place is not durable on all supported macOS
-        // versions (the Security.framework call can report success while a
-        // fresh `security find-generic-password` still returns the old data).
-        // Recreate the item through the same keychain-specific API that owns
-        // the item instead. The old bytes stay in memory until the replacement
-        // has been verified so a failed add can restore the previous value.
-        let keychain = SecKeychain::default().map_err(|_| PlatformError::KeyUnavailable)?;
-        debug_phase("default-keychain-opened");
-        let (old_password, item) = keychain
-            .find_generic_password(SERVICE, ACCOUNT)
-            .map_err(|_| PlatformError::Conflict)?;
-        debug_phase("item-found");
-        let old_bytes = old_password.to_owned();
-        // Release the buffer returned by SecKeychainFindGenericPassword before
-        // deleting the item; Security.framework can otherwise wait on the
-        // content allocation while the keychain record is being replaced.
-        drop(old_password);
-        debug_phase("old-content-released");
-        item.delete();
-        debug_phase("item-delete-returned");
-
-        if keychain
-            .add_generic_password(SERVICE, ACCOUNT, bytes)
-            .is_err()
-        {
-            // Re-creating the old value gives the caller a usable keychain
-            // item even when the replacement could not be created.
-            let _ = keychain.add_generic_password(SERVICE, ACCOUNT, &old_bytes);
-            return Err(PlatformError::KeyUnavailable);
-        }
-        debug_phase("replacement-added");
-
-        match keychain.find_generic_password(SERVICE, ACCOUNT) {
-            Ok((current, replacement)) if current.as_ref() == bytes => {
-                drop(replacement);
-                debug_phase("replacement-verified");
-                Ok(())
-            }
-            Ok((_, replacement)) => {
-                replacement.delete();
-                let _ = keychain.add_generic_password(SERVICE, ACCOUNT, &old_bytes);
-                Err(PlatformError::KeyUnavailable)
-            }
-            Err(_) => {
-                let _ = keychain.add_generic_password(SERVICE, ACCOUNT, &old_bytes);
-                Err(PlatformError::KeyUnavailable)
-            }
-        }
+        // In-place native item update preserves its attributes and ACL. It cannot
+        // upsert a new item if the CLI deletes the old one between read and write.
+        let (_, mut item) =
+            find_generic_password(None, SERVICE, ACCOUNT).map_err(|_| PlatformError::Conflict)?;
+        item.set_password(bytes)
+            .map_err(|_| PlatformError::KeyUnavailable)
     }
-
     fn native_username() -> Result<String> {
         use std::{ffi::CStr, mem::MaybeUninit, ptr};
         let mut buffer = vec![0u8; 16_384];

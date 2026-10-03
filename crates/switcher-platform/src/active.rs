@@ -390,7 +390,27 @@ fn is_desired(current: &RawSnapshot, journal: &Journal) -> bool {
 #[cfg(target_os = "macos")]
 mod mac {
     use super::*;
+    use core_foundation::base::TCFType;
     use security_framework::os::macos::keychain::SecKeychain;
+    use std::{ffi::c_void, ptr};
+
+    // `security add-generic-password -U` uses this legacy Security.framework
+    // entry point. The security-framework crate currently exposes the related
+    // `SecKeychainItemModifyAttributesAndData` call instead; on hosted macOS
+    // runners that call could look updated in-process while the `security`
+    // command still read the previous password. Keep this small binding local
+    // so we can use the same durable update primitive as Apple's CLI without
+    // passing credentials through a subprocess.
+    #[link(name = "Security", kind = "framework")]
+    unsafe extern "C" {
+        fn SecKeychainItemModifyContent(
+            item_ref: *mut c_void,
+            attr_list: *const c_void,
+            length: u32,
+            data: *const c_void,
+        ) -> i32;
+    }
+
     // Static source inspection of installed public Claude 2.1.287, not native Mac
     // acceptance. Older username/service-only selectors are intentionally not guessed.
     const SERVICE: &str = "Claude Code-credentials";
@@ -425,11 +445,23 @@ mod mac {
         // SecItem queries selecting a different keychain item with the same
         // service/account pair.
         let keychain = SecKeychain::default().map_err(|_| PlatformError::KeyUnavailable)?;
-        let (_, mut item) = keychain
+        let (_, item) = keychain
             .find_generic_password(SERVICE, ACCOUNT)
             .map_err(|_| PlatformError::Conflict)?;
-        item.set_password(bytes)
-            .map_err(|_| PlatformError::KeyUnavailable)
+        let length = u32::try_from(bytes.len()).map_err(|_| PlatformError::KeyUnavailable)?;
+        let status = unsafe {
+            SecKeychainItemModifyContent(
+                item.as_concrete_TypeRef().cast(),
+                ptr::null(),
+                length,
+                bytes.as_ptr().cast(),
+            )
+        };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(PlatformError::KeyUnavailable)
+        }
     }
     fn native_username() -> Result<String> {
         use std::{ffi::CStr, mem::MaybeUninit, ptr};

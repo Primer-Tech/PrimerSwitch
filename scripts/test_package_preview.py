@@ -462,6 +462,62 @@ ${EndIf}
     def test_malformed_rpm_payload_is_rejected_without_extraction(self):
         self.rejects("invalid-rpm-payload", lambda: packaging.cpio_files(b"untrusted payload"))
 
+    @staticmethod
+    def codex_demo_rows():
+        """AT-SPI rows of the unified page rendering CodexEngine::demo, in document order."""
+        def row(name, role="label", text="", enabled=True, selected=False):
+            return {"name": name, "role": role, "text": text, "parent": None, "enabled": enabled,
+                    "selected": selected, "focused": False, "accessible": None}
+        rows = [row("✳ Claude", "page tab"), row("Codex", "page tab", selected=True),
+                row("Demo data · actions are disabled.", "status", "Preview Demo data · actions are disabled."),
+                row("Active account", "heading"), row("", "paragraph", "Studio Codex codex-0@example.invalid"),
+                row("Details", "push button"), row("Saved accounts", "heading"),
+                row("Add account", "push button", enabled=False)]
+        for index, name in enumerate(("Studio Codex", "Personal Codex", "Research Codex")):
+            rows += [row(name, "label", name), row("", "label", f"codex-{index}@example.invalid"),
+                     row("5-hour window", "level bar"), row("Weekly", "level bar")]
+            rows += [row("", "label", "Limit reached")] if index == 1 else []
+            rows += [row("Switch", "push button", enabled=False)] if index else []
+            rows.append(row(f"More actions for {name}", "push button"))
+        rows += [row("Next in order", "section"), row("Next up", "heading"), row("Automation", "heading"),
+                 row("", "list item", "Open terminals reconnect automatically."), row("Codex setup", "heading"),
+                 row("Check setup", "push button", enabled=False), row("", "paragraph", "Codex 0.160.0 · ready"),
+                 row("Refresh all", "push button", enabled=False)]
+        return rows
+
+    def test_codex_demo_verification_matches_the_unified_page(self):
+        rows = self.codex_demo_rows()
+        evidence = qualification.verify_codex_demo_rows(rows)
+        self.assertEqual(evidence["fictionalAccountCount"], 3)
+        self.assertEqual(evidence["selectedAccount"], "Studio Codex")
+        self.assertEqual(evidence["mutationControlsDisabled"], 5)
+
+        def fails(reason, change):
+            broken = [dict(row) for row in self.codex_demo_rows()]
+            change(broken)
+            with self.assertRaisesRegex(qualification.QualificationError, "^" + reason + "$"):
+                qualification.verify_codex_demo_rows(broken)
+
+        def enable(name):
+            return lambda rows: [row.update(enabled=True) for row in rows if row["name"] == name]
+
+        for name in ("Add account", "Check setup", "Refresh all", "Switch"):
+            with self.subTest(enabled=name):
+                fails("native-codex-demo-mutation-controls-not-disabled", enable(name))
+        fails("native-codex-demo-labels-missing", lambda rows: [row.update(text="") for row in rows if "Limit reached" in row["text"]])
+        fails("native-codex-quota-windows-missing", lambda rows: [row.update(name="7-day window") for row in rows if row["name"] == "Weekly"])
+        fails("native-codex-demo-account-count-mismatch", lambda rows: rows.remove(next(row for row in rows if row["name"] == "More actions for Research Codex")))
+        fails("duplicate-automation-navigation-present", lambda rows: rows.append({**rows[0], "name": "Automation", "role": "push button"}))
+
+    def test_row_menu_entry_is_found_after_its_trigger_not_the_active_card_link(self):
+        rows = self.codex_demo_rows()
+        self.assertIsNone(qualification.item_after(rows, "More actions for Personal Codex", "Details"))
+        trigger = next(index for index, row in enumerate(rows) if row["name"] == "More actions for Personal Codex")
+        entry = {**rows[trigger], "name": "Details"}
+        rows[trigger + 1:trigger + 1] = [entry, {**entry, "name": "Refresh", "enabled": False}]
+        self.assertIs(qualification.item_after(rows, "More actions for Personal Codex", "Details"), entry)
+        self.assertIsNone(qualification.item_after(rows + [rows[trigger]], "More actions for Personal Codex", "Details"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -381,49 +381,52 @@ def navigate_provider(pyatspi, glib, application, rows: list[dict], current: str
         raise QualificationError("provider-keyboard-navigation-timeout") from (last_error or error)
 
 
-def accessible_section_content(rows: list[dict], label: str) -> str:
-    headings = [i for i, row in enumerate(rows) if row["name"] == label and row["role"] == "heading"]
-    require(len(headings) == 1 and rows[headings[0]]["parent"] is not None, "codex-read-only-count-panel-missing")
-    section = rows[headings[0]]["parent"]
-    members = []
-    for index, row in enumerate(rows):
-        ancestor = index
-        for _ in range(46):
-            if ancestor == section:
-                members.append(row["name"] + " " + row["text"])
-                break
-            ancestor = rows[ancestor]["parent"]
-            if ancestor is None:
-                break
-    return "\n".join(members)
+BUTTON_ROLES = {"push button", "button"}
+METER_ROLES = {"meter", "level bar", "progress bar"}
+# CodexEngine::demo in crates/switcher-runtime: three ChatGPT accounts, Studio Codex
+# active, Personal Codex at its 5-hour limit; the demo blocks every capability.
+CODEX_DEMO_ACCOUNTS = ("Studio Codex", "Personal Codex", "Research Codex")
+
+
+def item_after(rows: list[dict], trigger_name: str, item_name: str) -> dict | None:
+    """The first button named `item_name` after the button named `trigger_name`.
+
+    Rows are in document order, and an open row menu follows its trigger, so this
+    finds the menu entry rather than the active card's "Details" link before it.
+    """
+    triggers = [index for index, row in enumerate(rows) if row["name"] == trigger_name and row["role"] in BUTTON_ROLES]
+    if len(triggers) != 1:
+        return None
+    return next((row for row in rows[triggers[0] + 1:] if row["name"] == item_name and row["role"] in BUTTON_ROLES), None)
 
 
 def verify_codex_demo_rows(rows: list[dict]) -> dict:
+    """The unified provider page rendering the native Codex demo snapshot."""
     content = "\n".join(row["name"] + " " + row["text"] for row in rows)
-    expected = ("Studio Codex", "Personal Codex", "codex-demo-0@example.invalid", "codex-demo-1@example.invalid",
-                "Selected for new clients", "ChatGPT", "0.160.0", "Managed ChatGPT accounts",
-                "FILE credential storage", "Close Codex apps and terminals", "Reopen them after the change.",
-                "Code review", "Reset credits", "Read-only", "does not consume Codex credits or resets automatically.",
+    expected = (*CODEX_DEMO_ACCOUNTS, "codex-0@example.invalid", "codex-1@example.invalid", "codex-2@example.invalid",
+                "Active account", "Saved accounts", "Limit reached", "Next in order", "Next up", "Automation",
+                "Codex setup", "Codex 0.160.0 · ready", "Open terminals reconnect automatically.",
                 "Demo data", "actions are disabled")
     require(all(label in content for label in expected), "native-codex-demo-labels-missing")
-    meters = {row["name"] for row in rows if row["role"] in {"meter", "level bar", "progress bar"}}
-    require({"5-hour window", "7-day window", "1-day window"} <= meters, "native-codex-quota-durations-missing")
-    require(not any(row["name"] == "Automation" and row["role"] in {"push button", "button"} for row in rows), "duplicate-automation-navigation-present")
-    buttons = [row for row in rows if row["role"] in {"push button", "button"}]
-    selections = [row for row in buttons if row["name"] in {"Selected", "Select account"}]
-    require(len(selections) == 2 and {row["name"] for row in selections} == {"Selected", "Select account"}, "native-codex-demo-account-count-mismatch")
-    mutations = [row for row in buttons if row["name"] in {"Add account", "Check setup", "Selected", "Select account"}
-                 or row["name"].startswith("Refresh Codex quota for ")]
+    meters = {row["name"] for row in rows if row["role"] in METER_ROLES}
+    require({"5-hour window", "Weekly"} <= meters, "native-codex-quota-windows-missing")
+    require(not any(row["name"] == "Automation" and row["role"] in BUTTON_ROLES for row in rows), "duplicate-automation-navigation-present")
+    buttons = [row for row in rows if row["role"] in BUTTON_ROLES]
+    # Every saved account has a row menu; only the two inactive ones offer Switch.
+    menus = {row["name"] for row in buttons if row["name"].startswith("More actions for ") and row["enabled"]}
+    require(menus == {f"More actions for {name}" for name in CODEX_DEMO_ACCOUNTS}, "native-codex-demo-account-count-mismatch")
+    switches = [row for row in buttons if row["name"] == "Switch"]
+    require(len(switches) == 2, "native-codex-demo-account-count-mismatch")
+    mutations = [row for row in buttons if row["name"] in {"Add account", "Check setup", "Refresh all", "Switch"}]
     require(all(not row["enabled"] for row in mutations)
             and any(row["name"] == "Add account" for row in mutations)
             and any(row["name"] == "Check setup" for row in mutations)
-            and any(row["name"] == "Refresh Codex quota for Studio Codex" for row in mutations), "native-codex-demo-mutation-controls-not-disabled")
-    credits = accessible_section_content(rows, "Reset credits")
-    require("Read-only" in credits and bool(re.search(r"(?<![0-9.])3(?![0-9.])", credits)), "native-codex-reset-count-not-read-only")
+            and any(row["name"] == "Refresh all" for row in mutations), "native-codex-demo-mutation-controls-not-disabled")
     provider_tab(rows, "codex", selected=True)
     provider_tab(rows, "claude", selected=False)
-    return {"fictionalAccountCount": 2, "selectedAccount": "Studio Codex", "quotaWindowMinutes": [300, 10080, 1440],
-            "compatibleCodexVersion": "0.160.0", "resetCreditsReadOnly": 3, "mutationControlsDisabled": len(mutations)}
+    return {"fictionalAccountCount": len(CODEX_DEMO_ACCOUNTS), "selectedAccount": "Studio Codex",
+            "limitedAccount": "Personal Codex", "quotaWindowMinutes": [300, 10080],
+            "compatibleCodexVersion": "0.160.0", "mutationControlsDisabled": len(mutations)}
 
 def worker(directory: Path) -> int:
     report = {"formatVersion": 1, "status": "failed", "scope": "Installed Ubuntu 24.04 x86_64 demo accessibility and native window; no provider/live account qualification", "checks": {}}
@@ -485,10 +488,21 @@ def worker(directory: Path) -> int:
                                                                       previous_frame_sha256=report["screenshotSha256"])
         report["codexScreenshotSha256"] = sha256(CODEX_SCREENSHOT.read_bytes())
         report["checks"].update({"codexManagedAccountsRendered": True, "codexNativeQuotaWindowsRendered": True,
-                                 "codexCloseAndReopenGuidance": True, "codexResetCreditsReadOnly": True,
+                                 "codexSharedPageCardsRendered": True, "codexLimitStatusRendered": True,
                                  "codexMutationButtonsDisabled": True, "codexDarkScreenshotCaptured": True})
-        details = [row for row in rows if row["name"] == "Account details and actions for Personal Codex" and row["role"] in {"push button", "button"}]
-        require(len(details) == 1 and details[0]["enabled"] and details[0]["accessible"].queryAction().doAction(0), "codex-read-only-details-unavailable")
+        # Details live in the account's row menu: open it, then choose its entry.
+        trigger = [row for row in rows if row["name"] == "More actions for Personal Codex" and row["role"] in BUTTON_ROLES]
+        require(len(trigger) == 1 and trigger[0]["enabled"] and trigger[0]["accessible"].queryAction().doAction(0), "codex-read-only-details-unavailable")
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            rows = observe_accessibility_desktop(pyatspi, GLib)
+            entry = item_after(rows, "More actions for Personal Codex", "Details")
+            if entry is not None:
+                require(entry["enabled"] and entry["accessible"].queryAction().doAction(0), "codex-read-only-details-unavailable")
+                break
+            time.sleep(0.25)
+        else:
+            raise QualificationError("codex-read-only-details-unavailable")
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             rows = observe_accessibility_desktop(pyatspi, GLib)

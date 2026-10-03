@@ -1,8 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use switcher_runtime::{
-    CodexLoginView, CodexPreparationView, CodexReason, CodexSnapshot, ImportPreview, LoginSession,
-    RuntimeError, RuntimeHandle, SettingsView, Snapshot,
+    CodexLoginView, CodexReason, CodexSnapshot, ImportPreview, LoginSession, RuntimeError,
+    RuntimeHandle, SettingsView, Snapshot,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
@@ -247,42 +247,32 @@ async fn codex_delete_account(
         .map_err(|e| e.to_string())
 }
 #[tauri::command]
-async fn codex_prepare_switch(
-    runtime: State<'_, RuntimeHandle>,
-    id: String,
-) -> Reply<CodexPreparationView> {
-    codex_id(&id)?;
+async fn codex_import_switcher(runtime: State<'_, RuntimeHandle>) -> Reply<CodexSnapshot> {
     runtime
-        .codex_prepare_switch(&id)
+        .codex_import_switcher()
         .await
         .map_err(|e| e.to_string())
 }
 #[tauri::command]
-async fn codex_cancel_preparation(
+async fn codex_refresh_all(runtime: State<'_, RuntimeHandle>) -> Reply<CodexSnapshot> {
+    runtime.codex_refresh_all().await.map_err(|e| e.to_string())
+}
+/// Writes the selected sign-in and restarts Codex's shared daemon so open terminals
+/// reconnect on it. Progress is published through `codex_snapshot_changed`.
+#[tauri::command]
+async fn codex_switch_account(
     runtime: State<'_, RuntimeHandle>,
     id: String,
 ) -> Reply<CodexSnapshot> {
     codex_id(&id)?;
     runtime
-        .codex_cancel_preparation(&id)
-        .await
-        .map_err(|e| e.to_string())
-}
-#[tauri::command]
-async fn codex_apply_switch(
-    runtime: State<'_, RuntimeHandle>,
-    preparation_id: String,
-    clients_closed_acknowledged: bool,
-) -> Reply<CodexSnapshot> {
-    codex_id(&preparation_id)?;
-    runtime
-        .codex_apply_switch(&preparation_id, clients_closed_acknowledged)
+        .codex_switch_account(&id)
         .await
         .map_err(|e| e.to_string())
 }
 fn codex_id(id: &str) -> Reply<()> {
     if id.is_empty() || id.len() > 256 || id.chars().any(char::is_control) {
-        Err(CodexReason::InvalidPreparation.to_string())
+        Err(CodexReason::IdentityUnverified.to_string())
     } else {
         Ok(())
     }
@@ -324,16 +314,21 @@ fn main() {
             codex_import_current,
             codex_refresh_account,
             codex_delete_account,
-            codex_prepare_switch,
-            codex_cancel_preparation,
-            codex_apply_switch
+            codex_import_switcher,
+            codex_refresh_all,
+            codex_switch_account
         ])
         .setup(move |app| {
             let runtime = if demo {
                 RuntimeHandle::demo()
             } else {
-                tauri::async_runtime::block_on(RuntimeHandle::open())
-                    .unwrap_or_else(RuntimeHandle::unavailable)
+                tauri::async_runtime::block_on(async {
+                    let runtime = RuntimeHandle::open().await?;
+                    // Follows auth.json and reads due quotas in the background.
+                    runtime.start_codex_scheduler();
+                    Ok(runtime)
+                })
+                .unwrap_or_else(RuntimeHandle::unavailable)
             };
             let mut changes = runtime.subscribe();
             let mut codex_changes = runtime.subscribe_codex();

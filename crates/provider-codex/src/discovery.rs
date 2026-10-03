@@ -1,5 +1,4 @@
-use crate::{CodexContext, CodexError, SUPPORTED_CODEX_VERSION};
-use sha2::{Digest, Sha256};
+use crate::{CodexContext, CodexError, supported_version};
 use std::{
     fmt,
     path::{Path, PathBuf},
@@ -43,7 +42,15 @@ pub struct CodexCandidate {
 #[derive(Clone)]
 pub struct VerifiedCodexExecutable {
     path: PathBuf,
-    fingerprint: [u8; 32],
+    identity: FileIdentity,
+    version: String,
+}
+/// Cheap replacement check. Hashing the ~300 MB native binary before every spawn
+/// is wasteful; npm/installer updates change size or modification time.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct FileIdentity {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
 }
 impl fmt::Debug for CodexCandidate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -52,7 +59,7 @@ impl fmt::Debug for CodexCandidate {
 }
 impl fmt::Debug for VerifiedCodexExecutable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("VerifiedCodexExecutable(0.160.0, [REDACTED])")
+        write!(f, "VerifiedCodexExecutable({}, [REDACTED])", self.version)
     }
 }
 impl VerifiedCodexExecutable {
@@ -60,11 +67,11 @@ impl VerifiedCodexExecutable {
     pub fn native_path(&self) -> &Path {
         &self.path
     }
-    pub fn version(&self) -> &'static str {
-        SUPPORTED_CODEX_VERSION
+    pub fn version(&self) -> &str {
+        &self.version
     }
     pub(crate) fn recheck(&self) -> Result<&Path, CodexError> {
-        if fingerprint(&self.path)? != self.fingerprint {
+        if identity(&self.path)? != self.identity {
             return Err(CodexError::UnsupportedInstallation);
         }
         Ok(&self.path)
@@ -92,21 +99,21 @@ pub fn discover_candidates(options: &DiscoveryOptions) -> Result<Vec<CodexCandid
         ("codex-linux-x64", "x86_64-unknown-linux-musl")
     };
     for root in &options.npm_package_roots {
-        if !package_matches(root, "@openai/codex", SUPPORTED_CODEX_VERSION) {
+        let Some(version) = package_version(root, "@openai/codex")
+            .filter(|version| supported_version(version).is_some())
+        else {
             continue;
-        }
+        };
         for platform in [
             root.join("node_modules/@openai").join(package),
             root.parent().unwrap_or(root).join(package),
         ] {
-            if package_matches(
-                &platform,
-                "@openai/codex",
-                &format!(
-                    "{SUPPORTED_CODEX_VERSION}-{}",
+            if package_version(&platform, "@openai/codex").as_deref()
+                == Some(&format!(
+                    "{version}-{}",
                     package.trim_start_matches("codex-")
-                ),
-            ) {
+                ))
+            {
                 paths.push(
                     platform
                         .join("vendor")
@@ -128,25 +135,26 @@ pub fn discover_candidates(options: &DiscoveryOptions) -> Result<Vec<CodexCandid
     }
     Ok(result)
 }
-fn package_matches(root: &Path, name: &str, version: &str) -> bool {
+fn package_version(root: &Path, name: &str) -> Option<String> {
     let path = root.join("package.json");
-    let Ok(meta) = std::fs::metadata(&path) else {
-        return false;
-    };
+    let meta = std::fs::metadata(&path).ok()?;
     if !meta.is_file() || meta.len() > 65536 {
-        return false;
+        return None;
     }
-    let Ok(bytes) = std::fs::read(path) else {
-        return false;
-    };
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-        return false;
-    };
-    value["name"] == name && value["version"] == version
+    let bytes = std::fs::read(path).ok()?;
+    let value = serde_json::from_slice::<serde_json::Value>(&bytes).ok()?;
+    if value["name"] != name {
+        return None;
+    }
+    value["version"]
+        .as_str()
+        .filter(|v| !v.is_empty() && v.len() <= 64)
+        .map(str::to_owned)
 }
 fn native_file(path: &Path) -> Result<(), CodexError> {
     let meta = std::fs::metadata(path).map_err(|_| CodexError::UnsupportedInstallation)?;
-    if !meta.is_file() || meta.len() == 0 || meta.len() > 256 * 1024 * 1024 {
+    // Codex 0.160.0 for Windows x64 is ~312 MB; keep a generous sanity cap.
+    if !meta.is_file() || meta.len() == 0 || meta.len() > 1024 * 1024 * 1024 {
         return Err(CodexError::UnsupportedInstallation);
     }
     use std::io::Read;
@@ -177,27 +185,13 @@ fn native_file(path: &Path) -> Result<(), CodexError> {
     }
     Ok(())
 }
-fn fingerprint(path: &Path) -> Result<[u8; 32], CodexError> {
+pub(crate) fn identity(path: &Path) -> Result<FileIdentity, CodexError> {
     native_file(path)?;
-    use std::io::Read;
-    let mut input = std::fs::File::open(path).map_err(|_| CodexError::UnsupportedInstallation)?;
-    let mut digest = Sha256::new();
-    let mut chunk = [0; 65536];
-    let mut total = 0;
-    loop {
-        let n = input
-            .read(&mut chunk)
-            .map_err(|_| CodexError::UnsupportedInstallation)?;
-        if n == 0 {
-            break;
-        }
-        total += n;
-        if total > 256 * 1024 * 1024 {
-            return Err(CodexError::OutputLimit);
-        }
-        digest.update(&chunk[..n]);
-    }
-    Ok(digest.finalize().into())
+    let meta = std::fs::metadata(path).map_err(|_| CodexError::UnsupportedInstallation)?;
+    Ok(FileIdentity {
+        len: meta.len(),
+        modified: meta.modified().ok(),
+    })
 }
 pub async fn verify_executable(
     candidate: CodexCandidate,
@@ -206,7 +200,7 @@ pub async fn verify_executable(
     if !probe.is_isolated() {
         return Err(CodexError::UnsafeContext);
     }
-    let before = fingerprint(&candidate.path)?;
+    let before = identity(&candidate.path)?;
     let mut command = Command::new(&candidate.path);
     probe.configure(&mut command);
     command
@@ -242,10 +236,10 @@ pub async fn verify_executable(
             return Err(CodexError::UnsupportedVersion);
         }
         let text = std::str::from_utf8(&bytes).map_err(|_| CodexError::UnsupportedVersion)?;
-        if text.trim() != format!("codex-cli {SUPPORTED_CODEX_VERSION}") {
+        if !text.trim().starts_with("codex-cli ") {
             return Err(CodexError::UnsupportedVersion);
         }
-        Ok(())
+        supported_version(text).ok_or(CodexError::UnsupportedVersion)
     })
     .await
     .unwrap_or(Err(CodexError::Timeout));
@@ -253,13 +247,14 @@ pub async fn verify_executable(
         let _ = child.start_kill();
         let _ = timeout(Duration::from_secs(5), child.wait()).await;
     }
-    result?;
-    if before != fingerprint(&candidate.path)? {
+    let version = result?;
+    if before != identity(&candidate.path)? {
         return Err(CodexError::UnsupportedInstallation);
     }
     Ok(VerifiedCodexExecutable {
         path: candidate.path,
-        fingerprint: before,
+        identity: before,
+        version,
     })
 }
 

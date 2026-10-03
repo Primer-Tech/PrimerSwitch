@@ -1,4 +1,6 @@
 use crate::views::*;
+#[path = "codex_runtime.rs"]
+mod codex_runtime;
 use crate::{
     CodexLoginLaunch,
     codex_engine::{CodexCommand, CodexEngine, CodexOutput},
@@ -179,6 +181,10 @@ struct Inner {
     codex_cache: RwLock<CodexSnapshot>,
     codex_snapshots: broadcast::Sender<CodexSnapshot>,
     codex_intent: Arc<AtomicU64>,
+    /// Serializes multi-phase Codex work (quota readers, switches) whose slow parts
+    /// run outside the owner lock.
+    codex_job: Mutex<()>,
+    codex_scheduler_started: AtomicBool,
     snapshots: broadcast::Sender<Snapshot>,
     notifications: broadcast::Sender<Notification>,
     refresh_generation: AtomicU64,
@@ -297,6 +303,8 @@ impl RuntimeHandle {
                 codex_cache: RwLock::new(codex_snapshot),
                 codex_snapshots,
                 codex_intent,
+                codex_job: Mutex::new(()),
+                codex_scheduler_started: AtomicBool::new(false),
                 snapshots,
                 notifications,
                 refresh_generation: AtomicU64::new(0),
@@ -382,6 +390,8 @@ impl RuntimeHandle {
                 codex_cache: RwLock::new(codex_snapshot),
                 codex_snapshots,
                 codex_intent,
+                codex_job: Mutex::new(()),
+                codex_scheduler_started: AtomicBool::new(false),
                 snapshots,
                 notifications,
                 refresh_generation: AtomicU64::new(0),
@@ -491,103 +501,6 @@ impl RuntimeHandle {
     }
     pub fn subscribe_codex(&self) -> broadcast::Receiver<CodexSnapshot> {
         self.inner.codex_snapshots.subscribe()
-    }
-    async fn run_codex(&self, command: CodexCommand) -> Result<CodexOutput, CodexReason> {
-        let mut engine = if matches!(&command, CodexCommand::PollLogin(_)) {
-            self.inner.owner.try_lock().map_err(|_| CodexReason::Busy)?
-        } else {
-            self.inner.owner.lock().await
-        };
-        if engine.demo || engine.vault.is_none() {
-            return Err(CodexReason::VaultUnavailable);
-        }
-        self.publish(&mut engine, true);
-        let now = engine.clock.now();
-        let result = {
-            let Engine { codex, vault, .. } = &mut *engine;
-            codex
-                .command(
-                    command,
-                    vault.as_ref().ok_or(CodexReason::VaultUnavailable)?,
-                    now,
-                )
-                .await
-        };
-        if let Err(error) = &result {
-            engine.codex.error = Some(*error);
-        }
-        self.publish(&mut engine, false);
-        result
-    }
-    async fn codex_snapshot_command(
-        &self,
-        command: CodexCommand,
-    ) -> Result<CodexSnapshot, CodexReason> {
-        self.run_codex(command).await?;
-        Ok(self.get_codex_snapshot())
-    }
-    pub async fn shutdown_codex(&self) {
-        self.inner.codex_intent.fetch_add(1, Ordering::AcqRel);
-        let mut engine = self.inner.owner.lock().await;
-        engine.codex.shutdown_owned().await;
-    }
-    pub async fn codex_discover(&self) -> Result<CodexSnapshot, CodexReason> {
-        self.codex_snapshot_command(CodexCommand::Discover).await
-    }
-    pub async fn codex_begin_login(&self) -> Result<CodexLoginLaunch, CodexReason> {
-        let intent = self.inner.codex_intent.fetch_add(1, Ordering::AcqRel) + 1;
-        match self.run_codex(CodexCommand::BeginLogin(intent)).await? {
-            CodexOutput::Login(value) => Ok(value),
-            _ => Err(CodexReason::ProviderUnavailable),
-        }
-    }
-    pub async fn codex_poll_login(&self, id: &str) -> Result<CodexSnapshot, CodexReason> {
-        self.codex_snapshot_command(CodexCommand::PollLogin(id.into()))
-            .await
-    }
-    pub async fn codex_cancel_login(&self, id: &str) -> Result<CodexSnapshot, CodexReason> {
-        let current = self.get_codex_snapshot().login;
-        if current.is_some_and(|p| p.id == id) {
-            self.inner.codex_intent.fetch_add(1, Ordering::AcqRel);
-        }
-        self.codex_snapshot_command(CodexCommand::CancelLogin(id.into()))
-            .await
-    }
-    pub async fn codex_import_current(&self) -> Result<CodexSnapshot, CodexReason> {
-        self.codex_snapshot_command(CodexCommand::ImportCurrent)
-            .await
-    }
-    pub async fn codex_refresh_account(&self, id: &str) -> Result<CodexSnapshot, CodexReason> {
-        self.codex_snapshot_command(CodexCommand::Refresh(id.into()))
-            .await
-    }
-    pub async fn codex_delete_account(&self, id: &str) -> Result<CodexSnapshot, CodexReason> {
-        self.codex_snapshot_command(CodexCommand::Delete(id.into()))
-            .await
-    }
-    pub async fn codex_prepare_switch(
-        &self,
-        id: &str,
-    ) -> Result<CodexPreparationView, CodexReason> {
-        match self.run_codex(CodexCommand::Prepare(id.into())).await? {
-            CodexOutput::Preparation(value) => Ok(value),
-            _ => Err(CodexReason::InvalidPreparation),
-        }
-    }
-    pub async fn codex_cancel_preparation(&self, id: &str) -> Result<CodexSnapshot, CodexReason> {
-        self.codex_snapshot_command(CodexCommand::CancelPreparation(id.into()))
-            .await
-    }
-    pub async fn codex_apply_switch(
-        &self,
-        preparation_id: &str,
-        clients_closed_acknowledged: bool,
-    ) -> Result<CodexSnapshot, CodexReason> {
-        self.codex_snapshot_command(CodexCommand::Apply(
-            preparation_id.into(),
-            clients_closed_acknowledged,
-        ))
-        .await
     }
     async fn run(&self, command: Command, coalesce: Option<u64>) -> Result<Output, RuntimeError> {
         let mut engine = self.inner.owner.lock().await;

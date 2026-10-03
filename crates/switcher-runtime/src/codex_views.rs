@@ -13,15 +13,21 @@ pub enum CodexReason {
     VaultUnavailable,
     IdentityUnverified,
     IdentityMismatch,
-    ClientsRunning,
-    ProcessInventoryUnavailable,
     ExternalChange,
-    ReconciliationRequired,
     LoginExpired,
     LoginCanceled,
     ProviderUnavailable,
-    InvalidPreparation,
     Busy,
+    /// The sign-in was switched, but Codex's background server could not be
+    /// restarted: open terminals keep the previous account until restarted.
+    DaemonRestartFailed,
+    /// The saved sign-in was rejected (refresh token expired, revoked or reused).
+    SignInRequired,
+    SwitchInProgress,
+    /// Codex Switcher's account file is missing, unreadable or in an unknown format.
+    SwitcherUnavailable,
+    /// The active login cannot be removed; switch to another account first.
+    ActiveAccount,
 }
 impl std::fmt::Display for CodexReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -55,8 +61,9 @@ impl CodexCapability {
 pub struct CodexCapabilities {
     pub login_browser: CodexCapability,
     pub import_current: CodexCapability,
+    pub import_switcher: CodexCapability,
     pub refresh_quota: CodexCapability,
-    pub manual_switch: CodexCapability,
+    pub switch_account: CodexCapability,
     pub delete_saved: CodexCapability,
 }
 impl CodexCapabilities {
@@ -64,8 +71,9 @@ impl CodexCapabilities {
         Self {
             login_browser: CodexCapability::blocked(reason),
             import_current: CodexCapability::blocked(reason),
+            import_switcher: CodexCapability::blocked(reason),
             refresh_quota: CodexCapability::blocked(reason),
-            manual_switch: CodexCapability::blocked(reason),
+            switch_account: CodexCapability::blocked(reason),
             delete_saved: CodexCapability::blocked(reason),
         }
     }
@@ -139,14 +147,17 @@ pub struct CodexAccountView {
     pub workspace_id: Option<String>,
     pub workspace_name: Option<String>,
     pub auth_kind: String,
+    /// Raw lowercase plan from Codex (`plus`, `pro`, `prolite`, `team`, ...).
+    pub plan_type: Option<String>,
     pub identity_evidence: CodexIdentityEvidence,
     pub identity_verified: bool,
     pub selected: bool,
-    pub manual_switch: CodexCapability,
+    pub switchable: CodexCapability,
     pub quota: Option<CodexQuotaView>,
     pub quota_read_at: Option<i64>,
     pub quota_state: CodexQuotaState,
     pub error: Option<CodexReason>,
+    pub needs_sign_in: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -179,6 +190,42 @@ pub struct CodexSnapshot {
     pub busy: bool,
     pub error: Option<CodexReason>,
     pub demo: bool,
+    pub switching: Option<CodexSwitchView>,
+    pub last_switch: Option<CodexLastSwitchView>,
+    pub environment: CodexEnvironmentView,
+    pub warnings: Vec<CodexReason>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CodexSwitchStage {
+    Saving,
+    Restarting,
+    Verifying,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexSwitchView {
+    pub target_id: String,
+    pub stage: CodexSwitchStage,
+    pub started_at: i64,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexLastSwitchView {
+    pub account_id: String,
+    pub at: i64,
+    /// The shared daemon was running and restarted on the new sign-in.
+    pub daemon_restarted: bool,
+    /// Codex processes with their own login that keep the previous account.
+    pub other_clients: u32,
+    pub error: Option<CodexReason>,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexEnvironmentView {
+    pub daemon_running: Option<bool>,
+    pub other_clients: u32,
+    pub codex_switcher_running: bool,
 }
 impl CodexSnapshot {
     pub(crate) fn empty(demo: bool) -> Self {
@@ -196,13 +243,10 @@ impl CodexSnapshot {
             busy: false,
             error: None,
             demo,
+            switching: None,
+            last_switch: None,
+            environment: CodexEnvironmentView::default(),
+            warnings: Vec::new(),
         }
     }
-}
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CodexPreparationView {
-    pub id: String,
-    pub account_id: String,
-    pub expires_at: i64,
 }

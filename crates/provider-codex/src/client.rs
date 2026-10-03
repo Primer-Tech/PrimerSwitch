@@ -20,11 +20,21 @@ use tokio::{
 };
 use zeroize::{Zeroize, Zeroizing};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContextKind {
+    /// Application-owned empty home: discovery probes and browser sign-in.
+    Isolated,
+    /// Application-owned home holding one saved account's auth.json, for reading that
+    /// account's quota while it is not the active Codex login.
+    Owned,
+    /// The user's real CODEX_HOME (active account only).
+    Approved,
+}
 #[derive(Clone)]
 pub struct CodexContext {
     home: PathBuf,
     cwd: PathBuf,
-    isolated: bool,
+    kind: ContextKind,
     env: Vec<(OsString, OsString)>,
 }
 impl fmt::Debug for CodexContext {
@@ -34,21 +44,30 @@ impl fmt::Debug for CodexContext {
 }
 impl CodexContext {
     pub fn isolated(home: PathBuf, cwd: PathBuf) -> Result<Self, CodexError> {
-        Self::new(home, cwd, true)
+        Self::new(home, cwd, ContextKind::Isolated)
+    }
+    /// A private, application-owned home that already contains one saved account's
+    /// auth.json. Codex may rotate it; the caller adopts the result afterwards.
+    pub fn owned(home: PathBuf, cwd: PathBuf) -> Result<Self, CodexError> {
+        Self::new(home, cwd, ContextKind::Owned)
     }
     /// Caller must first qualify this FILE context and policy through the platform adapter.
     pub fn approved_file(home: PathBuf, cwd: PathBuf) -> Result<Self, CodexError> {
-        Self::new(home, cwd, false)
+        Self::new(home, cwd, ContextKind::Approved)
     }
-    fn new(home: PathBuf, cwd: PathBuf, isolated: bool) -> Result<Self, CodexError> {
+    fn new(home: PathBuf, cwd: PathBuf, kind: ContextKind) -> Result<Self, CodexError> {
+        let isolated = kind != ContextKind::Approved;
         let home = std::fs::canonicalize(home).map_err(|_| CodexError::UnsafeContext)?;
         let cwd = std::fs::canonicalize(cwd).map_err(|_| CodexError::UnsafeContext)?;
         if !home.is_dir() || !cwd.is_dir() {
             return Err(CodexError::UnsafeContext);
         }
-        if isolated
+        if kind == ContextKind::Isolated
             && (home.join("auth.json").exists() || home.join("secrets/codex_auth.age").exists())
         {
+            return Err(CodexError::UnsafeContext);
+        }
+        if kind == ContextKind::Owned && !home.join("auth.json").is_file() {
             return Err(CodexError::UnsafeContext);
         }
         if isolated && !cwd.starts_with(&home) {
@@ -122,7 +141,7 @@ impl CodexContext {
         Ok(Self {
             home,
             cwd,
-            isolated,
+            kind,
             env,
         })
     }
@@ -130,7 +149,7 @@ impl CodexContext {
         &self.home
     }
     pub(crate) fn is_isolated(&self) -> bool {
-        self.isolated
+        self.kind == ContextKind::Isolated
     }
     pub(crate) fn configure(&self, command: &mut Command) {
         command
@@ -374,7 +393,7 @@ pub struct CodexClient {
     id: i64,
     pending: Option<PendingLogin>,
     early: VecDeque<SecretJson>,
-    isolated: bool,
+    kind: ContextKind,
     dead: bool,
 }
 impl fmt::Debug for CodexClient {
@@ -387,7 +406,7 @@ impl CodexClient {
         executable: &VerifiedCodexExecutable,
         context: CodexContext,
     ) -> Result<Self, CodexError> {
-        if !context.isolated {
+        if context.kind != ContextKind::Isolated {
             return Err(CodexError::UnsafeContext);
         }
         Self::start(executable, context).await
@@ -396,7 +415,17 @@ impl CodexClient {
         executable: &VerifiedCodexExecutable,
         context: CodexContext,
     ) -> Result<Self, CodexError> {
-        if context.isolated {
+        if context.kind != ContextKind::Approved {
+            return Err(CodexError::UnsafeContext);
+        }
+        Self::start(executable, context).await
+    }
+    /// Quota reader for a saved account in its own application-owned home.
+    pub async fn start_owned(
+        executable: &VerifiedCodexExecutable,
+        context: CodexContext,
+    ) -> Result<Self, CodexError> {
+        if context.kind != ContextKind::Owned {
             return Err(CodexError::UnsafeContext);
         }
         Self::start(executable, context).await
@@ -405,7 +434,7 @@ impl CodexClient {
         executable: &VerifiedCodexExecutable,
         context: CodexContext,
     ) -> Result<Self, CodexError> {
-        if context.isolated
+        if context.kind == ContextKind::Isolated
             && (context.home.join("auth.json").exists()
                 || context.home.join("secrets/codex_auth.age").exists())
         {
@@ -417,7 +446,7 @@ impl CodexClient {
             id: 0,
             pending: None,
             early: VecDeque::new(),
-            isolated: context.isolated,
+            kind: context.kind,
             dead: false,
         };
         if let Err(error) = client.initialize(&context).await {
@@ -489,10 +518,18 @@ impl CodexClient {
                     return Err(CodexError::Protocol);
                 }
                 if let Some(error) = incoming.0.get("error") {
-                    if error["code"].as_i64().is_none() || !error["message"].is_string() {
+                    let Some(message) = error["message"].as_str() else {
+                        return Err(CodexError::Protocol);
+                    };
+                    if error["code"].as_i64().is_none() {
                         return Err(CodexError::Protocol);
                     }
-                    return Err(CodexError::ServiceUnavailable);
+                    // Classified locally; the text is never logged or forwarded.
+                    return Err(if auth_required(message) {
+                        CodexError::AuthRequired
+                    } else {
+                        CodexError::ServiceUnavailable
+                    });
                 }
                 return Ok(SecretJson(incoming.0["result"].take()));
             }
@@ -565,7 +602,7 @@ impl CodexClient {
         result
     }
     async fn begin_browser_login_inner(&mut self) -> Result<BrowserLoginChallenge, CodexError> {
-        if !self.isolated || self.pending.is_some() {
+        if self.kind != ContextKind::Isolated || self.pending.is_some() {
             return Err(CodexError::UnsafeContext);
         }
         let response = self
@@ -658,7 +695,7 @@ impl CodexClient {
         parsed
     }
     pub async fn read_rate_limits(&mut self) -> Result<CodexRateLimits, CodexError> {
-        if self.isolated {
+        if self.kind == ContextKind::Isolated {
             return Err(CodexError::UnsafeContext);
         }
         let mut response = self
@@ -679,6 +716,17 @@ impl CodexClient {
         self.dead = true;
         self.transport.shutdown().await
     }
+}
+
+/// Codex 0.160.0 reports a rejected refresh ("...Please log out and sign in again.")
+/// or a missing login ("...authentication required...") through these errors.
+fn auth_required(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("sign in again")
+        || message.contains("log in again")
+        || message.contains("authentication required")
+        || message.contains("401 unauthorized")
+        || message.contains("refresh token")
 }
 
 /// Typed seam for the runtime owner and fake lifecycle fixtures. No raw RPC/token methods.

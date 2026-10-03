@@ -1,23 +1,40 @@
-//! Codex state machine under the existing serialized runtime owner.
+//! Codex accounts under the serialized runtime owner. Fast state changes run under
+//! the owner lock; slow Codex children (quota readers, the daemon restart) run outside
+//! it as prepared jobs, serialized by a separate Codex job lock (codex_runtime.rs).
+//!
+//! Switching: since Codex 0.160.0 every terminal is a client of one shared app-server
+//! daemon per CODEX_HOME that owns the loaded login. A switch preserves the outgoing
+//! login, writes the selected one to auth.json atomically and runs Codex's official
+//! `codex app-server daemon restart`; terminals reconnect and resume their threads.
 use crate::{codex_context::*, codex_views::*};
 use async_trait::async_trait;
 use provider_codex::*;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeSet,
-    path::PathBuf,
+    collections::{BTreeMap, BTreeSet},
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
 };
 use switcher_core::ProviderId;
-use switcher_platform::{Vault, codex::*};
+use switcher_platform::{
+    Vault,
+    codex::{CodexStoreError, *},
+};
 use tempfile::TempDir;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 const RECORD: &str = "codex-state";
-const PREPARATION_TTL: i64 = 120;
+/// Background reading of the active account. The terminal shows live usage itself.
+pub(crate) const ACTIVE_QUOTA_INTERVAL: i64 = 600;
+/// Inactive accounts only change when their windows reset.
+pub(crate) const INACTIVE_QUOTA_INTERVAL: i64 = 3600;
+const ERROR_RETRY: i64 = 900;
+const FRESH_SECONDS: i64 = 900;
+/// Leave a nearly expired active token to Codex's own refresh in the background.
+const ACTIVE_EXPIRY_MARGIN: i64 = 600;
 
 pub struct CodexLoginLaunch {
     pub session: CodexLoginView,
@@ -44,6 +61,10 @@ struct SavedAccount {
     managed_origin: bool,
     quota: Option<CodexQuotaView>,
     quota_read_at: Option<i64>,
+    #[serde(default)]
+    needs_sign_in: bool,
+    #[serde(default)]
+    last_attempt_at: Option<i64>,
 }
 impl Drop for SavedAccount {
     fn drop(&mut self) {
@@ -58,7 +79,9 @@ struct Binding {
 }
 impl Binding {
     fn from_auth(auth: &OpaqueAuth) -> Result<Self, CodexReason> {
-        let claims = auth.routing_claims();
+        Self::from_claims(auth.routing_claims())
+    }
+    fn from_claims(claims: &UnverifiedRoutingClaims) -> Result<Self, CodexReason> {
         if claims.is_fedramp {
             return Err(CodexReason::UnsupportedAuth);
         }
@@ -95,13 +118,19 @@ impl Default for Saved {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClientRole {
+    Login,
+    Active,
+    Owned,
+}
 #[async_trait]
 pub(crate) trait ClientFactory: Send + Sync {
     async fn start(
         &self,
         executable: Option<&VerifiedCodexExecutable>,
         context: CodexContext,
-        login: bool,
+        role: ClientRole,
     ) -> Result<Box<dyn CodexService>, CodexError>;
 }
 struct NativeFactory;
@@ -111,19 +140,84 @@ impl ClientFactory for NativeFactory {
         &self,
         executable: Option<&VerifiedCodexExecutable>,
         context: CodexContext,
-        login: bool,
+        role: ClientRole,
     ) -> Result<Box<dyn CodexService>, CodexError> {
         let executable = executable.ok_or(CodexError::NotFound)?;
-        Ok(Box::new(if login {
-            CodexClient::start_login(executable, context).await?
-        } else {
-            CodexClient::start_active(executable, context).await?
+        Ok(Box::new(match role {
+            ClientRole::Login => CodexClient::start_login(executable, context).await?,
+            ClientRole::Active => CodexClient::start_active(executable, context).await?,
+            ClientRole::Owned => CodexClient::start_owned(executable, context).await?,
         }))
     }
 }
+#[async_trait]
+pub(crate) trait DaemonControl: Send + Sync {
+    async fn state(
+        &self,
+        executable: Option<&VerifiedCodexExecutable>,
+    ) -> Result<DaemonState, CodexError>;
+    async fn restart(&self, executable: Option<&VerifiedCodexExecutable>)
+    -> Result<(), CodexError>;
+}
+struct NativeDaemon;
+#[async_trait]
+impl DaemonControl for NativeDaemon {
+    async fn state(
+        &self,
+        executable: Option<&VerifiedCodexExecutable>,
+    ) -> Result<DaemonState, CodexError> {
+        daemon_state(executable.ok_or(CodexError::NotFound)?).await
+    }
+    async fn restart(
+        &self,
+        executable: Option<&VerifiedCodexExecutable>,
+    ) -> Result<(), CodexError> {
+        restart_daemon(executable.ok_or(CodexError::NotFound)?).await
+    }
+}
+pub(crate) trait ProcessInventory: Send + Sync {
+    fn scan(&self, home: &Path) -> CodexProcessSummary;
+}
+struct NativeInventory;
+impl ProcessInventory for NativeInventory {
+    fn scan(&self, home: &Path) -> CodexProcessSummary {
+        scan_codex_processes(home)
+    }
+}
+/// lampese "Codex Switcher" (`~/.codex-switcher/accounts.json`, store version 1).
+pub(crate) trait SwitcherSource: Send + Sync {
+    fn exists(&self) -> bool;
+    fn read(&self) -> Result<Zeroizing<Vec<u8>>, CodexReason>;
+}
+struct NativeSwitcher;
+impl NativeSwitcher {
+    fn path() -> Option<PathBuf> {
+        std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+            .map(PathBuf::from)
+            .map(|home| home.join(".codex-switcher").join("accounts.json"))
+    }
+}
+impl SwitcherSource for NativeSwitcher {
+    fn exists(&self) -> bool {
+        Self::path().is_some_and(|path| path.is_file())
+    }
+    fn read(&self) -> Result<Zeroizing<Vec<u8>>, CodexReason> {
+        let path = Self::path().ok_or(CodexReason::SwitcherUnavailable)?;
+        let meta =
+            std::fs::symlink_metadata(&path).map_err(|_| CodexReason::SwitcherUnavailable)?;
+        if !meta.is_file() || meta.len() > 16 * 1024 * 1024 {
+            return Err(CodexReason::SwitcherUnavailable);
+        }
+        std::fs::read(path)
+            .map(Zeroizing::new)
+            .map_err(|_| CodexReason::SwitcherUnavailable)
+    }
+}
+
 struct Installation {
     executable: Option<VerifiedCodexExecutable>,
     executable_path: PathBuf,
+    version: String,
     paths: ContextPaths,
     workspace: TempDir,
     qualified: QualifiedContext,
@@ -134,9 +228,120 @@ struct PendingLogin {
     home: TempDir,
     client: Box<dyn CodexService>,
 }
-struct Preparation {
-    view: CodexPreparationView,
-    receipt: PreparedCodexSwitch,
+
+/// A quota reading prepared under the owner lock and run outside it.
+pub(crate) struct QuotaJob {
+    account_id: String,
+    binding: Binding,
+    executable: Option<VerifiedCodexExecutable>,
+    factory: Arc<dyn ClientFactory>,
+    target: QuotaTarget,
+}
+enum QuotaTarget {
+    /// The active login, read through the user's own CODEX_HOME.
+    Active(CodexContext),
+    /// A saved login copied into an application-owned home; Codex may rotate it there.
+    Owned {
+        home: TempDir,
+        context: CodexContext,
+        original: Zeroizing<Vec<u8>>,
+    },
+}
+/// The saved login copied into an owned home, and that file after the reading.
+struct OwnedResult {
+    original: Zeroizing<Vec<u8>>,
+    rotated: Option<Zeroizing<Vec<u8>>>,
+}
+pub(crate) struct QuotaReport {
+    account_id: String,
+    binding: Binding,
+    owned: Option<OwnedResult>,
+    outcome: Result<CodexRateLimits, CodexError>,
+}
+impl QuotaJob {
+    pub(crate) async fn run(self) -> QuotaReport {
+        let (context, role) = match &self.target {
+            QuotaTarget::Active(context) => (context.clone(), ClientRole::Active),
+            QuotaTarget::Owned { context, .. } => (context.clone(), ClientRole::Owned),
+        };
+        let outcome = async {
+            let mut client = self
+                .factory
+                .start(self.executable.as_ref(), context, role)
+                .await?;
+            let result = client.read_rate_limits().await;
+            let _ = client.shutdown().await;
+            result
+        }
+        .await;
+        let owned = match self.target {
+            QuotaTarget::Owned { home, original, .. } => {
+                let rotated = read_private_auth(home.path()).ok().flatten();
+                scrub_owned_home(home);
+                Some(OwnedResult { original, rotated })
+            }
+            QuotaTarget::Active(_) => None,
+        };
+        QuotaReport {
+            account_id: self.account_id,
+            binding: self.binding,
+            owned,
+            outcome,
+        }
+    }
+}
+/// Overwrite and remove the private copy of a login before deleting its directory.
+fn scrub_owned_home(home: TempDir) {
+    let auth = home.path().join("auth.json");
+    for _ in 0..20 {
+        if let Ok(meta) = std::fs::metadata(&auth) {
+            let _ = std::fs::write(&auth, vec![0u8; meta.len() as usize]);
+        }
+        if std::fs::remove_file(&auth).is_ok() || !auth.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let _ = home.close();
+}
+
+/// The slow part of a switch, run outside the owner lock.
+pub(crate) struct SwitchJob {
+    target_id: String,
+    executable: Option<VerifiedCodexExecutable>,
+    daemon: Arc<dyn DaemonControl>,
+}
+pub(crate) struct SwitchOutcome {
+    daemon_running: bool,
+    restart: Option<Result<(), CodexError>>,
+}
+impl SwitchJob {
+    pub(crate) async fn run(&self) -> SwitchOutcome {
+        match self.daemon.state(self.executable.as_ref()).await {
+            Ok(DaemonState::Running) => SwitchOutcome {
+                daemon_running: true,
+                restart: Some(self.daemon.restart(self.executable.as_ref()).await),
+            },
+            Ok(DaemonState::NotRunning) => SwitchOutcome {
+                daemon_running: false,
+                restart: None,
+            },
+            Err(error) => SwitchOutcome {
+                daemon_running: true,
+                restart: Some(Err(error)),
+            },
+        }
+    }
+    /// A second restart after repairing a file that an old process rewrote mid-drain.
+    pub(crate) async fn restart_again(&self) -> SwitchOutcome {
+        SwitchOutcome {
+            daemon_running: true,
+            restart: Some(self.daemon.restart(self.executable.as_ref()).await),
+        }
+    }
+    pub(crate) fn target_id(&self) -> &str {
+        &self.target_id
+    }
 }
 
 pub(crate) enum CodexCommand {
@@ -145,39 +350,41 @@ pub(crate) enum CodexCommand {
     PollLogin(String),
     CancelLogin(String),
     ImportCurrent,
-    Refresh(String),
+    ImportSwitcher,
     Delete(String),
-    Prepare(String),
-    CancelPreparation(String),
-    Apply(String, bool),
+    Observe,
 }
 pub(crate) enum CodexOutput {
     Snapshot,
     Login(CodexLoginLaunch),
-    Preparation(CodexPreparationView),
 }
 pub(crate) struct CodexEngine {
     saved: Saved,
     writable: bool,
     installation: Option<Installation>,
     factory: Arc<dyn ClientFactory>,
-    guard: Arc<dyn CodexWriteGuard>,
+    daemon: Arc<dyn DaemonControl>,
+    processes: Arc<dyn ProcessInventory>,
+    switcher: Arc<dyn SwitcherSource>,
     pub intent: Arc<AtomicU64>,
     pending_login: Option<PendingLogin>,
     login_view: Option<CodexLoginView>,
-    preparation: Option<Preparation>,
-    pending_switch: Option<PendingCodexSwitch>,
+    /// Saved account created or refreshed by the last completed browser sign-in.
+    pub(crate) last_login_account: Option<String>,
     selected_id: Option<String>,
     observed_generation: Option<StoreGeneration>,
     verified_now: BTreeSet<String>,
-    account_errors: std::collections::BTreeMap<String, CodexReason>,
+    account_errors: BTreeMap<String, CodexReason>,
     availability: CodexAvailability,
     reason: Option<CodexReason>,
     pub error: Option<CodexReason>,
     pub revision: u64,
     demo: bool,
-    reconciling: bool,
-    external_reconciliation: bool,
+    switching: Option<CodexSwitchView>,
+    last_switch: Option<CodexLastSwitchView>,
+    environment: CodexEnvironmentView,
+    switcher_available: bool,
+    discovered_at: Option<i64>,
 }
 impl CodexEngine {
     pub fn load(vault: &Vault) -> Self {
@@ -200,12 +407,13 @@ impl CodexEngine {
             writable: !demo,
             installation: None,
             factory: Arc::new(NativeFactory),
-            guard: Arc::new(NativeCodexWriteGuard),
+            daemon: Arc::new(NativeDaemon),
+            processes: Arc::new(NativeInventory),
+            switcher: Arc::new(NativeSwitcher),
             intent: Arc::new(AtomicU64::new(0)),
             pending_login: None,
             login_view: None,
-            preparation: None,
-            pending_switch: None,
+            last_login_account: None,
             selected_id: None,
             observed_generation: None,
             verified_now: BTreeSet::new(),
@@ -215,15 +423,37 @@ impl CodexEngine {
             error: None,
             revision: 0,
             demo,
-            reconciling: false,
-            external_reconciliation: false,
+            switching: None,
+            last_switch: None,
+            environment: CodexEnvironmentView::default(),
+            switcher_available: false,
+            discovered_at: None,
+        }
+    }
+    /// Discover once at startup, and retry a failed discovery every `retry` seconds.
+    pub(crate) fn needs_discovery(&self, now: i64, retry: i64) -> bool {
+        if self.demo || !self.writable || self.switching.is_some() || self.pending_login.is_some() {
+            return false;
+        }
+        match self.discovered_at {
+            None => true,
+            Some(at) => self.installation.is_none() && (now < at || now - at >= retry),
         }
     }
 
     pub fn demo(now: i64) -> Self {
         let mut engine = Self::empty(true);
         engine.availability = CodexAvailability::Supported;
-        for (index, name, used) in [(0, "Studio Codex", 42), (1, "Personal Codex", 19)] {
+        let window = |used: i32, minutes: i64, reset: i64| CodexWindowView {
+            used_percent: used,
+            window_duration_mins: Some(minutes),
+            resets_at: Some(now + reset),
+        };
+        for (index, name, plan, five, week, five_reset) in [
+            (0, "Studio Codex", "pro", 42, 35, 7200),
+            (1, "Personal Codex", "plus", 100, 61, 8100),
+            (2, "Research Codex", "prolite", 8, 12, 15_300),
+        ] {
             let id = format!("codex-demo-{index}");
             engine.saved.accounts.push(SavedAccount {
                 id: id.clone(),
@@ -233,61 +463,38 @@ impl CodexEngine {
                 binding: Binding {
                     user: Some(format!("codex-demo-user-{index}")),
                     workspace: Some(format!("codex-demo-workspace-{index}")),
-                    email: Some(format!("codex-demo-{index}@example.invalid")),
+                    email: Some(format!("codex-{index}@example.invalid")),
                 },
                 evidence: CodexIdentityEvidence::BackendVerified,
                 managed_origin: true,
                 quota: Some(CodexQuotaView {
-                    ordinary_usage_allowed: Some(true),
-                    limits: vec![
-                        CodexLimitView {
-                            key: "default".into(),
-                            limit_id: Some("codex".into()),
-                            limit_name: Some("Codex".into()),
-                            normal_model_slug: None,
-                            primary: Some(CodexWindowView {
-                                used_percent: used,
-                                window_duration_mins: Some(300),
-                                resets_at: Some(now + 7200),
-                            }),
-                            secondary: Some(CodexWindowView {
-                                used_percent: 19,
-                                window_duration_mins: Some(10080),
-                                resets_at: Some(now + 259200),
-                            }),
-                            plan_type: Some("plus".into()),
-                            credits: Some(CodexCreditsView {
-                                has_credits: true,
-                                unlimited: false,
-                                balance: Some("12.50".into()),
-                            }),
-                            spend_control_reached: Some(false),
-                            rate_limit_reached_type: None,
-                        },
-                        CodexLimitView {
-                            key: "bucket:code-review".into(),
-                            limit_id: Some("code-review".into()),
-                            limit_name: Some("Code review".into()),
-                            normal_model_slug: None,
-                            primary: Some(CodexWindowView {
-                                used_percent: 76,
-                                window_duration_mins: Some(1440),
-                                resets_at: None,
-                            }),
-                            secondary: None,
-                            plan_type: None,
-                            credits: None,
-                            spend_control_reached: None,
-                            rate_limit_reached_type: None,
-                        },
-                    ],
-                    reset_credits_available: Some(3),
+                    ordinary_usage_allowed: Some(five < 100),
+                    limits: vec![CodexLimitView {
+                        key: "default".into(),
+                        limit_id: Some("codex".into()),
+                        limit_name: Some("Codex".into()),
+                        normal_model_slug: None,
+                        primary: Some(window(five, 300, five_reset)),
+                        secondary: Some(window(week, 10080, 259_200)),
+                        plan_type: Some(plan.into()),
+                        credits: None,
+                        spend_control_reached: Some(false),
+                        rate_limit_reached_type: (five >= 100).then(|| "primary".into()),
+                    }],
+                    reset_credits_available: None,
                 }),
                 quota_read_at: Some(now),
+                needs_sign_in: false,
+                last_attempt_at: Some(now),
             });
             engine.verified_now.insert(id);
         }
         engine.selected_id = Some("codex-demo-0".into());
+        engine.environment = CodexEnvironmentView {
+            daemon_running: Some(true),
+            other_clients: 0,
+            codex_switcher_running: false,
+        };
         engine
     }
     pub fn unavailable(&mut self) {
@@ -304,11 +511,8 @@ impl CodexEngine {
             .map_err(|_| CodexReason::VaultUnavailable)
     }
     fn ready(&self) -> Result<&Installation, CodexReason> {
-        if !self.writable {
+        if self.demo || !self.writable {
             return Err(CodexReason::VaultUnavailable);
-        }
-        if self.reconciling {
-            return Err(CodexReason::ReconciliationRequired);
         }
         self.installation
             .as_ref()
@@ -324,17 +528,20 @@ impl CodexEngine {
             .context
             .clone()
             .ok_or(CodexReason::UnsupportedStore)?;
-        Ok(CodexFileStore::new(context, self.guard.clone()))
+        Ok(CodexFileStore::new(context))
     }
+    /// Re-evaluate the configuration from scratch before any mutation: Codex edits
+    /// config.toml itself, and edits are judged on their content, not as conflicts.
     fn requalify(&mut self) -> Result<(), CodexReason> {
         let installation = self
             .installation
             .as_mut()
             .ok_or(CodexReason::NotInstalled)?;
-        installation.qualified.revalidate_static()?;
-        installation.qualified = installation
-            .paths
-            .qualify(&installation.executable_path, installation.workspace.path())?;
+        installation.qualified = installation.paths.qualify(
+            &installation.executable_path,
+            installation.workspace.path(),
+            &installation.version,
+        )?;
         Ok(())
     }
     fn account_index(&self, id: &str) -> Result<usize, CodexReason> {
@@ -347,36 +554,35 @@ impl CodexEngine {
             .position(|a| a.id == id)
             .ok_or(CodexReason::IdentityUnverified)
     }
-    fn switch_capability(&self, account: &SavedAccount) -> CodexCapability {
-        let reason = if self.demo || !self.writable {
+    fn common_block(&self) -> Option<CodexReason> {
+        if self.demo || !self.writable {
             Some(CodexReason::VaultUnavailable)
-        } else if self.reconciling {
-            Some(CodexReason::ReconciliationRequired)
         } else if self.installation.is_none() {
             Some(self.reason.unwrap_or(CodexReason::NotInstalled))
-        } else if account.auth_kind != AuthKind::ManagedChatgpt {
-            Some(CodexReason::UnsupportedAuth)
-        } else if self.account_errors.get(&account.id).is_some_and(|reason| {
-            matches!(
-                reason,
-                CodexReason::ExternalChange
-                    | CodexReason::IdentityMismatch
-                    | CodexReason::StoreConflict
-                    | CodexReason::VaultUnavailable
-                    | CodexReason::ReconciliationRequired
-            )
-        }) {
-            self.account_errors.get(&account.id).copied()
-        } else if !account.binding.complete()
-            || !matches!(
-                account.evidence,
-                CodexIdentityEvidence::ManagedLogin | CodexIdentityEvidence::BackendVerified
-            )
-        {
-            Some(CodexReason::IdentityUnverified)
         } else {
             None
-        };
+        }
+    }
+    fn switch_capability(&self, account: &SavedAccount) -> CodexCapability {
+        if self.selected_id.as_deref() == Some(&account.id) {
+            return CodexCapability {
+                enabled: false,
+                blocked_reason: None,
+            };
+        }
+        let reason = self.common_block().or_else(|| {
+            if self.switching.is_some() {
+                Some(CodexReason::SwitchInProgress)
+            } else if account.auth_kind != AuthKind::ManagedChatgpt {
+                Some(CodexReason::UnsupportedAuth)
+            } else if account.needs_sign_in {
+                Some(CodexReason::SignInRequired)
+            } else if !account.binding.complete() {
+                Some(CodexReason::IdentityUnverified)
+            } else {
+                None
+            }
+        });
         reason.map_or_else(CodexCapability::allowed, CodexCapability::blocked)
     }
     pub fn snapshot(&self, busy: bool, now: i64) -> CodexSnapshot {
@@ -386,53 +592,38 @@ impl CodexEngine {
         result.error = self.error;
         result.availability = self.availability;
         result.blocked_reason = self.reason;
-        if self.demo {
-            result.executable_version = Some(SUPPORTED_CODEX_VERSION.into());
-            result.active_model = Some("demo-model".into());
-        }
         result.login = self.login_view.clone();
         result.selected_id = self.selected_id.clone();
+        result.switching = self.switching.clone();
+        result.last_switch = self.last_switch.clone();
+        result.environment = self.environment.clone();
+        if self.demo {
+            result.executable_version = Some(MIN_CODEX_VERSION.into());
+            result.active_model = Some("gpt-6".into());
+        }
         if let Some(installation) = &self.installation {
-            result.executable_version = Some(SUPPORTED_CODEX_VERSION.into());
+            result.executable_version = Some(installation.version.clone());
             result.active_model = installation.qualified.active_model.clone();
         }
-        let common = if self.demo || !self.writable {
-            Some(CodexReason::VaultUnavailable)
-        } else if self.installation.is_none() {
-            Some(self.reason.unwrap_or(CodexReason::NotInstalled))
-        } else {
-            None
-        };
+        if !self.demo && ContextPaths::credential_overrides_present() {
+            result.warnings.push(CodexReason::ExternalCredentials);
+        }
+        let common = self.common_block();
         let capability = |reason: Option<CodexReason>| {
             reason.map_or_else(CodexCapability::allowed, CodexCapability::blocked)
         };
         result.capabilities = CodexCapabilities {
-            login_browser: capability(
-                common.or(self
-                    .reconciling
-                    .then_some(CodexReason::ReconciliationRequired)),
-            ),
+            login_browser: capability(common),
             import_current: capability(common.or_else(|| self.store().err())),
-            refresh_quota: capability(common.or_else(|| {
-                match self
-                    .selected_id
-                    .as_ref()
-                    .and_then(|id| self.saved.accounts.iter().find(|a| &a.id == id))
-                {
-                    None => Some(CodexReason::IdentityUnverified),
-                    Some(account) if account.auth_kind != AuthKind::ManagedChatgpt => {
-                        Some(CodexReason::UnsupportedAuth)
-                    }
-                    Some(account) if !account.binding.complete() => {
-                        Some(CodexReason::IdentityUnverified)
-                    }
-                    Some(_) => None,
-                }
+            import_switcher: capability(common.or_else(|| {
+                (!self.switcher_available).then_some(CodexReason::SwitcherUnavailable)
             })),
-            manual_switch: capability(
+            refresh_quota: capability(common),
+            switch_account: capability(
                 common.or(self
-                    .reconciling
-                    .then_some(CodexReason::ReconciliationRequired)),
+                    .switching
+                    .is_some()
+                    .then_some(CodexReason::SwitchInProgress)),
             ),
             delete_saved: capability(
                 (!self.writable || self.demo).then_some(CodexReason::VaultUnavailable),
@@ -442,39 +633,54 @@ impl CodexEngine {
             .saved
             .accounts
             .iter()
-            .map(|account| CodexAccountView {
-                id: account.id.clone(),
-                provider: ProviderId::Codex,
-                name: account.name.clone(),
-                email: account.binding.email.clone(),
-                workspace_id: account.binding.workspace.clone(),
-                workspace_name: None,
-                auth_kind: match account.auth_kind {
-                    AuthKind::ManagedChatgpt => "chatgpt",
-                    AuthKind::ApiKey => "apiKey",
-                    AuthKind::Unsupported => "unsupported",
+            .map(|account| {
+                let plan_type = account
+                    .quota
+                    .as_ref()
+                    .and_then(|q| q.limits.iter().find(|l| l.key == "default"))
+                    .and_then(|l| l.plan_type.clone())
+                    .or_else(|| {
+                        OpaqueAuth::inspect(&account.auth)
+                            .ok()
+                            .and_then(|i| i.claims.plan_type)
+                    })
+                    .map(|plan| plan.to_ascii_lowercase());
+                CodexAccountView {
+                    id: account.id.clone(),
+                    provider: ProviderId::Codex,
+                    name: account.name.clone(),
+                    email: account.binding.email.clone(),
+                    workspace_id: account.binding.workspace.clone(),
+                    workspace_name: None,
+                    auth_kind: match account.auth_kind {
+                        AuthKind::ManagedChatgpt => "chatgpt",
+                        AuthKind::ApiKey => "apiKey",
+                        AuthKind::Unsupported => "unsupported",
+                    }
+                    .into(),
+                    plan_type,
+                    identity_evidence: account.evidence,
+                    identity_verified: self.verified_now.contains(&account.id),
+                    selected: self.selected_id.as_ref() == Some(&account.id),
+                    switchable: self.switch_capability(account),
+                    quota: account.quota.clone(),
+                    quota_read_at: account.quota_read_at,
+                    quota_state: if self.account_errors.contains_key(&account.id) {
+                        CodexQuotaState::Unavailable
+                    } else if account.quota.is_none() {
+                        CodexQuotaState::Unread
+                    } else if self.verified_now.contains(&account.id)
+                        && account
+                            .quota_read_at
+                            .is_some_and(|time| now >= time && now - time <= FRESH_SECONDS)
+                    {
+                        CodexQuotaState::Fresh
+                    } else {
+                        CodexQuotaState::Cached
+                    },
+                    error: self.account_errors.get(&account.id).copied(),
+                    needs_sign_in: account.needs_sign_in,
                 }
-                .into(),
-                identity_evidence: account.evidence,
-                identity_verified: self.verified_now.contains(&account.id),
-                selected: self.selected_id.as_ref() == Some(&account.id),
-                manual_switch: self.switch_capability(account),
-                quota: account.quota.clone(),
-                quota_read_at: account.quota_read_at,
-                quota_state: if self.account_errors.contains_key(&account.id) {
-                    CodexQuotaState::Unavailable
-                } else if account.quota.is_none() {
-                    CodexQuotaState::Unread
-                } else if self.verified_now.contains(&account.id)
-                    && account
-                        .quota_read_at
-                        .is_some_and(|time| now >= time && now - time <= 900)
-                {
-                    CodexQuotaState::Fresh
-                } else {
-                    CodexQuotaState::Cached
-                },
-                error: self.account_errors.get(&account.id).copied(),
             })
             .collect();
         result
@@ -491,6 +697,7 @@ impl CodexEngine {
         if result
             .as_ref()
             .is_err_and(|error| *error == CodexReason::VaultUnavailable)
+            && !self.demo
         {
             self.saved = checkpoint;
             self.selected_id = selected;
@@ -509,18 +716,12 @@ impl CodexEngine {
         if self.demo || !self.writable {
             return Err(CodexReason::VaultUnavailable);
         }
-        self.error = None;
-        if self
-            .preparation
-            .as_ref()
-            .is_some_and(|p| now >= p.view.expires_at)
-        {
-            self.preparation = None;
-            self.recover(vault)?;
+        if !matches!(command, CodexCommand::Observe | CodexCommand::PollLogin(_)) {
+            self.error = None;
         }
         match command {
             CodexCommand::Discover => {
-                if let Err(error) = self.discover(vault).await {
+                if let Err(error) = self.discover(vault, now).await {
                     self.reason = Some(error);
                     self.availability = if error == CodexReason::NotInstalled {
                         CodexAvailability::NotInstalled
@@ -540,53 +741,39 @@ impl CodexEngine {
                 self.cancel_login(&id).await?;
             }
             CodexCommand::ImportCurrent => {
-                self.import_current(vault)?;
+                self.import_current(vault, now)?;
             }
-            CodexCommand::Refresh(id) => {
-                if let Err(error) = self.refresh(&id, vault, now).await {
-                    self.account_errors.insert(id.clone(), error);
-                    self.verified_now.remove(&id);
-                    return Err(error);
-                }
+            CodexCommand::ImportSwitcher => {
+                self.import_switcher(vault, now)?;
             }
             CodexCommand::Delete(id) => {
-                if self.pending_login.is_some() || self.preparation.is_some() {
+                if self.pending_login.is_some() || self.switching.is_some() {
                     return Err(CodexReason::Busy);
                 }
                 let index = self.account_index(&id)?;
+                if self.selected_id.as_ref() == Some(&id) {
+                    // auth.json still holds it; Codex keeps using it until another switch.
+                    return Err(CodexReason::ActiveAccount);
+                }
                 self.saved.accounts.remove(index);
                 self.verified_now.remove(&id);
                 self.account_errors.remove(&id);
-                if self.selected_id.as_ref() == Some(&id) {
-                    self.selected_id = None;
-                    self.observed_generation = None;
-                }
                 self.save(vault)?;
             }
-            CodexCommand::Prepare(id) => {
-                return self.prepare(&id, vault, now).map(CodexOutput::Preparation);
-            }
-            CodexCommand::CancelPreparation(id) => {
-                if self.preparation.as_ref().is_some_and(|p| p.view.id == id) {
-                    self.preparation = None;
-                    self.recover(vault)?;
-                }
-            }
-            CodexCommand::Apply(id, acknowledgment) => {
-                self.apply(&id, acknowledgment, vault, now).await?;
+            CodexCommand::Observe => {
+                self.observe(vault, now)?;
             }
         }
         Ok(CodexOutput::Snapshot)
     }
-    async fn discover(&mut self, vault: &Vault) -> Result<(), CodexReason> {
-        if self.pending_login.is_some() {
+    async fn discover(&mut self, vault: &Vault, now: i64) -> Result<(), CodexReason> {
+        if self.pending_login.is_some() || self.switching.is_some() {
             return Err(CodexReason::Busy);
         }
-        self.preparation = None;
+        self.discovered_at = Some(now);
         self.installation = None;
         self.selected_id = None;
         self.observed_generation = None;
-        self.verified_now.clear();
         self.availability = CodexAvailability::Unqualified;
         let paths = ContextPaths::discover()?;
         let workspace = owned_home()?;
@@ -618,7 +805,8 @@ impl CodexEngine {
             return Err(last);
         };
         let executable_path = executable.native_path().to_owned();
-        let qualified = match paths.qualify(&executable_path, workspace.path()) {
+        let version = executable.version().to_owned();
+        let qualified = match paths.qualify(&executable_path, workspace.path(), &version) {
             Ok(value) => value,
             Err(error) => {
                 self.availability = CodexAvailability::Unsupported;
@@ -629,69 +817,187 @@ impl CodexEngine {
         self.installation = Some(Installation {
             executable: Some(executable),
             executable_path,
+            version,
             paths,
             workspace,
             qualified,
         });
         self.availability = CodexAvailability::Supported;
         self.reason = None;
-        self.reconciling = false;
-        self.recover(vault)?;
-        self.observe_current()?;
+        if let Ok(store) = self.store() {
+            // The 0.2.0 candidate's two-step journal is obsolete; its tokens are saved.
+            let _ = store.discard_legacy_journal(vault);
+        }
+        self.observe(vault, now)?;
         Ok(())
     }
-    fn recover(&mut self, vault: &Vault) -> Result<(), CodexReason> {
-        let store = match self.store() {
-            Ok(store) => store,
-            Err(CodexReason::UnsupportedStore) => return Ok(()),
-            Err(error) => return Err(error),
+    fn refresh_environment(&mut self) {
+        self.switcher_available = self.switcher.exists();
+        let Some(home) = self.installation.as_ref().map(|i| i.paths.home.clone()) else {
+            return;
         };
-        match store.recover(vault).map_err(store_reason) {
-            Ok(CodexRecovery::Clean | CodexRecovery::CanceledPreparation) => {
-                self.pending_switch = None;
-                self.reconciling = false;
-                self.external_reconciliation = false;
+        let summary = self.processes.scan(&home);
+        self.environment = CodexEnvironmentView {
+            daemon_running: Some(summary.daemon_running),
+            other_clients: summary.other_clients,
+            codex_switcher_running: summary.switcher_running,
+        };
+    }
+    /// Track the live auth.json: adopt Codex's token rotations into the saved record,
+    /// keep an external `codex login` as a new saved account, and repair a hybrid file.
+    pub(crate) fn observe(&mut self, vault: &Vault, now: i64) -> Result<(), CodexReason> {
+        if self.demo || !self.writable || self.switching.is_some() {
+            return Ok(());
+        }
+        self.refresh_environment();
+        let Ok(store) = self.store() else {
+            return Ok(());
+        };
+        let current = store.read().map_err(store_reason)?;
+        if self.observed_generation.as_ref() == Some(&current.generation) {
+            return Ok(());
+        }
+        let Some(bytes) = current.auth_bytes() else {
+            self.selected_id = None;
+            self.observed_generation = Some(current.generation);
+            return Ok(());
+        };
+        match OpaqueAuth::inspect(bytes) {
+            Ok(inspection) if inspection.hybrid => {
+                self.repair_hybrid(bytes, &current, &store, vault, now)?;
+                return Ok(());
             }
-            Ok(CodexRecovery::NeedsVerification(pending)) => {
-                self.pending_switch = Some(pending);
-                self.reconciling = true;
+            Ok(inspection) if inspection.kind != AuthKind::Unsupported => {
+                let auth = OpaqueAuth::parse(bytes.to_vec()).map_err(provider_reason)?;
+                let index = self.adopt_or_import(auth, CodexIdentityEvidence::ClaimsOnly, now)?;
+                self.selected_id = Some(self.saved.accounts[index].id.clone());
+                self.save(vault)?;
             }
-            Err(error) => {
-                self.reconciling = true;
-                self.reason = Some(CodexReason::ReconciliationRequired);
-                return Err(error);
+            _ => self.selected_id = None,
+        }
+        self.observed_generation = Some(current.generation);
+        Ok(())
+    }
+    /// Save `auth` into the matching account (a rotation of the same login) or add it
+    /// as a new account. Never drops a login PrimerSwitch has not seen before.
+    fn adopt_or_import(
+        &mut self,
+        auth: OpaqueAuth,
+        evidence: CodexIdentityEvidence,
+        _now: i64,
+    ) -> Result<usize, CodexReason> {
+        let binding = Binding::from_auth(&auth)?;
+        let existing = self.saved.accounts.iter().position(|a| {
+            a.auth_kind == auth.kind()
+                && (a.binding.same_owner(&binding) || a.auth == auth.as_bytes())
+        });
+        if let Some(index) = existing {
+            let account = &mut self.saved.accounts[index];
+            if account.auth != auth.as_bytes() {
+                account.auth.zeroize();
+                account.auth = auth.as_bytes().to_vec();
+                // A login that Codex just refreshed is valid again.
+                account.needs_sign_in = false;
+                self.account_errors.remove(&account.id.clone());
+            }
+            if evidence != CodexIdentityEvidence::ClaimsOnly {
+                account.evidence = evidence;
+            }
+            account.managed_origin |= evidence == CodexIdentityEvidence::ManagedLogin;
+            account.binding = binding;
+            return Ok(index);
+        }
+        if self.saved.accounts.len() >= 1000 {
+            return Err(CodexReason::StoreConflict);
+        }
+        let name = binding.email.clone().unwrap_or_else(|| {
+            if auth.kind() == AuthKind::ApiKey {
+                "Codex API key"
+            } else {
+                "Codex account"
+            }
+            .into()
+        });
+        self.saved.accounts.push(SavedAccount {
+            id: uuid::Uuid::new_v4().to_string(),
+            name,
+            auth: auth.as_bytes().to_vec(),
+            auth_kind: auth.kind(),
+            binding,
+            evidence,
+            managed_origin: evidence == CodexIdentityEvidence::ManagedLogin,
+            quota: None,
+            quota_read_at: None,
+            needs_sign_in: false,
+            last_attempt_at: None,
+        });
+        Ok(self.saved.accounts.len() - 1)
+    }
+    /// A Codex process that still held another account refreshed after the file was
+    /// switched: its `persist_tokens` merged that account's tokens into the current
+    /// file. Move them to their owner and restore the account the file is labelled for.
+    fn repair_hybrid(
+        &mut self,
+        bytes: &[u8],
+        current: &CodexAuthSnapshot,
+        store: &CodexFileStore,
+        vault: &Vault,
+        now: i64,
+    ) -> Result<(), CodexReason> {
+        let inspection = OpaqueAuth::inspect(bytes).map_err(provider_reason)?;
+        let owner = Binding {
+            user: inspection.claims.chatgpt_user_id.clone(),
+            workspace: inspection.claims.chatgpt_account_id.clone(),
+            email: inspection.claims.email.clone(),
+        };
+        if let Some(account) = self
+            .saved
+            .accounts
+            .iter_mut()
+            .find(|a| a.auth_kind == AuthKind::ManagedChatgpt && a.binding.same_owner(&owner))
+        {
+            if let Ok(merged) = merge_rotated_tokens(&account.auth, bytes) {
+                account.auth.zeroize();
+                account.auth = merged;
+                account.needs_sign_in = false;
+            }
+        } else if let Ok(fixed) = normalize_hybrid(bytes) {
+            let auth = OpaqueAuth::parse(fixed).map_err(provider_reason)?;
+            self.adopt_or_import(auth, CodexIdentityEvidence::ClaimsOnly, now)?;
+        }
+        let label = inspection.claims.token_account_id.clone();
+        let restore = self
+            .selected_id
+            .as_ref()
+            .and_then(|id| self.saved.accounts.iter().find(|a| &a.id == id))
+            .filter(|a| a.binding.workspace == label)
+            .or_else(|| {
+                self.saved.accounts.iter().find(|a| {
+                    a.auth_kind == AuthKind::ManagedChatgpt
+                        && label.is_some()
+                        && a.binding.workspace == label
+                })
+            })
+            .map(|a| (a.id.clone(), Zeroizing::new(a.auth.clone())));
+        self.save(vault)?;
+        match restore {
+            Some((id, auth)) => {
+                let written = store
+                    .replace(&auth, &current.generation, vault)
+                    .map_err(store_reason)?;
+                self.selected_id = Some(id);
+                self.observed_generation = Some(written.generation);
+            }
+            None => {
+                self.selected_id = None;
+                self.observed_generation = Some(current.generation.clone());
             }
         }
         Ok(())
     }
-    fn observe_current(&mut self) -> Result<(), CodexReason> {
-        let store = match self.store() {
-            Ok(store) => store,
-            Err(CodexReason::UnsupportedStore) => return Ok(()),
-            Err(error) => return Err(error),
-        };
-        let snapshot = store.read().map_err(store_reason)?;
-        let Some(bytes) = snapshot.auth_bytes() else {
-            self.selected_id = None;
-            self.observed_generation = Some(snapshot.generation);
-            return Ok(());
-        };
-        let auth = OpaqueAuth::parse(bytes.to_vec()).map_err(provider_reason)?;
-        let binding = Binding::from_auth(&auth)?;
-        self.selected_id = self
-            .saved
-            .accounts
-            .iter()
-            .find(|a| {
-                a.auth_kind == auth.kind() && (a.binding.same_owner(&binding) || a.auth == bytes)
-            })
-            .map(|a| a.id.clone());
-        self.observed_generation = Some(snapshot.generation);
-        Ok(())
-    }
     async fn begin_login(&mut self, intent: u64) -> Result<CodexLoginLaunch, CodexReason> {
         self.ready()?;
-        if self.preparation.is_some() || self.pending_login.is_some() {
+        if self.pending_login.is_some() || self.switching.is_some() {
             return Err(CodexReason::Busy);
         }
         self.requalify()?;
@@ -704,7 +1010,7 @@ impl CodexEngine {
             .ok_or(CodexReason::NotInstalled)?;
         let mut client = self
             .factory
-            .start(installation.executable.as_ref(), context, true)
+            .start(installation.executable.as_ref(), context, ClientRole::Login)
             .await
             .map_err(provider_reason)?;
         let result = async {
@@ -833,19 +1139,12 @@ impl CodexEngine {
             if initial.kind() != AuthKind::ManagedChatgpt || !binding.complete() {
                 return Err(CodexReason::IdentityUnverified);
             }
-            let inspection = pending
-                .client
-                .inspect_configuration()
-                .await
-                .map_err(provider_reason)?;
-            validate_inspection(&inspection)?;
-            let quota = pending.client.read_rate_limits().await.ok();
-            Ok((binding, quota))
+            Ok(binding)
         }
         .await;
         let shutdown = pending.client.shutdown().await.map_err(provider_reason);
         let complete = (|| {
-            let (initial_binding, quota) = result?;
+            let initial_binding = result?;
             shutdown?;
             if self.intent.load(Ordering::Acquire) != pending.intent {
                 return Err(CodexReason::LoginCanceled);
@@ -858,51 +1157,16 @@ impl CodexEngine {
             if auth.kind() != AuthKind::ManagedChatgpt || !initial_binding.same_owner(&binding) {
                 return Err(CodexReason::IdentityMismatch);
             }
-            let installation = self
-                .installation
-                .as_ref()
-                .ok_or(CodexReason::NotInstalled)?;
-            let paths = ContextPaths {
-                home: pending.home.path().to_owned(),
-                system_config: installation.paths.system_config.clone(),
-                system_requirements: installation.paths.system_requirements.clone(),
-                legacy_requirements: if cfg!(windows) {
-                    pending.home.path().join("managed_config.toml")
-                } else {
-                    installation.paths.legacy_requirements.clone()
-                },
-                enforce_native_policy: false,
-                #[cfg(test)]
-                project_ancestor_stop: Some(pending.home.path().to_owned()),
-            };
-            paths.qualify(&installation.executable_path, pending.home.path())?;
-            let verified_quota = match quota {
-                Some(quota)
-                    if quota.account_id.as_ref() == binding.workspace.as_ref()
-                        && quota.ordinary_usage_allowed.is_some() =>
-                {
-                    Some(quota_view(&quota)?)
-                }
-                Some(quota)
-                    if quota.account_id.is_some()
-                        && quota.account_id.as_ref() != binding.workspace.as_ref() =>
-                {
-                    return Err(CodexReason::IdentityMismatch);
-                }
-                _ => None,
-            };
-            let index = self.upsert(auth, CodexIdentityEvidence::ManagedLogin, true)?;
+            let index = self.adopt_or_import(auth, CodexIdentityEvidence::ManagedLogin, now)?;
             let account = &mut self.saved.accounts[index];
-            if let Some(quota) = verified_quota {
-                account.quota = Some(quota);
-                account.quota_read_at = Some(now);
-                account.evidence = CodexIdentityEvidence::BackendVerified;
-                self.verified_now.insert(account.id.clone());
-            }
-            self.account_errors.remove(&account.id);
+            account.needs_sign_in = false;
+            let account_id = account.id.clone();
+            self.account_errors.remove(&account_id);
             self.save(vault)?;
+            self.last_login_account = Some(account_id);
             Ok(())
         })();
+        scrub_owned_home(pending.home);
         match complete {
             Ok(()) => {
                 self.login_view = Some(CodexLoginView {
@@ -922,262 +1186,309 @@ impl CodexEngine {
             }
         }
     }
-    fn import_current(&mut self, vault: &Vault) -> Result<(), CodexReason> {
-        if self.pending_login.is_some() || self.preparation.is_some() {
+    fn import_current(&mut self, vault: &Vault, now: i64) -> Result<(), CodexReason> {
+        if self.pending_login.is_some() || self.switching.is_some() {
             return Err(CodexReason::Busy);
         }
+        self.ready()?;
         self.requalify()?;
-        match self.recover(vault) {
-            Ok(()) => (),
-            Err(CodexReason::ExternalChange) => {
-                // Explicit import adopts only the current login into encrypted storage.
-                // Keep the authentic conflicting journal until a subsequent active
-                // backend read corroborates the imported owner and durable rotation.
-                self.external_reconciliation = true;
-                self.pending_switch = None;
-                self.reconciling = true;
-                self.reason = Some(CodexReason::ReconciliationRequired);
-            }
-            Err(error) => return Err(error),
-        }
         let store = self.store()?;
-        store.check_quiescent().map_err(store_reason)?;
-        let snapshot = store.read().map_err(store_reason)?;
-        let auth = OpaqueAuth::parse(
-            snapshot
-                .auth_bytes()
-                .ok_or(CodexReason::UnsupportedAuth)?
-                .to_vec(),
-        )
-        .map_err(provider_reason)?;
-        if auth.kind() == AuthKind::Unsupported {
+        let current = store.read().map_err(store_reason)?;
+        let bytes = current.auth_bytes().ok_or(CodexReason::UnsupportedAuth)?;
+        let inspection = OpaqueAuth::inspect(bytes).map_err(provider_reason)?;
+        if inspection.hybrid {
+            return self.repair_hybrid(bytes, &current, &store, vault, now);
+        }
+        if inspection.kind == AuthKind::Unsupported {
             return Err(CodexReason::UnsupportedAuth);
         }
-        let index = self.upsert(auth, CodexIdentityEvidence::ClaimsOnly, false)?;
+        let auth = OpaqueAuth::parse(bytes.to_vec()).map_err(provider_reason)?;
+        let index = self.adopt_or_import(auth, CodexIdentityEvidence::ClaimsOnly, now)?;
         self.save(vault)?;
-        store.check_quiescent().map_err(store_reason)?;
-        if store.read().map_err(store_reason)?.generation != snapshot.generation {
-            return Err(CodexReason::ExternalChange);
-        }
         self.selected_id = Some(self.saved.accounts[index].id.clone());
-        self.observed_generation = Some(snapshot.generation);
+        self.observed_generation = Some(current.generation);
         Ok(())
     }
-    fn upsert(
-        &mut self,
-        auth: OpaqueAuth,
-        evidence: CodexIdentityEvidence,
-        managed: bool,
-    ) -> Result<usize, CodexReason> {
-        let binding = Binding::from_auth(&auth)?;
-        let existing = self.saved.accounts.iter().position(|a| {
-            a.auth_kind == auth.kind()
-                && (a.binding.same_owner(&binding) || a.auth == auth.as_bytes())
-        });
-        if let Some(index) = existing {
-            let account = &mut self.saved.accounts[index];
-            let same_bytes = account.auth == auth.as_bytes();
-            account.auth.zeroize();
-            account.auth = auth.as_bytes().to_vec();
-            if !same_bytes && evidence == CodexIdentityEvidence::ClaimsOnly {
-                account.evidence = CodexIdentityEvidence::ClaimsOnly;
-                self.verified_now.remove(&account.id);
-            }
-            if evidence != CodexIdentityEvidence::ClaimsOnly {
-                account.evidence = evidence;
-            }
-            account.managed_origin |= managed;
-            account.binding = binding;
-            return Ok(index);
-        }
-        let name = binding.email.clone().unwrap_or_else(|| {
-            if auth.kind() == AuthKind::ApiKey {
-                "Codex API key"
-            } else {
-                "Codex account"
-            }
-            .into()
-        });
-        self.saved.accounts.push(SavedAccount {
-            id: uuid::Uuid::new_v4().to_string(),
-            name,
-            auth: auth.as_bytes().to_vec(),
-            auth_kind: auth.kind(),
-            binding,
-            evidence,
-            managed_origin: managed,
-            quota: None,
-            quota_read_at: None,
-        });
-        Ok(self.saved.accounts.len() - 1)
-    }
-    async fn refresh(&mut self, id: &str, vault: &Vault, now: i64) -> Result<(), CodexReason> {
-        if self.pending_login.is_some() || self.preparation.is_some() {
+    /// Import every account saved by lampese "Codex Switcher". For an account that is
+    /// already saved here, the copy whose id_token was issued later wins.
+    fn import_switcher(&mut self, vault: &Vault, now: i64) -> Result<(), CodexReason> {
+        if self.pending_login.is_some() || self.switching.is_some() {
             return Err(CodexReason::Busy);
         }
-        if self.selected_id.as_deref() != Some(id) {
-            return Err(CodexReason::IdentityUnverified);
+        self.ready()?;
+        let bytes = self.switcher.read()?;
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|_| CodexReason::SwitcherUnavailable)?;
+        let stamp = chrono::DateTime::<chrono::Utc>::from_timestamp(now, 0)
+            .unwrap_or_default()
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let mut imported = 0usize;
+        let result = (|| {
+            let accounts = value["accounts"]
+                .as_array()
+                .ok_or(CodexReason::SwitcherUnavailable)?;
+            for item in accounts.iter().take(500) {
+                let data = &item["auth_data"];
+                let text = |key: &str| data[key].as_str().filter(|v| !v.is_empty());
+                let payload = match data["type"].as_str() {
+                    Some("chat_g_p_t" | "chatgpt" | "chat_gpt") => {
+                        match (
+                            text("id_token"),
+                            text("access_token"),
+                            text("refresh_token"),
+                        ) {
+                            (Some(id), Some(access), Some(refresh)) => chatgpt_auth_payload(
+                                id,
+                                access,
+                                refresh,
+                                text("account_id"),
+                                &stamp,
+                            ),
+                            _ => continue,
+                        }
+                    }
+                    Some("api_key") => match text("key") {
+                        Some(key) => api_key_auth_payload(key),
+                        None => continue,
+                    },
+                    _ => continue,
+                };
+                let Ok(auth) = payload.and_then(OpaqueAuth::parse) else {
+                    continue;
+                };
+                if self.import_record(auth, item["name"].as_str(), now)? {
+                    imported += 1;
+                }
+            }
+            Ok(())
+        })();
+        wipe_json(&mut value);
+        result?;
+        if imported == 0 && self.saved.accounts.is_empty() {
+            return Err(CodexReason::SwitcherUnavailable);
         }
-        self.verify_active(id, vault, now).await
+        self.save(vault)
     }
-    async fn verify_active(
+    fn import_record(
+        &mut self,
+        auth: OpaqueAuth,
+        name: Option<&str>,
+        now: i64,
+    ) -> Result<bool, CodexReason> {
+        let binding = Binding::from_auth(&auth)?;
+        let issued = auth.routing_claims().issued_at;
+        if let Some(account) = self.saved.accounts.iter_mut().find(|a| {
+            a.auth_kind == auth.kind()
+                && (a.binding.same_owner(&binding) || a.auth == auth.as_bytes())
+        }) {
+            let saved_issued = OpaqueAuth::inspect(&account.auth)
+                .ok()
+                .and_then(|i| i.claims.issued_at);
+            let is_active = self.selected_id.as_deref() == Some(&account.id);
+            if !is_active && issued.is_some() && issued > saved_issued {
+                account.auth.zeroize();
+                account.auth = auth.as_bytes().to_vec();
+                account.needs_sign_in = false;
+            }
+            return Ok(false);
+        }
+        let index = self.adopt_or_import(auth, CodexIdentityEvidence::ClaimsOnly, now)?;
+        if let Some(name) = name.and_then(safe_text).filter(|n| n.len() <= 120) {
+            self.saved.accounts[index].name = name;
+        }
+        Ok(true)
+    }
+
+    /// Choose the next background reading: the active account first, then the inactive
+    /// account with the oldest reading or a window that has reset since it was read.
+    pub(crate) fn due_quota(&self, now: i64) -> Option<String> {
+        if self.common_block().is_some() || self.switching.is_some() {
+            return None;
+        }
+        let eligible = |a: &&SavedAccount| {
+            a.auth_kind == AuthKind::ManagedChatgpt
+                && !a.needs_sign_in
+                && a.last_attempt_at
+                    .is_none_or(|t| now < t || now - t >= ERROR_RETRY.min(ACTIVE_QUOTA_INTERVAL))
+        };
+        if let Some(active) = self
+            .selected_id
+            .as_ref()
+            .and_then(|id| self.saved.accounts.iter().find(|a| &a.id == id))
+            .filter(eligible)
+            && active
+                .quota_read_at
+                .is_none_or(|t| now < t || now - t >= ACTIVE_QUOTA_INTERVAL)
+        {
+            return Some(active.id.clone());
+        }
+        self.saved
+            .accounts
+            .iter()
+            .filter(|a| self.selected_id.as_ref() != Some(&a.id))
+            .filter(eligible)
+            .filter(|a| {
+                a.last_attempt_at
+                    .is_none_or(|t| now < t || now - t >= ERROR_RETRY)
+                    && (a
+                        .quota_read_at
+                        .is_none_or(|t| now < t || now - t >= INACTIVE_QUOTA_INTERVAL)
+                        || reset_passed(a, now))
+            })
+            .min_by_key(|a| a.quota_read_at.unwrap_or(i64::MIN))
+            .map(|a| a.id.clone())
+    }
+    /// Prepare a quota reading. `manual` readings ignore back-off and token-expiry margins.
+    pub(crate) fn plan_quota(
         &mut self,
         id: &str,
-        vault: &Vault,
         now: i64,
-    ) -> Result<(), CodexReason> {
-        self.requalify()?;
+        manual: bool,
+    ) -> Result<QuotaJob, CodexReason> {
+        self.ready()?;
+        if self.switching.is_some() {
+            return Err(CodexReason::SwitchInProgress);
+        }
         let index = self.account_index(id)?;
-        let binding = self.saved.accounts[index].binding.clone();
-        if self.saved.accounts[index].auth_kind != AuthKind::ManagedChatgpt || !binding.complete() {
+        if self.saved.accounts[index].auth_kind != AuthKind::ManagedChatgpt {
             return Err(CodexReason::UnsupportedAuth);
         }
-        let store = self.store()?;
-        store.check_quiescent().map_err(store_reason)?;
-        let before = store.read().map_err(store_reason)?;
-        if self
-            .observed_generation
-            .as_ref()
-            .is_some_and(|generation| generation != &before.generation)
-        {
-            self.verified_now.remove(id);
-            self.selected_id = None;
-            return Err(CodexReason::ExternalChange);
-        }
-        let auth = OpaqueAuth::parse(
-            before
-                .auth_bytes()
-                .ok_or(CodexReason::UnsupportedAuth)?
-                .to_vec(),
-        )
-        .map_err(provider_reason)?;
-        if !binding.same_owner(&Binding::from_auth(&auth)?) {
-            self.selected_id = None;
-            return Err(CodexReason::IdentityMismatch);
-        }
+        let binding = self.saved.accounts[index].binding.clone();
         let installation = self
             .installation
             .as_ref()
             .ok_or(CodexReason::NotInstalled)?;
-        let context = CodexContext::approved_file(
-            store.context().home().to_owned(),
-            installation.workspace.path().to_owned(),
-        )
-        .map_err(provider_reason)?;
-        let mut client = self
-            .factory
-            .start(installation.executable.as_ref(), context, false)
-            .await
-            .map_err(provider_reason)?;
-        let result = async {
-            let account = client.read_account().await.map_err(provider_reason)?;
-            if !matches!(account.account, Some(CodexAccount::Chatgpt { .. })) {
-                return Err(CodexReason::UnsupportedAuth);
+        let executable = installation.executable.clone();
+        let target = if self.selected_id.as_deref() == Some(id) {
+            let store = self.store()?;
+            let current = store.read().map_err(store_reason)?;
+            let bytes = current.auth_bytes().ok_or(CodexReason::ExternalChange)?;
+            let live = OpaqueAuth::parse(bytes.to_vec()).map_err(provider_reason)?;
+            if !Binding::from_auth(&live)?.same_owner(&binding) {
+                return Err(CodexReason::ExternalChange);
             }
-            let inspection = client
-                .inspect_configuration()
-                .await
-                .map_err(provider_reason)?;
-            let model = validate_inspection(&inspection)?;
-            let quota = client.read_rate_limits().await.map_err(provider_reason)?;
-            if quota.account_id.as_ref() != binding.workspace.as_ref()
-                || quota.ordinary_usage_allowed.is_none()
+            if !manual
+                && live
+                    .routing_claims()
+                    .access_expires_at
+                    .is_some_and(|exp| exp - now < ACTIVE_EXPIRY_MARGIN)
             {
-                return Err(CodexReason::IdentityMismatch);
+                // Codex refreshes this token within the next minute; read afterwards.
+                return Err(CodexReason::Busy);
             }
-            Ok((quota_view(&quota)?, model))
-        }
-        .await;
-        let shutdown = client.shutdown().await.map_err(provider_reason);
-        // Preserve owned rotation after every provider result, before completing a journal.
-        self.requalify()?;
-        let current_store = self.store()?;
-        current_store.check_quiescent().map_err(store_reason)?;
-        let after = current_store.read().map_err(store_reason)?;
-        let fresh = OpaqueAuth::parse(
-            after
-                .auth_bytes()
-                .ok_or(CodexReason::UnsupportedAuth)?
-                .to_vec(),
-        )
-        .map_err(provider_reason)?;
-        if fresh.kind() != AuthKind::ManagedChatgpt
-            || !binding.same_owner(&Binding::from_auth(&fresh)?)
-        {
-            self.verified_now.remove(id);
-            self.reconciling = self.pending_switch.is_some();
-            self.selected_id = None;
-            self.observed_generation = None;
-            return Err(CodexReason::IdentityMismatch);
-        }
-        let account = &mut self.saved.accounts[index];
-        account.auth.zeroize();
-        account.auth = fresh.as_bytes().to_vec();
-        let result = result.and_then(|value| shutdown.map(|_| value));
-        if let Ok((quota, model)) = &result {
-            account.quota = Some(quota.clone());
-            account.quota_read_at = Some(now);
-            account.evidence = CodexIdentityEvidence::BackendVerified;
-            self.verified_now.insert(id.into());
-            self.account_errors.remove(id);
-            if let Some(installation) = &mut self.installation {
-                installation.qualified.active_model = model.clone();
-            }
+            QuotaTarget::Active(
+                CodexContext::approved_file(
+                    store.context().home().to_owned(),
+                    installation.workspace.path().to_owned(),
+                )
+                .map_err(provider_reason)?,
+            )
         } else {
-            self.verified_now.remove(id);
+            let original = Zeroizing::new(self.saved.accounts[index].auth.clone());
+            let home = owned_home()?;
+            write_private_auth(home.path(), &original).map_err(store_reason)?;
+            let context = CodexContext::owned(home.path().to_owned(), home.path().to_owned())
+                .map_err(provider_reason)?;
+            QuotaTarget::Owned {
+                home,
+                context,
+                original,
+            }
+        };
+        self.saved.accounts[index].last_attempt_at = Some(now);
+        Ok(QuotaJob {
+            account_id: id.into(),
+            binding,
+            executable,
+            factory: self.factory.clone(),
+            target,
+        })
+    }
+    pub(crate) fn finish_quota(
+        &mut self,
+        report: QuotaReport,
+        vault: &Vault,
+        now: i64,
+    ) -> Result<(), CodexReason> {
+        let Ok(index) = self.account_index(&report.account_id) else {
+            return Ok(());
+        };
+        if let Some(OwnedResult {
+            original,
+            rotated: Some(rotated),
+        }) = &report.owned
+            && rotated.as_slice() != original.as_slice()
+            && self.saved.accounts[index].auth == original.as_slice()
+            && let Ok(auth) = OpaqueAuth::parse(rotated.to_vec())
+            && Binding::from_auth(&auth).is_ok_and(|b| b.same_owner(&report.binding))
+        {
+            let account = &mut self.saved.accounts[index];
+            account.auth.zeroize();
+            account.auth = auth.as_bytes().to_vec();
         }
-        self.save(vault)?;
-        if current_store.read().map_err(store_reason)?.generation != after.generation {
-            return Err(CodexReason::ExternalChange);
-        }
-        self.observed_generation = Some(after.generation.clone());
-        match result {
-            Ok(_) => {
-                if self.external_reconciliation {
-                    current_store
-                        .reconcile_verified_current(&after.generation, vault)
-                        .map_err(store_reason)?;
-                    self.external_reconciliation = false;
-                    self.reconciling = false;
-                    self.reason = None;
-                } else if let Some(pending) = &self.pending_switch {
-                    current_store
-                        .finish_verified(pending, &after.generation, vault)
-                        .map_err(store_reason)?;
-                    self.pending_switch = None;
-                    self.reconciling = false;
-                    self.external_reconciliation = false;
-                    self.reason = None;
+        let id = report.account_id.clone();
+        match report.outcome {
+            Ok(limits)
+                if limits.account_id.is_some() && limits.account_id != report.binding.workspace =>
+            {
+                self.verified_now.remove(&id);
+                self.account_errors
+                    .insert(id, CodexReason::IdentityMismatch);
+            }
+            Ok(limits) => match quota_view(&limits) {
+                Ok(view) => {
+                    let account = &mut self.saved.accounts[index];
+                    account.quota = Some(view);
+                    account.quota_read_at = Some(now);
+                    account.needs_sign_in = false;
+                    account.evidence = CodexIdentityEvidence::BackendVerified;
+                    self.verified_now.insert(id.clone());
+                    self.account_errors.remove(&id);
                 }
-                Ok(())
+                Err(error) => {
+                    self.account_errors.insert(id, error);
+                }
+            },
+            Err(CodexError::AuthRequired) => {
+                self.saved.accounts[index].needs_sign_in = true;
+                self.verified_now.remove(&id);
+                self.account_errors.insert(id, CodexReason::SignInRequired);
             }
             Err(error) => {
-                self.account_errors.insert(id.into(), error);
-                Err(error)
+                self.account_errors.insert(id, provider_reason(error));
             }
         }
+        self.save(vault)?;
+        // An active reading may have let Codex rotate auth.json; adopt it now.
+        self.observe(vault, now)
     }
-    fn prepare(
+
+    /// First, locked half of a switch: keep the outgoing login, write the selected one.
+    /// Returns None when the account is already active.
+    pub(crate) fn begin_switch(
         &mut self,
         id: &str,
         vault: &Vault,
         now: i64,
-    ) -> Result<CodexPreparationView, CodexReason> {
+    ) -> Result<Option<SwitchJob>, CodexReason> {
         self.ready()?;
+        if self.switching.is_some() {
+            return Err(CodexReason::SwitchInProgress);
+        }
         if self.pending_login.is_some() {
             return Err(CodexReason::Busy);
         }
-        if self.preparation.take().is_some() {
-            self.recover(vault)?;
-        }
+        self.requalify()?;
         let index = self.account_index(id)?;
+        if self.selected_id.as_deref() == Some(id) {
+            return Ok(None);
+        }
         let capability = self.switch_capability(&self.saved.accounts[index]);
         if !capability.enabled {
             return Err(capability
                 .blocked_reason
                 .unwrap_or(CodexReason::IdentityUnverified));
         }
-        self.requalify()?;
         if self.store().is_err() {
             let home = self
                 .installation
@@ -1186,84 +1497,183 @@ impl CodexEngine {
                 .paths
                 .home
                 .clone();
+            if home.exists() {
+                return Err(CodexReason::UnsupportedStore);
+            }
             create_private_context(home).map_err(store_reason)?;
-            // Creating the target directory is explicit preparation; recapture its absent source receipts.
-            let installation = self
-                .installation
-                .as_mut()
-                .ok_or(CodexReason::NotInstalled)?;
-            installation.qualified = installation
-                .paths
-                .qualify(&installation.executable_path, installation.workspace.path())?;
+            self.requalify()?;
         }
         let store = self.store()?;
-        store.check_quiescent().map_err(store_reason)?;
-        let snapshot = store.read().map_err(store_reason)?;
-        if let Some(bytes) = snapshot.auth_bytes() {
-            let outgoing = OpaqueAuth::parse(bytes.to_vec()).map_err(provider_reason)?;
-            let binding = Binding::from_auth(&outgoing)?;
-            if let Some(account) = self
-                .saved
-                .accounts
-                .iter_mut()
-                .find(|a| a.binding.same_owner(&binding))
-            {
-                // Adopt the current outgoing rotation rather than replaying an old encrypted copy later.
-                account.auth.zeroize();
-                account.auth = bytes.to_vec();
-                self.save(vault)?;
+        let mut attempts = 0;
+        let written = loop {
+            attempts += 1;
+            let current = store.read().map_err(store_reason)?;
+            if let Some(bytes) = current.auth_bytes() {
+                self.preserve_outgoing(bytes, now)?;
             }
-        }
-        let receipt = store
-            .prepare_switch(
-                &self.saved.accounts[index].auth,
-                &snapshot.generation,
-                vault,
-            )
-            .map_err(store_reason)?;
-        let view = CodexPreparationView {
-            id: uuid::Uuid::new_v4().to_string(),
-            account_id: id.into(),
-            expires_at: now + PREPARATION_TTL,
+            self.save(vault)?;
+            let incoming =
+                Zeroizing::new(self.saved.accounts[self.account_index(id)?].auth.clone());
+            match store.replace(&incoming, &current.generation, vault) {
+                Ok(snapshot) => break snapshot,
+                // Codex refreshed the outgoing token meanwhile: keep it and try again.
+                Err(CodexStoreError::ExternalChange) if attempts < 4 => continue,
+                Err(error) => return Err(store_reason(error)),
+            }
         };
-        self.preparation = Some(Preparation {
-            view: view.clone(),
-            receipt,
+        self.selected_id = Some(id.into());
+        self.observed_generation = Some(written.generation);
+        self.last_switch = None;
+        self.switching = Some(CodexSwitchView {
+            target_id: id.into(),
+            stage: CodexSwitchStage::Restarting,
+            started_at: now,
         });
-        Ok(view)
+        Ok(Some(SwitchJob {
+            target_id: id.into(),
+            executable: self
+                .installation
+                .as_ref()
+                .and_then(|i| i.executable.clone()),
+            daemon: self.daemon.clone(),
+        }))
     }
-    async fn apply(
+    /// Keep the login that is about to be replaced: a rotation of a saved account, an
+    /// unknown login (saved as a new account), or a hybrid left by an old process.
+    fn preserve_outgoing(&mut self, bytes: &[u8], now: i64) -> Result<(), CodexReason> {
+        let inspection = OpaqueAuth::inspect(bytes).map_err(|_| CodexReason::UnsupportedAuth)?;
+        if inspection.hybrid {
+            let owner = Binding {
+                user: inspection.claims.chatgpt_user_id.clone(),
+                workspace: inspection.claims.chatgpt_account_id.clone(),
+                email: inspection.claims.email.clone(),
+            };
+            if let Some(account) =
+                self.saved.accounts.iter_mut().find(|a| {
+                    a.auth_kind == AuthKind::ManagedChatgpt && a.binding.same_owner(&owner)
+                })
+            {
+                if let Ok(merged) = merge_rotated_tokens(&account.auth, bytes) {
+                    account.auth.zeroize();
+                    account.auth = merged;
+                }
+            } else {
+                let fixed = normalize_hybrid(bytes).map_err(provider_reason)?;
+                let auth = OpaqueAuth::parse(fixed).map_err(provider_reason)?;
+                self.adopt_or_import(auth, CodexIdentityEvidence::ClaimsOnly, now)?;
+            }
+            return Ok(());
+        }
+        if inspection.kind == AuthKind::Unsupported {
+            // Agent identity, personal access token or Bedrock: never overwrite it.
+            return Err(CodexReason::UnsupportedAuth);
+        }
+        let auth = OpaqueAuth::parse(bytes.to_vec()).map_err(provider_reason)?;
+        self.adopt_or_import(auth, CodexIdentityEvidence::ClaimsOnly, now)?;
+        Ok(())
+    }
+    pub(crate) fn set_switch_stage(&mut self, stage: CodexSwitchStage) {
+        if let Some(switching) = &mut self.switching {
+            switching.stage = stage;
+        }
+    }
+    /// Last, locked half of a switch. Returns true when an old process rewrote the
+    /// file during the drain and the daemon must be restarted once more.
+    pub(crate) fn finish_switch(
         &mut self,
-        id: &str,
-        acknowledgment: bool,
+        job: &SwitchJob,
+        outcome: &SwitchOutcome,
         vault: &Vault,
         now: i64,
-    ) -> Result<(), CodexReason> {
-        if !acknowledgment {
-            return Err(CodexReason::InvalidPreparation);
+        allow_repair: bool,
+    ) -> Result<bool, CodexReason> {
+        self.set_switch_stage(CodexSwitchStage::Verifying);
+        let mut repaired = false;
+        if let Ok(store) = self.store()
+            && let Ok(current) = store.read()
+            && Some(&current.generation) != self.observed_generation.as_ref()
+        {
+            match current.auth_bytes().map(OpaqueAuth::inspect) {
+                Some(Ok(inspection)) if inspection.hybrid => {
+                    let bytes = Zeroizing::new(current.auth_bytes().unwrap_or_default().to_vec());
+                    self.switching = None;
+                    self.repair_hybrid(&bytes, &current, &store, vault, now)?;
+                    repaired = true;
+                }
+                Some(Ok(inspection)) if inspection.kind != AuthKind::Unsupported => {
+                    // The new daemon refreshed the selected login (or someone ran
+                    // `codex login`): keep it and follow it.
+                    if let Some(bytes) = current.auth_bytes()
+                        && let Ok(auth) = OpaqueAuth::parse(bytes.to_vec())
+                    {
+                        let index =
+                            self.adopt_or_import(auth, CodexIdentityEvidence::ClaimsOnly, now)?;
+                        self.selected_id = Some(self.saved.accounts[index].id.clone());
+                    }
+                    self.observed_generation = Some(current.generation);
+                }
+                _ => (),
+            }
         }
-        if self.preparation.as_ref().is_none_or(|p| p.view.id != id) {
-            return Err(CodexReason::InvalidPreparation);
+        if repaired && allow_repair && outcome.daemon_running {
+            self.switching = Some(CodexSwitchView {
+                target_id: job.target_id.clone(),
+                stage: CodexSwitchStage::Restarting,
+                started_at: now,
+            });
+            return Ok(true);
         }
-        let preparation = self
-            .preparation
-            .take()
-            .ok_or(CodexReason::InvalidPreparation)?;
-        if now >= preparation.view.expires_at {
-            self.recover(vault)?;
-            return Err(CodexReason::InvalidPreparation);
-        }
-        let account_id = preparation.view.account_id;
-        let receipt = preparation.receipt;
-        self.requalify()?;
-        let store = self.store()?;
-        self.reconciling = true;
-        let pending = store.commit_file(&receipt, vault).map_err(store_reason)?;
-        self.pending_switch = Some(pending.clone());
-        self.preparation = None;
-        self.selected_id = Some(account_id.clone());
-        self.observed_generation = Some(pending.generation);
-        self.verify_active(&account_id, vault, now).await
+        self.refresh_environment();
+        let restarted = outcome.daemon_running && matches!(outcome.restart, Some(Ok(())));
+        self.last_switch = Some(CodexLastSwitchView {
+            account_id: job.target_id.clone(),
+            at: now,
+            daemon_restarted: restarted,
+            other_clients: self.environment.other_clients,
+            error: matches!(outcome.restart, Some(Err(_)))
+                .then_some(CodexReason::DaemonRestartFailed),
+        });
+        self.switching = None;
+        self.save(vault)?;
+        Ok(false)
+    }
+    /// A switch whose locked first half succeeded must never stay "in progress".
+    pub(crate) fn abort_switch(&mut self) {
+        self.switching = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_seams(
+        mut self,
+        factory: Arc<dyn ClientFactory>,
+        daemon: Arc<dyn DaemonControl>,
+        processes: Arc<dyn ProcessInventory>,
+        switcher: Arc<dyn SwitcherSource>,
+    ) -> Self {
+        self.factory = factory;
+        self.daemon = daemon;
+        self.processes = processes;
+        self.switcher = switcher;
+        self
+    }
+}
+fn reset_passed(account: &SavedAccount, now: i64) -> bool {
+    let (Some(quota), Some(read)) = (&account.quota, account.quota_read_at) else {
+        return false;
+    };
+    quota.limits.iter().any(|limit| {
+        [&limit.primary, &limit.secondary]
+            .into_iter()
+            .flatten()
+            .any(|w| w.used_percent > 0 && w.resets_at.is_some_and(|r| r > read && r <= now))
+    })
+}
+fn wipe_json(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => text.zeroize(),
+        serde_json::Value::Array(items) => items.iter_mut().for_each(wipe_json),
+        serde_json::Value::Object(items) => items.values_mut().for_each(wipe_json),
+        _ => (),
     }
 }
 fn valid_saved(saved: &Saved) -> bool {
@@ -1308,6 +1718,8 @@ pub(crate) fn provider_reason(error: CodexError) -> CodexReason {
         CodexError::Cancelled => CodexReason::LoginCanceled,
         CodexError::UnsupportedAuthMode => CodexReason::UnsupportedAuth,
         CodexError::IdentityMismatch => CodexReason::IdentityMismatch,
+        CodexError::AuthRequired => CodexReason::SignInRequired,
+        CodexError::DaemonUnavailable => CodexReason::DaemonRestartFailed,
         _ => CodexReason::ProviderUnavailable,
     }
 }
@@ -1358,6 +1770,10 @@ fn quota_view(quota: &CodexRateLimits) -> Result<CodexQuotaView, CodexReason> {
             return Err(CodexReason::ProviderUnavailable);
         }
         for (key, bucket) in buckets {
+            // The default bucket is usually repeated under its own limit id.
+            if Some(key.as_str()) == quota.rate_limits.limit_id.as_deref() {
+                continue;
+            }
             let key = format!("bucket:{key}");
             add(&key, bucket)?;
         }

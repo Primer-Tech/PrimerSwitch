@@ -168,3 +168,61 @@ fn malformed_known_requirement_values_fail_closed() {
         assert!(validate_inspection(&inspection(pinned_config(), requirements)).is_err());
     }
 }
+
+#[test]
+fn user_config_blocks_only_settings_that_defeat_a_switch() {
+    let check = |text: &str| validate_config(&toml::from_str::<toml::Value>(text).unwrap());
+    // Everyday settings, MCP credentials, trusted projects and newer keys are fine.
+    assert!(
+        check(
+            r#"
+model = "gpt-6"
+model_reasoning_effort = "high"
+model_auto_compact_token_limit = 200000
+preferred_auth_method = "chatgpt"
+show_raw_agent_reasoning = true
+cli_auth_credentials_store = "file"
+model_provider = "openai"
+forced_login_method = "chatgpt"
+[mcp_servers.github]
+command = "npx"
+env = { GITHUB_TOKEN = "SENTINEL_SECRET" }
+[projects.'C:\repo']
+trust_level = "trusted"
+[model_providers.local]
+base_url = "http://localhost:1234/v1"
+"#
+        )
+        .is_ok()
+    );
+    for (text, reason) in [
+        (
+            "cli_auth_credentials_store = \"keyring\"",
+            CodexReason::UnsupportedStore,
+        ),
+        ("model_provider = \"azure\"", CodexReason::UnsupportedAuth),
+        (
+            "forced_login_method = \"api\"",
+            CodexReason::PolicyRestricted,
+        ),
+        (
+            "forced_chatgpt_workspace_id = \"ws\"",
+            CodexReason::PolicyRestricted,
+        ),
+        ("profile = \"work\"", CodexReason::PolicyRestricted),
+        (
+            "chatgpt_base_url = \"https://proxy.invalid/\"",
+            CodexReason::PolicyRestricted,
+        ),
+        (
+            "openai_base_url = \"https://proxy.invalid/\"",
+            CodexReason::PolicyRestricted,
+        ),
+        (
+            "[model_providers.openai]\nbase_url = \"https://proxy.invalid/\"",
+            CodexReason::PolicyRestricted,
+        ),
+    ] {
+        assert_eq!(check(text).unwrap_err(), reason, "{text}");
+    }
+}

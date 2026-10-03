@@ -20,6 +20,10 @@ pub struct UnverifiedRoutingClaims {
     pub email: Option<String>,
     pub plan_type: Option<String>,
     pub is_fedramp: bool,
+    /// id_token `iat`: orders two copies of the same account's tokens.
+    pub issued_at: Option<i64>,
+    /// access_token `exp`, when the access token is a JWT.
+    pub access_expires_at: Option<i64>,
 }
 impl fmt::Debug for UnverifiedRoutingClaims {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -37,13 +41,60 @@ impl fmt::Debug for OpaqueAuth {
         f.write_str("OpaqueAuth([REDACTED])")
     }
 }
+/// Lenient classification of an auth.json payload, used to watch the live file.
+pub struct AuthInspection {
+    pub kind: AuthKind,
+    pub claims: UnverifiedRoutingClaims,
+    /// `tokens.account_id` disagrees with the id_token workspace. Codex's
+    /// `persist_tokens` merges a refresh into whatever file is current, so an old
+    /// process still holding another account can leave its tokens here.
+    pub hybrid: bool,
+}
+impl fmt::Debug for AuthInspection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AuthInspection")
+            .field("kind", &self.kind)
+            .field("hybrid", &self.hybrid)
+            .finish_non_exhaustive()
+    }
+}
 impl OpaqueAuth {
     pub fn parse(bytes: Vec<u8>) -> Result<Self, CodexError> {
         let bytes = Zeroizing::new(bytes);
+        let (kind, claims, hybrid) = analyze(&bytes)?;
+        if hybrid {
+            return Err(CodexError::IdentityMismatch);
+        }
+        Ok(Self {
+            bytes,
+            kind,
+            claims,
+        })
+    }
+    pub fn inspect(bytes: &[u8]) -> Result<AuthInspection, CodexError> {
+        let (kind, claims, hybrid) = analyze(bytes)?;
+        Ok(AuthInspection {
+            kind,
+            claims,
+            hybrid,
+        })
+    }
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+    pub fn kind(&self) -> AuthKind {
+        self.kind
+    }
+    pub fn routing_claims(&self) -> &UnverifiedRoutingClaims {
+        &self.claims
+    }
+}
+fn analyze(bytes: &[u8]) -> Result<(AuthKind, UnverifiedRoutingClaims, bool), CodexError> {
+    {
         if bytes.len() > crate::wire::MAX_FRAME {
             return Err(CodexError::OutputLimit);
         }
-        let json = SecretJson::parse(&bytes)?;
+        let json = SecretJson::parse(bytes)?;
         let object = json.0.as_object().ok_or(CodexError::Protocol)?;
         let nonnull = |key: &str| object.get(key).is_some_and(|v| !v.is_null());
         let mode = object.get("auth_mode").and_then(|v| v.as_str());
@@ -60,6 +111,7 @@ impl OpaqueAuth {
             .and_then(|v| v.as_str())
             .filter(|s| !s.trim().is_empty());
         let mut claims = UnverifiedRoutingClaims::default();
+        let mut hybrid = false;
         let kind = if unsupported
             || (nonnull("auth_mode") && mode.is_none())
             || (nonnull("OPENAI_API_KEY") && api.is_none())
@@ -112,6 +164,8 @@ impl OpaqueAuth {
                     .or_else(|| decoded.0["https://api.openai.com/profile"]["email"].as_str()),
             )?;
             claims.plan_type = metadata(auth["chatgpt_plan_type"].as_str())?;
+            claims.issued_at = decoded.0["iat"].as_i64();
+            claims.access_expires_at = tokens["access_token"].as_str().and_then(jwt_expiry);
             if auth
                 .get("chatgpt_account_is_fedramp")
                 .is_some_and(|v| !v.is_null() && !v.is_boolean())
@@ -121,30 +175,116 @@ impl OpaqueAuth {
             claims.is_fedramp = auth["chatgpt_account_is_fedramp"]
                 .as_bool()
                 .unwrap_or(false);
-            if let (Some(a), Some(b)) = (&claims.chatgpt_account_id, &claims.token_account_id)
-                && a != b
-            {
-                return Err(CodexError::IdentityMismatch);
-            }
+            hybrid = matches!(
+                (&claims.chatgpt_account_id, &claims.token_account_id),
+                (Some(a), Some(b)) if a != b
+            );
             AuthKind::ManagedChatgpt
         } else {
             AuthKind::Unsupported
         };
-        Ok(Self {
-            bytes,
-            kind,
-            claims,
-        })
+        Ok((kind, claims, hybrid))
     }
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.bytes
+}
+
+/// Move the rotated tokens found in `rotated` (an auth.json whose id_token belongs
+/// to the account saved as `base`, possibly a hybrid file) into a copy of `base`.
+/// Every other field of `base`, including `tokens.account_id`, is kept. The result
+/// must parse strictly and keep the user/workspace identity of `base`.
+pub fn merge_rotated_tokens(base: &[u8], rotated: &[u8]) -> Result<Vec<u8>, CodexError> {
+    let original = OpaqueAuth::parse(base.to_vec())?;
+    if original.kind() != AuthKind::ManagedChatgpt {
+        return Err(CodexError::UnsupportedAuthMode);
     }
-    pub fn kind(&self) -> AuthKind {
-        self.kind
+    let mut target = SecretJson::parse(base)?;
+    let source = SecretJson::parse(rotated)?;
+    let tokens = source.0["tokens"]
+        .as_object()
+        .ok_or(CodexError::UnsupportedAuthMode)?;
+    let slot = target.0["tokens"]
+        .as_object_mut()
+        .ok_or(CodexError::UnsupportedAuthMode)?;
+    for key in ["id_token", "access_token", "refresh_token"] {
+        let value = tokens
+            .get(key)
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.trim().is_empty())
+            .ok_or(CodexError::UnsupportedAuthMode)?;
+        slot.insert(key.into(), serde_json::Value::String(value.into()));
     }
-    pub fn routing_claims(&self) -> &UnverifiedRoutingClaims {
-        &self.claims
+    if let Some(stamp) = source.0.get("last_refresh").filter(|v| v.is_string()) {
+        target.0["last_refresh"] = stamp.clone();
     }
+    let bytes = serde_json::to_vec_pretty(&target.0).map_err(|_| CodexError::Protocol)?;
+    let merged = OpaqueAuth::parse(bytes)?;
+    let (a, b) = (original.routing_claims(), merged.routing_claims());
+    if merged.kind() != AuthKind::ManagedChatgpt
+        || a.chatgpt_user_id != b.chatgpt_user_id
+        || a.chatgpt_account_id
+            .as_ref()
+            .or(a.token_account_id.as_ref())
+            != b.chatgpt_account_id
+                .as_ref()
+                .or(b.token_account_id.as_ref())
+    {
+        return Err(CodexError::IdentityMismatch);
+    }
+    Ok(merged.as_bytes().to_vec())
+}
+/// Best-effort `exp` of a JWT access token; opaque tokens yield None.
+fn jwt_expiry(token: &str) -> Option<i64> {
+    let mut parts = token.split('.');
+    let (_, payload, _) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() || payload.len() > 32768 {
+        return None;
+    }
+    let bytes = Zeroizing::new(URL_SAFE_NO_PAD.decode(payload).ok()?);
+    SecretJson::parse(&bytes).ok()?.0["exp"].as_i64()
+}
+/// A hybrid file's tokens re-labelled with their own id_token workspace, so an
+/// account that is not saved yet can still be kept instead of discarded.
+pub fn normalize_hybrid(bytes: &[u8]) -> Result<Vec<u8>, CodexError> {
+    let inspection = OpaqueAuth::inspect(bytes)?;
+    let workspace = inspection
+        .claims
+        .chatgpt_account_id
+        .ok_or(CodexError::IdentityMismatch)?;
+    let mut value = SecretJson::parse(bytes)?;
+    value.0["tokens"]["account_id"] = serde_json::Value::String(workspace);
+    let fixed = serde_json::to_vec_pretty(&value.0).map_err(|_| CodexError::Protocol)?;
+    Ok(OpaqueAuth::parse(fixed)?.as_bytes().to_vec())
+}
+/// auth.json payload for ChatGPT tokens imported from another switcher.
+pub fn chatgpt_auth_payload(
+    id_token: &str,
+    access_token: &str,
+    refresh_token: &str,
+    account_id: Option<&str>,
+    last_refresh: &str,
+) -> Result<Vec<u8>, CodexError> {
+    let value = serde_json::json!({
+        "auth_mode": "chatgpt",
+        "OPENAI_API_KEY": null,
+        "tokens": {
+            "id_token": id_token,
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "account_id": account_id,
+        },
+        "last_refresh": last_refresh,
+    });
+    let bytes =
+        Zeroizing::new(serde_json::to_vec_pretty(&value).map_err(|_| CodexError::Protocol)?);
+    let mut value = value;
+    crate::wire::wipe(&mut value);
+    Ok(OpaqueAuth::parse(bytes.to_vec())?.as_bytes().to_vec())
+}
+/// auth.json payload for an imported OpenAI API key (saved, never selected).
+pub fn api_key_auth_payload(key: &str) -> Result<Vec<u8>, CodexError> {
+    let mut value = serde_json::json!({ "OPENAI_API_KEY": key });
+    let bytes = serde_json::to_vec_pretty(&value).map_err(|_| CodexError::Protocol);
+    crate::wire::wipe(&mut value);
+    Ok(OpaqueAuth::parse(bytes?)?.as_bytes().to_vec())
 }
 fn metadata(value: Option<&str>) -> Result<Option<String>, CodexError> {
     value

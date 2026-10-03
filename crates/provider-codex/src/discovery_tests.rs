@@ -41,8 +41,9 @@ fn executable_fingerprint_rejects_replacement() {
     std::fs::write(&path, native_bytes()).unwrap();
     let path = path.canonicalize().unwrap();
     let executable = VerifiedCodexExecutable {
-        fingerprint: fingerprint(&path).unwrap(),
+        identity: identity(&path).unwrap(),
         path: path.clone(),
+        version: "0.160.0".into(),
     };
     assert_eq!(executable.recheck().unwrap(), path);
     let mut changed = native_bytes();
@@ -60,10 +61,7 @@ fn npm_platform_resolution_reads_only_recognized_package_metadata() {
     std::fs::create_dir_all(&package).unwrap();
     std::fs::write(
         package.join("package.json"),
-        format!(
-            r#"{{"name":"@openai/codex","version":"{}"}}"#,
-            SUPPORTED_CODEX_VERSION
-        ),
+        format!(r#"{{"name":"@openai/codex","version":"{}"}}"#, "0.161.2"),
     )
     .unwrap();
     let (platform, target) = if cfg!(all(windows, target_arch = "x86_64")) {
@@ -84,7 +82,7 @@ fn npm_platform_resolution_reads_only_recognized_package_metadata() {
     std::fs::create_dir_all(&bin).unwrap();
     std::fs::write(
         native_package.join("package.json"),
-        format!(r#"{{"name":"@openai/codex","version":"{SUPPORTED_CODEX_VERSION}-{platform}"}}"#),
+        format!(r#"{{"name":"@openai/codex","version":"0.161.2-{platform}"}}"#),
     )
     .unwrap();
     std::fs::write(bin.join(native_name()), native_bytes()).unwrap();
@@ -95,7 +93,7 @@ fn npm_platform_resolution_reads_only_recognized_package_metadata() {
     assert_eq!(discover_candidates(&options).unwrap().len(), 1);
     std::fs::write(
         package.join("package.json"),
-        r#"{"name":"@openai/codex","version":"0.999.0"}"#,
+        r#"{"name":"@openai/codex","version":"0.159.0"}"#,
     )
     .unwrap();
     assert!(discover_candidates(&options).unwrap().is_empty());

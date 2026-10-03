@@ -203,3 +203,16 @@ pub(crate) fn directory_generation(path: &Path) -> CodexResult<StoreGeneration> 
         native_identity,
     })
 }
+
+/// Metadata-only generation for large files (the ~300 MB native Codex executable):
+/// identity, size and timestamps, without reading the content.
+pub(crate) fn metadata_generation(path: &Path) -> CodexResult<StoreGeneration> {
+    let file = open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(CodexStoreError::ExternalChange);
+    }
+    Ok(StoreGeneration {
+        fingerprint: digest(format!("metadata:{}", metadata(&file, false)?).as_bytes()),
+        native_identity: digest(metadata(&file, true)?.as_bytes()),
+    })
+}

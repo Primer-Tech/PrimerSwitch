@@ -96,7 +96,7 @@ impl Drop for SecretJson {
         wipe(&mut self.0);
     }
 }
-fn wipe(value: &mut Value) {
+pub(crate) fn wipe(value: &mut Value) {
     match value {
         Value::String(s) => s.zeroize(),
         Value::Array(a) => a.iter_mut().for_each(wipe),

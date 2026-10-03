@@ -1,4 +1,4 @@
-//! Version-pinned, opaque FILE-mode Codex storage. No network or Codex execution.
+//! Opaque FILE-mode Codex storage (Codex >= 0.160.0). No network or Codex execution.
 mod context;
 mod generation;
 mod process;
@@ -6,14 +6,12 @@ mod store;
 
 pub use context::{
     CodexContextEvidence, CodexFileContext, CodexPolicyState, CodexProviderMode, CodexSourceRole,
-    CodexStorageMode, CodexWatchedSource, PINNED_CODEX_SCHEMA, PINNED_CODEX_VERSION,
-    create_private_context, read_private_auth,
+    CodexStorageMode, CodexWatchedSource, create_private_context, read_private_auth,
+    write_private_auth,
 };
 pub use generation::StoreGeneration;
-pub use process::{CodexWriteGuard, NativeCodexWriteGuard, macos_policy_is_unrestricted};
-pub use store::{
-    CodexAuthSnapshot, CodexFileStore, CodexRecovery, PendingCodexSwitch, PreparedCodexSwitch,
-};
+pub use process::{CodexProcessSummary, macos_policy_is_unrestricted, scan_codex_processes};
+pub use store::{CodexAuthSnapshot, CodexFileStore};
 
 pub type CodexResult<T> = std::result::Result<T, CodexStoreError>;
 
@@ -26,14 +24,6 @@ pub enum CodexStoreError {
     UnsupportedAuth,
     #[error("Codex context or credentials changed externally; reconciliation is required")]
     ExternalChange,
-    #[error("Close Codex clients before changing the selected account")]
-    RunningClients,
-    #[error("Codex process visibility is incomplete; selection is blocked")]
-    ProcessVisibility,
-    #[error("A Codex transaction requires verified reconciliation")]
-    ReconciliationRequired,
-    #[error("Codex transaction receipt is invalid or stale")]
-    InvalidReceipt,
     #[error(transparent)]
     Storage(#[from] crate::PlatformError),
 }

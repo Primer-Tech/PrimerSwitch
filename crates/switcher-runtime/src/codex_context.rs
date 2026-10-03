@@ -17,23 +17,16 @@ pub(crate) struct ContextPaths {
 }
 pub(crate) struct QualifiedContext {
     pub context: Option<CodexFileContext>,
-    pub static_sources: Vec<CodexWatchedSource>,
     pub active_model: Option<String>,
 }
-impl QualifiedContext {
-    pub fn revalidate_static(&self) -> Result<(), CodexReason> {
-        for source in &self.static_sources {
-            source.revalidate().map_err(store_reason)?;
-        }
-        Ok(())
-    }
-}
 impl ContextPaths {
-    pub fn discover() -> Result<Self, CodexReason> {
-        for name in [
+    /// Credential variables in this environment. Interactive Codex ignores most of them
+    /// while a ChatGPT login exists, but `codex exec` prefers CODEX_API_KEY and the
+    /// others redirect sign-in, so the dashboard shows a warning instead of blocking.
+    pub fn credential_overrides_present() -> bool {
+        [
             "CODEX_API_KEY",
             "CODEX_ACCESS_TOKEN",
-            "OPENAI_API_KEY",
             "OPENAI_BASE_URL",
             "OPENAI_FEDERATION_RULE_ID",
             "OPENAI_IDENTITY_TOKEN_FILE",
@@ -43,11 +36,11 @@ impl ContextPaths {
             "CODEX_REVOKE_TOKEN_URL_OVERRIDE",
             "CODEX_AUTHAPI_BASE_URL",
             "CODEX_INTERNAL_ORIGINATOR_OVERRIDE",
-        ] {
-            if std::env::var_os(name).is_some() {
-                return Err(CodexReason::ExternalCredentials);
-            }
-        }
+        ]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some())
+    }
+    pub fn discover() -> Result<Self, CodexReason> {
         let home = match std::env::var_os("CODEX_HOME") {
             Some(value) if !value.is_empty() => PathBuf::from(value),
             Some(_) => return Err(CodexReason::UnsupportedStore),
@@ -75,7 +68,12 @@ impl ContextPaths {
             project_ancestor_stop: None,
         })
     }
-    pub fn qualify(&self, executable: &Path, cwd: &Path) -> Result<QualifiedContext, CodexReason> {
+    pub fn qualify(
+        &self,
+        executable: &Path,
+        cwd: &Path,
+        version: &str,
+    ) -> Result<QualifiedContext, CodexReason> {
         if self.enforce_native_policy {
             macos_policy_is_unrestricted().map_err(|_| CodexReason::PolicyRestricted)?;
             // Check environment again, including changes since installation discovery.
@@ -122,23 +120,24 @@ impl ContextPaths {
             self.home.join("config.toml"),
         )?)?;
         validate_config(&user)?;
-        // Projectless owned cwd: never ignore a discovered project or inherit its auth routing.
+        // The owned cwd lives under the user's temp directory, so a project layer
+        // (`.codex/config.toml` in an ancestor, e.g. a home that is a git repo) can
+        // apply to the Codex children: hold it to the same rules as the user config.
+        // The home's own CODEX_HOME/config.toml is the user layer validated above.
+        let user_layer = self.home.join("config.toml").canonicalize().ok();
         for parent in cwd.ancestors() {
-            for relative in [".git", ".codex/config.toml"] {
-                if capture(CodexSourceRole::Project, parent.join(relative))?.is_some() {
-                    return Err(CodexReason::PolicyRestricted);
-                }
+            let candidate = parent.join(".codex").join("config.toml");
+            if candidate.canonicalize().ok().is_none_or(|path| Some(path) != user_layer)
+                && let Some(bytes) = capture(CodexSourceRole::Project, candidate)?
+            {
+                validate_config(&parse_config(Some(bytes))?)?;
             }
             #[cfg(test)]
             if self.project_ancestor_stop.as_deref() == Some(parent) {
                 break;
             }
         }
-        if capture(CodexSourceRole::Project, cwd.join("config.toml"))?.is_some() {
-            return Err(CodexReason::PolicyRestricted);
-        }
         sources.push(CodexWatchedSource::default_session());
-        let static_sources = sources.clone();
         let (_, cloud) = CodexWatchedSource::capture(
             CodexSourceRole::Managed,
             self.home.join("cloud-config-bundle-cache.json"),
@@ -159,8 +158,8 @@ impl ContextPaths {
                 CodexFileContext::qualify(
                     self.home.clone(),
                     CodexContextEvidence {
-                        version: PINNED_CODEX_VERSION.into(),
-                        schema: PINNED_CODEX_SCHEMA.into(),
+                        version: version.into(),
+                        schema: provider_codex::PINNED_SOURCE_COMMIT.into(),
                         storage: CodexStorageMode::File,
                         provider: CodexProviderMode::DefaultOpenAi,
                         policy: CodexPolicyState::Unrestricted,
@@ -182,7 +181,6 @@ impl ContextPaths {
             .and_then(safe_text);
         Ok(QualifiedContext {
             context,
-            static_sources,
             active_model,
         })
     }
@@ -196,6 +194,7 @@ fn parse_config(bytes: Option<Zeroizing<Vec<u8>>>) -> Result<toml::Value, CodexR
 }
 fn validate_config(value: &toml::Value) -> Result<(), CodexReason> {
     let table = value.as_table().ok_or(CodexReason::PolicyRestricted)?;
+    // Codex must read ChatGPT sign-in from auth.json in this home.
     if table
         .get("cli_auth_credentials_store")
         .is_some_and(|v| v.as_str() != Some("file"))
@@ -208,43 +207,31 @@ fn validate_config(value: &toml::Value) -> Result<(), CodexReason> {
     {
         return Err(CodexReason::UnsupportedAuth);
     }
+    if table
+        .get("forced_login_method")
+        .is_some_and(|v| v.as_str() != Some("chatgpt"))
+    {
+        return Err(CodexReason::PolicyRestricted);
+    }
+    // A forced workspace makes Codex sign out logins from any other workspace; a
+    // default profile can change provider/login; custom endpoints change who
+    // receives the subscription token.
     for key in [
-        "forced_login_method",
         "forced_chatgpt_workspace_id",
-        "model_providers",
         "profile",
-        "profiles",
-        "project_root_markers",
-        "allow_symlinked_codex_home",
         "openai_base_url",
         "chatgpt_base_url",
-        "responses_api_metadata",
-        "cloud",
-        "experimental_thread_store",
-        "experimental_thread_store_endpoint",
     ] {
         if table.contains_key(key) {
             return Err(CodexReason::PolicyRestricted);
         }
     }
-    // Unknown authentication/routing keys cannot silently weaken the pinned adapter.
-    for key in table.keys() {
-        if key != "cli_auth_credentials_store"
-            && key != "model_provider"
-            && (key.contains("credential")
-                || key.contains("login") && key != "allow_login_shell"
-                || key.contains("token")
-                    && ![
-                        "model_auto_compact_token_limit",
-                        "tool_output_token_limit",
-                        "model_auto_compact_token_limit_scope",
-                    ]
-                    .contains(&key.as_str())
-                || key.contains("api_key")
-                || key.contains("auth") && !key.starts_with("mcp_"))
-        {
-            return Err(CodexReason::PolicyRestricted);
-        }
+    if table
+        .get("model_providers")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|providers| providers.contains_key("openai"))
+    {
+        return Err(CodexReason::PolicyRestricted);
     }
     Ok(())
 }
@@ -447,10 +434,6 @@ pub(crate) fn store_reason(error: CodexStoreError) -> CodexReason {
         CodexStoreError::UnsupportedContext => CodexReason::UnsupportedStore,
         CodexStoreError::UnsupportedAuth => CodexReason::UnsupportedAuth,
         CodexStoreError::ExternalChange => CodexReason::ExternalChange,
-        CodexStoreError::RunningClients => CodexReason::ClientsRunning,
-        CodexStoreError::ProcessVisibility => CodexReason::ProcessInventoryUnavailable,
-        CodexStoreError::ReconciliationRequired => CodexReason::ReconciliationRequired,
-        CodexStoreError::InvalidReceipt => CodexReason::InvalidPreparation,
         CodexStoreError::Storage(_) => CodexReason::StoreConflict,
     }
 }

@@ -5,8 +5,6 @@ use std::{
 };
 use zeroize::Zeroizing;
 
-pub const PINNED_CODEX_VERSION: &str = "0.160.0";
-pub const PINNED_CODEX_SCHEMA: &str = "a956835d020762cb2b570053af06f643a11c0ecc";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CodexStorageMode {
     File,
@@ -70,12 +68,12 @@ impl CodexWatchedSource {
         let directory = role == CodexSourceRole::Project && path.is_dir();
         let (bytes, generation) = if directory {
             (None, generation::directory_generation(&path)?)
+        } else if role == CodexSourceRole::Executable {
+            // The native binary is ~300 MB: identify it by metadata, never read it.
+            (None, generation::metadata_generation(&path)?)
         } else {
             generation::read(&path, "codex-source-v1", limit, false)?
         };
-        if role == CodexSourceRole::Executable && bytes.is_none() {
-            return Err(CodexStoreError::UnsupportedContext);
-        }
         Ok((
             Self {
                 role,
@@ -110,6 +108,8 @@ impl CodexWatchedSource {
             };
             let current = if self.directory {
                 generation::directory_generation(path)?
+            } else if self.role == CodexSourceRole::Executable {
+                generation::metadata_generation(path)?
             } else {
                 generation::read(path, "codex-source-v1", limit, false)?.1
             };
@@ -150,9 +150,10 @@ impl std::fmt::Debug for CodexFileContext {
 impl CodexFileContext {
     pub fn qualify(home: PathBuf, evidence: CodexContextEvidence) -> CodexResult<Self> {
         crate::files::check_path(&home)?;
+        // The runtime verified the executable version (>= 0.160.0) before qualifying.
         if !home.is_dir()
-            || evidence.version != PINNED_CODEX_VERSION
-            || evidence.schema != PINNED_CODEX_SCHEMA
+            || evidence.version.is_empty()
+            || evidence.version.len() > 64
             || evidence.storage != CodexStorageMode::File
             || evidence.provider != CodexProviderMode::DefaultOpenAi
             || evidence.policy != CodexPolicyState::Unrestricted
@@ -206,6 +207,9 @@ impl CodexFileContext {
     pub fn context_id(&self) -> &str {
         &self.context_id
     }
+    /// Cheap check used before every read/write of auth.json: the qualified home is
+    /// still the same directory. Config edits (Codex writes config.toml itself) are
+    /// re-evaluated by a fresh qualification, not treated as a conflict here.
     pub fn revalidate(&self) -> CodexResult<()> {
         crate::files::check_path(&self.home)?;
         if self.home.canonicalize()? != self.home
@@ -213,18 +217,18 @@ impl CodexFileContext {
         {
             return Err(CodexStoreError::ExternalChange);
         }
+        Ok(())
+    }
+    /// Every captured source (executable, config layers) is unchanged.
+    pub fn revalidate_sources(&self) -> CodexResult<()> {
+        self.revalidate()?;
         for source in &self.evidence.sources {
             source.revalidate()?;
         }
         Ok(())
     }
-    pub(crate) fn executable(&self) -> CodexResult<&Path> {
-        self.evidence
-            .sources
-            .iter()
-            .find(|s| s.role == CodexSourceRole::Executable)
-            .and_then(|s| s.path.as_deref())
-            .ok_or(CodexStoreError::UnsupportedContext)
+    pub fn version(&self) -> &str {
+        &self.evidence.version
     }
 }
 
@@ -235,6 +239,20 @@ pub fn create_private_context(path: PathBuf) -> CodexResult<PathBuf> {
     let canonical = path.canonicalize()?;
     crate::files::check_path(&canonical)?;
     Ok(canonical)
+}
+/// Write one saved login into an application-owned private home, so an owned Codex
+/// child can read that account's quota (and rotate its tokens) in isolation.
+pub fn write_private_auth(home: &Path, bytes: &[u8]) -> CodexResult<()> {
+    crate::files::check_path(home)?;
+    if !home.is_dir() {
+        return Err(CodexStoreError::UnsupportedContext);
+    }
+    let canonical = home.canonicalize()?;
+    crate::files::check_path(&canonical)?;
+    let path = canonical.join("auth.json");
+    crate::files::atomic_write(&path, bytes)?;
+    crate::protection::protect_file(&path, false)?;
+    Ok(())
 }
 /// Read an application-owned login output without reconstructing its JSON. The
 /// caller retains ownership proof for this temporary directory and child process.

@@ -64,7 +64,11 @@ fn fake(
             id: 0,
             pending: None,
             early: VecDeque::new(),
-            isolated,
+            kind: if isolated {
+                ContextKind::Isolated
+            } else {
+                ContextKind::Approved
+            },
             dead: false,
         },
         state,
@@ -225,7 +229,7 @@ async fn deadlines_and_flood_close_transport() {
         id: 0,
         pending: None,
         early: VecDeque::new(),
-        isolated: false,
+        kind: ContextKind::Approved,
         dead: false,
     };
     assert_eq!(

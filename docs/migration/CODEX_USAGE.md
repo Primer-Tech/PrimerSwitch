@@ -22,6 +22,32 @@ Processes that hold their own sign-in keep the previous account until they resta
 
 Resumed conversations carry encrypted reasoning that belongs to the previous account. Switching between two personal accounts has been reported to work; if a resumed thread fails after switching between a personal account and a workspace, start a new thread.
 
+### Claude Code jobs through Ultracodex
+
+The [0.2.1 release](https://github.com/Primer-Tech/PrimerSwitch/releases/tag/v0.2.1-preview.1)
+includes a separate Ultracodex 0.3.7 compatibility package. Its runner retains
+Codex thread history by default. After a managed ChatGPT quota failure it waits
+for the selected account to change, then resumes the exact thread under the
+same job id, request authentication, model, schema, directory and permissions.
+Claude's existing relay keeps polling through the compatible `backoff` state.
+Running commands are not interrupted merely because an account changed.
+
+If the new account rejects encrypted reasoning, the runner continues once per
+handoff in a fresh thread using the exact thread's visible messages and tool
+records, leaving the original rollout intact. This checkpoint excludes hidden
+reasoning/config and is bounded; missing essential context must be requested.
+The wait is limited to 15 minutes and the original deadline, with at most eight
+account handoffs. Cancellation and orphan detection remain active. Explicit
+ephemeral jobs, external API-key authentication, missing history and unverified
+cleanup cannot be recovered. Already-polled durable jobs from the installed
+0.3.6 runner can be adopted once after their supervisor exits with a quota error,
+while their original deadline and heartbeat remain valid.
+
+This companion changes the Ultracodex launcher. Native `codex exec` has no live
+account reload, and arbitrary other launchers require their own continuation
+support. Offline fixtures cover the full handoff and encrypted-history fallback;
+no authenticated provider run was used for release verification.
+
 ## Add accounts
 
 - **Sign in with ChatGPT…** opens the browser login in a private, temporary Codex home, so adding an account never changes the active one.

@@ -1,6 +1,6 @@
 # Updating without resetting your data
 
-PrimerSwitch 0.1.1 and the 0.2.0 Codex update keep the application and storage identity of the 0.1.0 preview. The Primer logo, colors and simplified navigation change the interface; existing saved accounts and settings use the same encrypted record.
+PrimerSwitch 0.1.1, the 0.2.0 Codex update and the 0.2.1 quota-selection fix keep the application and storage identity of the 0.1.0 preview. Existing saved accounts and settings use the same encrypted record.
 
 ## Installing the branded update
 
@@ -32,4 +32,17 @@ Installer identity and cleanup checks are separate from runtime compatibility. N
 
 Codex uses the new encrypted codex-state record with the existing master key, vault envelope and application directory. Enabling it does not rewrite runtime-state or change Claude settings. A damaged Codex envelope blocks only Codex while preserving that file and keeping Claude settings usable. Codex records, pending selection journals and unrelated opaque files are included in the new installer retention fixtures.
 
-The 0.1.1-to-0.2.0 hosted installer gate is pinned to the actual published 0.1.1 installer bytes and checks upgrade followed by same-version reinstall. It passed on the [0.2.0 candidate run](https://github.com/Primer-Tech/PrimerSwitch/actions/runs/37072277451), preserving seven synthetic state/key/settings/journal/opaque sentinels in both phases. The artifacts remain unsigned previews and v0.2.0 has not been published as a release. The historical 0.1.0 runtime-format fixture remains active.
+The 0.1.1-to-0.2.0 hosted installer gate is pinned to the actual published 0.1.1 installer bytes and checks upgrade followed by same-version reinstall. It passed on the [0.2.0 candidate run](https://github.com/Primer-Tech/PrimerSwitch/actions/runs/37072277451), preserving seven synthetic state/key/settings/journal/opaque sentinels in both phases. Version 0.2.0 was published as an unsigned preview. The historical 0.1.0 runtime-format fixture remains active.
+
+## Codex 0.2.1 fix
+
+Install 0.2.1 over 0.2.0 in the same directory under the same Windows user. The
+[hosted retained-package qualification](https://github.com/Primer-Tech/PrimerSwitch/actions/runs/37243426908)
+used the exact published 0.2.0 installer and the source-bound 0.2.1 installer,
+then applied 0.2.1 twice. Both phases retained all seven synthetic state, key,
+settings, journal and opaque sentinels and installed the expected application
+bytes. No application was started and no real credentials were accessed.
+
+The release's separate Ultracodex 0.3.7 companion handles Codex jobs inside
+Claude Code. It is an integration update, so installing PrimerSwitch alone
+does not replace arbitrary `codex exec` launchers. See [Codex usage](CODEX_USAGE.md).

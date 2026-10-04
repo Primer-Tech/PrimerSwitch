@@ -239,6 +239,34 @@ describe('Codex adapter: statuses in the shared words', () => {
 });
 
 describe('Codex adapter: the page', () => {
+  it('shows a weekly-only account as next at the active account switch threshold', () => {
+    const raw = fixture({
+      nextId: 'codex-research',
+      order: ['codex-research'],
+    });
+    raw.accounts[0].quota!.limits[0].primary!.usedPercent = 13;
+    raw.accounts[0].quota!.limits[0].secondary!.usedPercent = 95;
+    const limit = raw.accounts[2].quota!.limits[0];
+    limit.primary = {
+      usedPercent: 19,
+      windowDurationMins: 10080,
+      resetsAt: now + 4 * day,
+    };
+    limit.secondary = null;
+    const page = view(raw, { settings: { ...defaults, threshold: 94 } });
+    expect(page.alertLimit).toBe('near');
+    expect(page.next).toMatchObject({
+      id: 'codex-research',
+      fiveHour: { value: null, resetsAt: null },
+      weekly: { value: 19, resetsAt: now + 4 * day },
+      status: { kind: 'next', label: 'Next' },
+      canSwitch: true,
+    });
+    expect(page.order).toEqual([
+      { id: 'codex-research', name: 'research@example.invalid' },
+    ]);
+  });
+
   it('ranks the active account first, then the native order, then by when accounts free up', () => {
     const raw = fixture({ order: ['codex-research'] });
     raw.accounts.unshift(

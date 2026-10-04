@@ -38,14 +38,14 @@ class GuardTests(unittest.TestCase):
                 qualification.require_clean_registration({name: {}})
 
     def fixture_package(self, root):
-        package = root / "target/release/bundle/nsis/PrimerSwitch_0.2.0_x64-setup.exe"
+        package = root / "target/release/bundle/nsis/PrimerSwitch_0.2.1_x64-setup.exe"
         package.parent.mkdir(parents=True)
         package.write_bytes(b"MZ hermetic fixture installer never executed")
         binary = root / "target/release/primerswitch.exe"
         binary.write_bytes(b"MZ hermetic fixture application never executed")
         config = root / "apps/desktop/src-tauri/tauri.conf.json"
         config.parent.mkdir(parents=True)
-        config.write_text(json.dumps({"productName": "PrimerSwitch", "identifier": "com.primertech.primerswitch", "version": "0.2.0", "bundle": {"publisher": "Primer-Tech", "windows": {"nsis": {"installMode": "currentUser"}}}}), encoding="utf8")
+        config.write_text(json.dumps({"productName": "PrimerSwitch", "identifier": "com.primertech.primerswitch", "version": "0.2.1", "bundle": {"publisher": "Primer-Tech", "windows": {"nsis": {"installMode": "currentUser"}}}}), encoding="utf8")
         evidence = root / ".artifacts/evidence.json"
         evidence.parent.mkdir()
         evidence.write_bytes(b"fixture evidence")

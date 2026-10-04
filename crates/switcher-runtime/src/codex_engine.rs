@@ -99,7 +99,7 @@ pub(crate) struct CodexAutoSwitch {
     pub peak: Option<i32>,
 }
 
-/// The main Codex limit: `primary` is its 5-hour window, `secondary` the weekly one.
+/// The main Codex limit. Either window may be absent; duration determines its role.
 fn main_limit(quota: &CodexQuotaView) -> Option<&CodexLimitView> {
     quota.limits.iter().find(|limit| limit.key == "default")
 }
@@ -108,6 +108,28 @@ fn main_windows(quota: &CodexQuotaView) -> impl Iterator<Item = &CodexWindowView
         .into_iter()
         .flat_map(|limit| [&limit.primary, &limit.secondary])
         .flatten()
+}
+/// The same duration-based short/long placement as the renderer's `codexWindows`.
+/// Unknown durations retain the native primary/secondary positions.
+fn main_window_slots(limit: &CodexLimitView) -> [Option<&CodexWindowView>; 2] {
+    let mut slots = [None, None];
+    for (index, window) in [limit.primary.as_ref(), limit.secondary.as_ref()]
+        .into_iter()
+        .enumerate()
+    {
+        let Some(window) = window else { continue };
+        let long = window
+            .window_duration_mins
+            .map_or(index == 1, |mins| mins > 1440);
+        let preferred = usize::from(long);
+        let slot = if slots[preferred].is_none() {
+            preferred
+        } else {
+            1 - preferred
+        };
+        slots[slot] = Some(window);
+    }
+    slots
 }
 /// Codex says the plan's usage is unavailable: a main window is spent (above 100 means
 /// usage continues on purchased credits), a limit was reached or included usage is off.
@@ -120,26 +142,35 @@ pub(crate) fn quota_limited(quota: &CodexQuotaView) -> bool {
 fn reaches(quota: &CodexQuotaView, level: f64) -> bool {
     quota_limited(quota) || main_windows(quota).any(|w| f64::from(w.used_percent) >= level)
 }
-/// Ranking inputs of an account whose two main windows are known and strictly below
-/// `threshold` with nothing else limiting it; `None` when it is not usable.
+/// At least one reported main window, all strictly below `threshold`, with nothing
+/// else limiting the account. An omitted window is neither required nor free quota.
 fn usable_rank(account: &SavedAccount, threshold: f64) -> Option<CandidateRank<'_>> {
     let quota = account.quota.as_ref()?;
     if quota_limited(quota) {
         return None;
     }
     let limit = main_limit(quota)?;
-    let (five, week) = (limit.primary.as_ref()?, limit.secondary.as_ref()?);
-    let (five_used, week_used) = (f64::from(five.used_percent), f64::from(week.used_percent));
-    if five_used >= threshold || week_used >= threshold {
+    let [five, week] = main_window_slots(limit);
+    let windows = [five, week];
+    if windows.iter().all(Option::is_none)
+        || windows
+            .iter()
+            .flatten()
+            .any(|w| f64::from(w.used_percent) >= threshold)
+    {
         return None;
     }
     let margin = threshold - HEADROOM_MARGIN;
     Some(CandidateRank {
         id: &account.id,
-        headroom: five_used <= margin && week_used <= margin,
-        weekly_used: week_used,
-        weekly_reset_bucket: week.resets_at.map(reset_hour_bucket),
-        five_hour_used: five_used,
+        headroom: windows
+            .iter()
+            .flatten()
+            .all(|w| f64::from(w.used_percent) <= margin),
+        // Unknown usage sorts last when needed for ranking, never as unused quota.
+        weekly_used: week.map_or(f64::INFINITY, |w| f64::from(w.used_percent)),
+        weekly_reset_bucket: week.and_then(|w| w.resets_at).map(reset_hour_bucket),
+        five_hour_used: five.map_or(f64::INFINITY, |w| f64::from(w.used_percent)),
     })
 }
 /// When the main windows at or above `threshold` reopen: the latest of their resets.
@@ -835,7 +866,7 @@ impl CodexEngine {
     }
     /// Accounts automatic switching may use, with their ranking inputs: switchable
     /// saved ChatGPT sign-ins (not active, not signed out) whose latest reading
-    /// succeeded and shows both main windows below the threshold and no limit.
+    /// succeeded and shows at least one main window, all below the threshold, and no limit.
     fn candidates(
         &self,
         threshold: f64,
@@ -926,8 +957,7 @@ impl CodexEngine {
             .all(|a| {
                 !a.needs_sign_in
                     && !self.account_errors.contains_key(&a.id)
-                    && a.quota.is_some()
-                    && usable_rank(a, threshold).is_none()
+                    && a.quota.as_ref().is_some_and(|q| reaches(q, threshold))
             })
     }
     /// An automatic switch is starting: the cooldown runs whatever its outcome.

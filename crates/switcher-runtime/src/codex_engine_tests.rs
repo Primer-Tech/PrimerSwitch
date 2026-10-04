@@ -1229,6 +1229,17 @@ fn main_quota_at(five: i32, five_reset: i64, week: i32, week_reset: i64) -> Code
 fn main_quota(five: i32, week: i32) -> CodexQuotaView {
     main_quota_at(five, NOW + 3600, week, NOW + 5 * 86400)
 }
+/// Codex can report its only weekly window as primary or secondary.
+fn weekly_only_quota(week: i32, reset: i64, primary: bool) -> CodexQuotaView {
+    let mut quota = main_quota_at(0, NOW + 3600, week, reset);
+    let limit = &mut quota.limits[0];
+    limit.primary = if primary {
+        limit.secondary.take()
+    } else {
+        None
+    };
+    quota
+}
 /// A successful reading of `id` at `at` that named its workspace.
 fn record_reading(engine: &mut CodexEngine, id: &str, quota: CodexQuotaView, at: i64) {
     let index = engine.account_index(id).unwrap();
@@ -1325,6 +1336,116 @@ fn the_next_codex_account_is_ranked_in_rust_with_the_order_shared_with_claude() 
 }
 
 #[test]
+fn weekly_only_codex_accounts_are_ranked_by_their_reported_windows() {
+    let mut f = Fixture::new();
+    let a = f.id_of("ws-a");
+    let b = f.add("user-b", "ws-b", "saved");
+    let c = f.add("user-c", "ws-c", "saved");
+    let d = f.add("user-d", "ws-d", "saved");
+    let policy = CodexPolicy {
+        threshold: 94.0,
+        ..CodexPolicy::default()
+    };
+    // The reported failure: active 13%/95%, with three weekly-only alternatives.
+    f.read(&a, main_quota(13, 95), NOW);
+    f.read(
+        &b,
+        weekly_only_quota(19, NOW + 4 * 86400 + 23 * 3600, true),
+        NOW,
+    );
+    f.read(
+        &c,
+        weekly_only_quota(10, NOW + 22 * 86400 + 22 * 3600, false),
+        NOW,
+    );
+    f.read(
+        &d,
+        weekly_only_quota(2, NOW + 24 * 86400 + 12 * 3600, true),
+        NOW,
+    );
+    assert_eq!(f.order(&policy), vec![b.clone(), c.clone(), d.clone()]);
+    assert_eq!(f.engine.automation(NOW, &policy), switch_to(&f, &b, 95));
+    let most_left = CodexPolicy {
+        order: CandidateOrder::MostWeeklyLeft,
+        ..policy
+    };
+    assert_eq!(f.order(&most_left), vec![d.clone(), c.clone(), b.clone()]);
+    assert_eq!(f.engine.automation(NOW, &most_left), switch_to(&f, &d, 95));
+    // Missing windows stay absent in IPC and persistence; no zero usage is invented.
+    let limit = f.view(&b).quota.unwrap().limits.remove(0);
+    assert!(limit.secondary.is_none());
+    assert_eq!(limit.primary.unwrap().window_duration_mins, Some(10080));
+    f.engine.save(&f.vault).unwrap();
+    let saved: Saved = f.vault.load(RECORD).unwrap().unwrap();
+    let limit = &saved
+        .accounts
+        .iter()
+        .find(|account| account.id == b)
+        .unwrap()
+        .quota
+        .as_ref()
+        .unwrap()
+        .limits[0];
+    assert!(limit.secondary.is_none());
+    assert_eq!(limit.primary.as_ref().unwrap().used_percent, 19);
+    // Old readings are still revalidated before automatic switching.
+    f.read(&b, weekly_only_quota(19, NOW + 4 * 86400, true), NOW - 901);
+    assert_eq!(
+        f.engine.automation(NOW, &policy),
+        CodexAutomation::Refresh(b)
+    );
+    f.claude_untouched();
+}
+
+#[test]
+fn single_codex_windows_obey_thresholds_headroom_and_provider_limits() {
+    let mut f = Fixture::new();
+    let a = f.id_of("ws-a");
+    let b = f.add("user-b", "ws-b", "saved");
+    let c = f.add("user-c", "ws-c", "saved");
+    let policy = CodexPolicy::default();
+    f.read(&a, main_quota(13, 95), NOW);
+    for primary in [true, false] {
+        f.read(&b, weekly_only_quota(19, NOW + 3600, primary), NOW);
+        assert_eq!(f.next(&policy), Some(b.clone()));
+        for used in [95, 100, 105] {
+            f.read(&b, weekly_only_quota(used, NOW + 3600, primary), NOW);
+            assert_eq!(f.next(&policy), None);
+        }
+        f.read(&b, weekly_only_quota(19, NOW + 3600, primary), NOW);
+        f.quota_mut(&b).ordinary_usage_allowed = Some(false);
+        assert_eq!(f.next(&policy), None);
+        f.read(&b, weekly_only_quota(19, NOW + 3600, primary), NOW);
+        f.quota_mut(&b).limits[0].rate_limit_reached_type = Some("primary".into());
+        assert_eq!(f.next(&policy), None);
+    }
+    // Preferred headroom uses the only reported window as well.
+    f.read(&b, weekly_only_quota(91, NOW + 3600, true), NOW);
+    f.read(&c, weekly_only_quota(20, NOW + 6 * 86400, true), NOW);
+    assert_eq!(f.order(&policy), vec![c.clone(), b.clone()]);
+    // A short-only account is usable, but its unknown weekly usage ranks last.
+    let mut short_only = main_quota(10, 10);
+    short_only.limits[0].secondary = None;
+    f.read(&b, short_only.clone(), NOW);
+    for order in [
+        CandidateOrder::SoonestWeeklyReset,
+        CandidateOrder::MostWeeklyLeft,
+    ] {
+        assert_eq!(
+            f.order(&CodexPolicy { order, ..policy }),
+            vec![c.clone(), b.clone()]
+        );
+    }
+    f.read(&c, weekly_only_quota(95, NOW + 86400, true), NOW);
+    assert_eq!(f.next(&policy), Some(b.clone()));
+    // No main windows proves neither availability nor that every account is limited.
+    short_only.limits[0].primary = None;
+    f.read(&b, short_only, NOW);
+    assert_eq!(f.next(&policy), None);
+    assert_eq!(f.engine.automation(NOW, &policy), CodexAutomation::Idle);
+}
+
+#[test]
 fn limited_unread_failed_or_unswitchable_accounts_are_never_next() {
     let mut f = Fixture::new();
     let b = f.add("user-b", "ws-b", "saved");
@@ -1352,8 +1473,9 @@ fn limited_unread_failed_or_unswitchable_accounts_are_never_next() {
     f.read(&b, usable.clone(), NOW);
     f.quota_mut(&b).ordinary_usage_allowed = Some(false);
     assert_eq!(f.next(&policy), None);
-    // A missing main window is not evidence of free usage.
+    // With no main windows there is no evidence of free usage.
     f.read(&b, usable.clone(), NOW);
+    f.quota_mut(&b).limits[0].primary = None;
     f.quota_mut(&b).limits[0].secondary = None;
     assert_eq!(f.next(&policy), None);
     // A failed latest reading, a rejected sign-in or a switch in progress.
@@ -1690,6 +1812,57 @@ async fn until(condition: impl Fn() -> bool) {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     panic!("the fixture condition was never reached");
+}
+
+#[tokio::test]
+async fn the_background_tick_switches_to_a_weekly_only_codex_account() {
+    let mut f = Fixture::new();
+    let a = f.id_of("ws-a");
+    let b = f.add("user-b", "ws-b", "saved");
+    f.read(&a, main_quota(13, 95), NOW);
+    f.read(
+        &b,
+        weekly_only_quota(19, NOW + 4 * 86400 + 23 * 3600, true),
+        NOW,
+    );
+    // Read the new active account through the fake service after switching.
+    let mut reading = quota(Some("ws-b"), 0, 19);
+    reading.rate_limits.primary = reading.rate_limits.secondary.take();
+    f.factory.enqueue(Plan::quota(Ok(reading)));
+    let daemon = f.daemon.clone();
+    let settings = Settings {
+        threshold: 94.0,
+        poll_interval: 120,
+        ..Settings::default()
+    };
+    let (_temp, handle) = runtime(&mut f, settings).await;
+    let before = handle.get_codex_snapshot();
+    assert_eq!(before.next_id, Some(b.clone()));
+    assert_eq!(before.order, vec![b.clone()]);
+    let mut notifications = handle.notifications();
+    handle.codex_tick().await;
+    let notice = notifications.try_recv().unwrap();
+    assert_eq!(notice.title, "Codex switched to user-b@example.invalid");
+    assert!(notice.body.contains("reached 95%"));
+    assert_eq!(
+        handle.get_codex_snapshot().selected_id.as_deref(),
+        Some(b.as_str())
+    );
+    assert_eq!(f.active(), auth("user-b", "ws-b", "saved"));
+    assert_eq!(*daemon.calls.lock().unwrap(), vec!["state", "restart"]);
+    until(|| {
+        handle.get_codex_snapshot().accounts.iter().any(|account| {
+            account.id == b
+                && account.quota_state == CodexQuotaState::Fresh
+                && account.quota.as_ref().is_some_and(|quota| {
+                    quota.limits[0].secondary.is_none()
+                        && quota.limits[0].primary.as_ref().is_some_and(|window| {
+                            window.used_percent == 19 && window.window_duration_mins == Some(10080)
+                        })
+                })
+        })
+    })
+    .await;
 }
 
 #[tokio::test]

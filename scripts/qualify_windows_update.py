@@ -23,6 +23,7 @@ ROOT = Path(__file__).resolve().parent.parent
 ARTIFACTS = ROOT / ".artifacts"
 REPORT = ARTIFACTS / "windows-update-preservation-report.json"
 OLD_URL = "https://github.com/Primer-Tech/PrimerSwitch/releases/download/v0.2.0-preview.1/PrimerSwitch_0.2.0_x64-setup.exe"
+OLD_VERSION = "0.2.0"
 # Exact producer transform in tauri-cli v2.12.1 (commit below), bundle.rs:
 # patch_binary() lines40-96 writes UNK -> NSS for NSIS; bundle_project()
 # lines134-145 and212-218 restores the original after packaging. No other
@@ -319,7 +320,7 @@ def main() -> int:
         stage = "old-isolated-install"
         # /UPDATE avoids WebView2 bootstrap/download and still creates registration.
         run_silent(old, ["/S", "/UPDATE"], install)
-        verify_registration(registry_state(), install, "0.1.1")
+        verify_registration(registry_state(), install, OLD_VERSION)
         require((install / "primerswitch.exe").is_file(), "old-application-not-installed")
         old_binary_hash = sha256((install / "primerswitch.exe").read_bytes())
         report["oldApplicationSha256"] = old_binary_hash

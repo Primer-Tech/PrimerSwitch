@@ -12,6 +12,17 @@ The [release-source verification matrix](https://github.com/Primer-Tech/PrimerSw
 
 The owner's second report was traced to the installed Ultracodex 0.3.6 detached supervisor: native `codex exec` keeps its own loaded login, and a usage-limit error was terminal even after PrimerSwitch wrote another account. The isolated companion source at commit `e16cde3d27bb15a602fb13c9807b579d2dcf911e` preserves the installed plugin's existing behavior and adds durable-thread account continuation. It detects changes of managed ChatGPT account without logging credentials, keeps the original run/request/schema/permissions, waits within bounded deadlines, and supports existing relay prompts plus still-polled durable 0.3.6 jobs. If encrypted reasoning is account-bound, it continues from bounded visible history without modifying the original rollout. All 138 offline Node fixtures passed, including one-time writing effects, exact-thread resume, encrypted-history fallback, racing legacy waiters, cancellation, orphan/process ownership, signed transport and generated-workflow consistency. The restricted shell's Windows process-inspection fixture passed when run with normal Windows process visibility; the complete final suite passed there too. The user's original dirty source checkout was left intact. Release assets include the companion source package, the focused 0.3.6-to-0.3.7 patch and test evidence.
 
+Published [v0.2.1-preview.1](https://github.com/Primer-Tech/PrimerSwitch/releases/tag/v0.2.1-preview.1)
+on release commit `25622b5fd819b79f1cb39b1af5a9fccd9428380b`, with all 35
+GitHub asset SHA256 digests verified against the staged files before and after
+publication. The owner's installed PrimerSwitch was upgraded from 0.2.0 to
+0.2.1 in its existing directory and restarted; registration and executable hash
+match the qualified package. Ultracodex 0.3.7 was installed locally and the old
+0.3.6 runner path was updated for already-loaded Claude relays, with original
+files backed up. Claude and Codex processes were not stopped by these updates.
+These installation checks read application/plugin metadata and executable hashes;
+they do not constitute authenticated end-to-end provider qualification.
+
 ## Branded 0.1.1 release qualification
 
 The [0.1.1 branded preview](https://github.com/Primer-Tech/PrimerSwitch/releases/tag/v0.1.1-preview.1) adds the genuine Primer logo/Comfortaa wordmark, removes duplicate Automation navigation, and preserves the existing application/storage identity. Windows x64 NSIS, macOS ARM64 DMG, Ubuntu 24.04 x64 DEB and an experimental x64 RPM have verified installer hashes and per-platform provenance. Application source and lockfiles are identical between package commits 77ffa1cfa2a6482dee5cd0aaec608de123fda9de and cbf6f972e7231b45e8cdba18e4b325f4a3a5f9b3; the latter fixes only creation of the native RPM output directory.

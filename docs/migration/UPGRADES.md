@@ -55,6 +55,12 @@ and weekly windows**, retaining its saved enabled/disabled value. It now starts
 expired 5-hour windows on inactive Claude accounts at the next ordinary check,
 and shares one tiny message when both windows are due. New optional encrypted
 state fields retain the reset and retry history; older records remain compatible.
-The installer qualification baseline is pinned to the exact published 0.2.1
-Windows installer. Current qualification and release status are recorded in
-[the evidence ledger](PROGRESS.md).
+The [hosted installer qualification](https://github.com/Primer-Tech/PrimerSwitch/actions/runs/37837311497)
+used the exact published 0.2.1 Windows installer, then applied the source-bound
+0.2.2 installer twice. Both upgrade and same-version reinstall retained all
+seven synthetic state/key/settings/journal/opaque sentinels and installed the
+expected application bytes. The [0.2.2 preview](https://github.com/Primer-Tech/PrimerSwitch/releases/tag/v0.2.2-preview.1)
+is published with the preservation report and package provenance. The owner's
+local upgrade also retained all four existing opaque state/key files exactly
+before the application was restarted. See [the evidence ledger](PROGRESS.md)
+for qualification scope.

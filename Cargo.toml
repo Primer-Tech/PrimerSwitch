@@ -4,7 +4,7 @@ members = ["crates/switcher-core", "crates/switcher-platform", "crates/provider-
 default-members = ["crates/switcher-core", "crates/switcher-platform", "crates/provider-claude", "crates/provider-codex", "crates/switcher-runtime", "crates/switcher-diagnostics"]
 
 [workspace.package]
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 rust-version = "1.96"
 license = "MIT"

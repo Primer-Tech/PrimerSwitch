@@ -171,6 +171,7 @@ export const en = {
   renewalDay: 'Day {day}',
   manualEstimate: 'Manual estimate · {date}',
   primedLabel: 'Weekly window started',
+  fiveHourPrimedLabel: '5-hour window started',
   scopedStale: 'Model readings are out of date.',
   lastReadingKept: 'The last reading is retained.',
   identityVerified: 'Verified: the saved sign-in belongs to this account.',
@@ -214,9 +215,9 @@ export const en = {
   preferSoonestReset: 'Use the account whose weekly limit resets soonest first',
   preferSoonestResetHelp:
     'Spends quota that would otherwise expire unused. Off: prefer the account with the most weekly usage left.',
-  primeWindow: 'Start the weekly window',
+  primeWindow: 'Start the 5-hour and weekly windows',
   primeHelp:
-    "When an account's weekly window ends, send one very short message to start the next one right away, so its next reset comes sooner.",
+    "When an account's 5-hour or weekly window ends, send one very short message at the next check to start the next window, so its next reset comes sooner. This also applies to inactive accounts. If both windows end together, one message starts both.",
   autoResets: 'Use resets automatically',
   resetsHelp:
     'When every account is at its limit, use a banked reset. If the reset belongs to another account, PrimerSwitch switches to that account first, even when automatic switching is off. A reset about to expire is used on its own account without switching.',
@@ -236,7 +237,7 @@ export const en = {
     'Choose an interval between 2 and 15 minutes and a threshold between 50% and 100%.',
   globalPreferences: 'Appearance and language',
   settingsProviderScope:
-    'Automatic switching, the weekly reset order, the check interval and the switch threshold apply to Claude and Codex. Starting the weekly window and using resets apply to Claude only. Appearance and language apply to both.',
+    'Automatic switching, the weekly reset order, the check interval and the switch threshold apply to Claude and Codex. Starting the 5-hour and weekly windows and using resets apply to Claude only. Appearance and language apply to both.',
   sharedAutomation: 'Automation for Claude and Codex',
   claudeOnlyAutomation: 'Claude only',
 

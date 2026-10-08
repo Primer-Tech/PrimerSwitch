@@ -49,6 +49,14 @@ pub struct StoredAccount {
     pub rate_limited_until: Option<i64>,
     pub expected_weekly_reset_at: Option<i64>,
     pub primed_for_reset_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_five_hour_reset_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub five_hour_primed_for_reset_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub five_hour_started_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub five_hour_priming_pending_for: Option<i64>,
     pub consecutive_rate_limits: u32,
     pub last_usage: Option<UsageResponse>,
     pub last_usage_at: Option<i64>,

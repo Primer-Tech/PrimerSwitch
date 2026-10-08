@@ -176,6 +176,7 @@ export const ro: Record<keyof typeof en, string> = {
   renewalDay: 'Ziua {day}',
   manualEstimate: 'Estimare introdusă manual · {date}',
   primedLabel: 'Fereastra săptămânală a pornit',
+  fiveHourPrimedLabel: 'Fereastra de 5 ore a pornit',
   scopedStale: 'Datele pe modele sunt vechi.',
   lastReadingKept: 'Ultima citire este păstrată.',
   identityVerified: 'Verificat: autentificarea salvată aparține acestui cont.',
@@ -222,9 +223,9 @@ export const ro: Record<keyof typeof en, string> = {
     'Folosește întâi contul a cărui limită săptămânală se resetează cel mai curând',
   preferSoonestResetHelp:
     'Consumă întâi ce altfel ar expira nefolosit. Dezactivat: se preferă contul cu cea mai mare rezervă săptămânală.',
-  primeWindow: 'Pornește fereastra săptămânală',
+  primeWindow: 'Pornește ferestrele de 5 ore și săptămânală',
   primeHelp:
-    'Când fereastra săptămânală a unui cont se încheie, trimite un mesaj foarte scurt pentru a o porni imediat pe următoarea, ca resetarea ei să vină mai devreme.',
+    'Când fereastra de 5 ore sau cea săptămânală a unui cont se încheie, trimite un mesaj foarte scurt la următoarea verificare pentru a porni fereastra următoare, ca resetarea ei să vină mai devreme. Se aplică și conturilor inactive. Dacă ambele ferestre se încheie simultan, un singur mesaj le pornește pe amândouă.',
   autoResets: 'Folosește automat resetările',
   resetsHelp:
     'Când toate conturile sunt la limită, folosește o resetare disponibilă. Dacă resetarea aparține altui cont, PrimerSwitch comută mai întâi pe acel cont, chiar dacă comutarea automată este oprită. O resetare care expiră curând este folosită pe contul ei, fără comutare.',
@@ -244,7 +245,7 @@ export const ro: Record<keyof typeof en, string> = {
     'Alege un interval între 2 și 15 minute și un prag între 50% și 100%.',
   globalPreferences: 'Aspect și limbă',
   settingsProviderScope:
-    'Comutarea automată, ordinea resetărilor săptămânale, intervalul de verificare și pragul de comutare se aplică pentru Claude și Codex. Pornirea ferestrei săptămânale și folosirea resetărilor se aplică doar pentru Claude. Aspectul și limba se aplică ambilor furnizori.',
+    'Comutarea automată, ordinea resetărilor săptămânale, intervalul de verificare și pragul de comutare se aplică pentru Claude și Codex. Pornirea ferestrelor de 5 ore și săptămânală și folosirea resetărilor se aplică doar pentru Claude. Aspectul și limba se aplică ambilor furnizori.',
   sharedAutomation: 'Automatizare pentru Claude și Codex',
   claudeOnlyAutomation: 'Doar pentru Claude',
 

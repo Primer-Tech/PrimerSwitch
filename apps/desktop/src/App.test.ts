@@ -108,6 +108,7 @@ describe('desktop workflows', () => {
     const dialog = await details('Studio');
     expect(dialog).toHaveTextContent('Available resets');
     expect(dialog).toHaveTextContent('Weekly window started');
+    expect(dialog).toHaveTextContent('5-hour window started');
     expect(
       within(dialog).getByRole('meter', { name: 'Weekly · Sonnet' }),
     ).toBeVisible();
@@ -306,7 +307,9 @@ describe('desktop workflows', () => {
     setup();
     await screen.findAllByText('a@example.invalid');
     const automation = section('Automation');
-    expect(automation.getByText('Start the weekly window')).toBeVisible();
+    expect(
+      automation.getByText('Start the 5-hour and weekly windows'),
+    ).toBeVisible();
     expect(automation.getByText('Use resets automatically')).toBeVisible();
     await fireEvent.click(
       screen.getByRole('button', { name: 'Open settings' }),

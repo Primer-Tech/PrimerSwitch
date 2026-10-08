@@ -19,7 +19,7 @@ The [Codex 0.160.0 adapter](docs/migration/CODEX_USAGE.md) supports isolated man
 - Browser sign-in with PKCE, import of the current Claude CLI login, and previewed legacy account import.
 - Manual switching with token-owner verification and encrypted recovery journals.
 - Five-hour, weekly and model-specific quota views, reset countdowns, and a ranked consumption order.
-- Automatic switching, weekly-window priming, reset-credit handling and notifications.
+- Automatic switching, 5-hour and weekly window priming, reset-credit handling and notifications.
 - Encrypted account vault: DPAPI on Windows, an application-owned Keychain key on macOS, and encrypted Secret Service sessions on Linux.
 - Appearance, language, polling, threshold, automation and manual renewal-date preferences.
 

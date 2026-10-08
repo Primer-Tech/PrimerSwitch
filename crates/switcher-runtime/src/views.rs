@@ -176,6 +176,7 @@ pub struct AccountView {
     pub next_renewal_at: Option<i64>,
     pub resets: ResetView,
     pub primed_at: Option<i64>,
+    pub five_hour_primed_at: Option<i64>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

@@ -1062,6 +1062,7 @@ impl Engine {
                             .map(|text| safe_reset_text(text, &self.saved.settings.language)),
                     },
                     primed_at: a.primed_for_reset_at,
+                    five_hour_primed_at: a.five_hour_started_at,
                 }
             })
             .collect();
@@ -1746,7 +1747,19 @@ impl Engine {
             for a in &self.saved.accounts {
                 if a.provider == ProviderId::Claude
                     && self.active_id.as_deref() != Some(&a.id)
-                    && (force || !a.identity_verified || !recent(a.last_usage_at, now, 900))
+                    && (force
+                        || !a.identity_verified
+                        || !recent(a.last_usage_at, now, 900)
+                        || (self.saved.settings.auto_start_window_enabled
+                            && (Self::window_priming_due(
+                                a.expected_five_hour_reset_at,
+                                a.five_hour_primed_for_reset_at,
+                                now,
+                            ) || Self::window_priming_due(
+                                a.expected_weekly_reset_at,
+                                a.primed_for_reset_at,
+                                now,
+                            ))))
                     // A refused sign-in waits for its daily retry or an explicit refresh.
                     && (force || !self.sign_in_backoff(a, now))
                 {
@@ -1930,51 +1943,110 @@ impl Engine {
         let i = self.index(id)?;
         let now = self.clock.now();
         let a = &mut self.saved.accounts[i];
+        // An accepted usage check already sent the same tiny inference used for
+        // priming. It satisfies every expired window even without reset headers.
         if let Some(old) = a.expected_weekly_reset_at
             && old <= now
-            && a.last_usage
-                .as_ref()
-                .and_then(UsageResponse::weekly_all_resets_at)
-                .is_some_and(|next| next > old)
         {
             a.primed_for_reset_at = Some(old);
             a.priming_pending_for = None;
         }
+        if let Some(old) = a.expected_five_hour_reset_at
+            && old <= now
+        {
+            if a.five_hour_primed_for_reset_at != Some(old) {
+                a.five_hour_started_at = Some(now);
+            }
+            a.five_hour_primed_for_reset_at = Some(old);
+            a.five_hour_priming_pending_for = None;
+        }
         Ok(())
+    }
+    fn window_priming_due(expected: Option<i64>, primed: Option<i64>, now: i64) -> bool {
+        expected.is_some_and(|reset| reset <= now && primed != Some(reset))
+    }
+    fn window_to_prime(
+        expected: &mut Option<i64>,
+        primed: &mut Option<i64>,
+        pending: &mut Option<i64>,
+        next: Option<i64>,
+        now: i64,
+        enabled: bool,
+    ) -> Option<i64> {
+        if let Some(attempted_reset) = *pending
+            && next.is_some_and(|n| n > attempted_reset)
+        {
+            *primed = Some(attempted_reset);
+            *pending = None;
+        }
+        let Some(old) = *expected else {
+            *expected = next;
+            return None;
+        };
+        if old > now || *primed == Some(old) {
+            if next.is_some() {
+                *expected = next;
+            }
+            return None;
+        }
+        if !enabled {
+            // Turning automation off does not erase an unresolved attempt or
+            // replace its reset key. Fresh metadata may still reconcile it.
+            if pending.is_none() {
+                *primed = Some(old);
+                *expected = next;
+            }
+            return None;
+        }
+        Some(old)
     }
     async fn prime(&mut self, id: &str, expected: &str) -> Result<(), RuntimeError> {
         let i = self.index(id)?;
         let now = self.clock.now();
-        let next = self.saved.accounts[i]
+        let enabled = self.saved.settings.auto_start_window_enabled;
+        let attempted_at = self
+            .saved
+            .readings
+            .get(id)
+            .and_then(|r| r.priming_attempt_at);
+        let a = &mut self.saved.accounts[i];
+        let five_pending = a.five_hour_priming_pending_for;
+        let five_next = a.last_usage.as_ref().and_then(|u| u.five_hour.resets_at);
+        let weekly_next = a
             .last_usage
             .as_ref()
             .and_then(UsageResponse::weekly_all_resets_at);
-        let Some(old) = self.saved.accounts[i].expected_weekly_reset_at else {
-            self.saved.accounts[i].expected_weekly_reset_at = next;
-            return Ok(());
-        };
-        if self.saved.accounts[i].priming_pending_for == Some(old) && next.is_some_and(|n| n > old)
+        let five = Self::window_to_prime(
+            &mut a.expected_five_hour_reset_at,
+            &mut a.five_hour_primed_for_reset_at,
+            &mut a.five_hour_priming_pending_for,
+            five_next,
+            now,
+            enabled,
+        );
+        let weekly = Self::window_to_prime(
+            &mut a.expected_weekly_reset_at,
+            &mut a.primed_for_reset_at,
+            &mut a.priming_pending_for,
+            weekly_next,
+            now,
+            enabled,
+        );
+        if five_pending.is_some()
+            && a.five_hour_priming_pending_for.is_none()
+            && a.five_hour_primed_for_reset_at == five_pending
         {
-            self.saved.accounts[i].primed_for_reset_at = Some(old);
-            self.saved.accounts[i].priming_pending_for = None;
+            a.five_hour_started_at = attempted_at.or(Some(now));
         }
-        if old > now || self.saved.accounts[i].primed_for_reset_at == Some(old) {
-            if next.is_some() {
-                self.saved.accounts[i].expected_weekly_reset_at = next;
-            }
+        if five.is_none() && weekly.is_none() {
             return Ok(());
         }
-        if !self.saved.settings.auto_start_window_enabled {
-            self.saved.accounts[i].primed_for_reset_at = Some(old);
-            self.saved.accounts[i].expected_weekly_reset_at = next;
-            return Ok(());
-        }
-        if !self.saved.accounts[i].identity_verified {
+        if !a.identity_verified {
             return Ok(());
         }
         // Reconcile pending attempts with a fresh metadata observation first. A
         // retry is never issued immediately after a crash/ambiguous network reply.
-        if self.saved.accounts[i].priming_pending_for.is_some() {
+        if a.priming_pending_for.is_some() || a.five_hour_priming_pending_for.is_some() {
             let last = self
                 .saved
                 .readings
@@ -1986,7 +2058,14 @@ impl Engine {
                 return Ok(());
             }
         }
-        self.saved.accounts[i].priming_pending_for = Some(old);
+        // One inference starts every due window on this account. Save both keys
+        // before sending it so an ambiguous reply survives a restart.
+        if five.is_some() {
+            self.saved.accounts[i].five_hour_priming_pending_for = five;
+        }
+        if weekly.is_some() {
+            self.saved.accounts[i].priming_pending_for = weekly;
+        }
         self.saved
             .readings
             .entry(id.into())
@@ -2012,28 +2091,52 @@ impl Engine {
                 self.saved.accounts[i].last_usage = Some(usage);
                 self.saved.accounts[i].last_usage_at = Some(self.clock.now());
                 self.saved.readings.entry(id.into()).or_default().complete = read.complete;
-                self.saved.accounts[i].primed_for_reset_at = Some(old);
-                self.saved.accounts[i].priming_pending_for = None;
-                self.saved.accounts[i].expected_weekly_reset_at = self.saved.accounts[i]
+                let a = &mut self.saved.accounts[i];
+                if let Some(old) = five {
+                    a.five_hour_primed_for_reset_at = Some(old);
+                    a.five_hour_priming_pending_for = None;
+                    a.five_hour_started_at = Some(self.clock.now());
+                }
+                if let Some(old) = weekly {
+                    a.primed_for_reset_at = Some(old);
+                    a.priming_pending_for = None;
+                }
+                a.expected_five_hour_reset_at =
+                    a.last_usage.as_ref().and_then(|u| u.five_hour.resets_at);
+                a.expected_weekly_reset_at = a
                     .last_usage
                     .as_ref()
                     .and_then(UsageResponse::weekly_all_resets_at);
                 let label = self.label(id);
-                self.notify(if self.ro() {
-                    format!("Fereastra săptămânală a fost pornită pentru {label}.")
-                } else {
-                    format!("The weekly window was started for {label}.")
+                self.notify(match (five.is_some(), weekly.is_some(), self.ro()) {
+                    (true, true, true) => format!(
+                        "Ferestrele de 5 ore și săptămânală au fost pornite pentru {label}."
+                    ),
+                    (true, true, false) => {
+                        format!("The 5-hour and weekly windows were started for {label}.")
+                    }
+                    (true, false, true) => {
+                        format!("Fereastra de 5 ore a fost pornită pentru {label}.")
+                    }
+                    (true, false, false) => {
+                        format!("The 5-hour window was started for {label}.")
+                    }
+                    (_, _, true) => format!("Fereastra săptămânală a fost pornită pentru {label}."),
+                    (_, _, false) => format!("The weekly window was started for {label}."),
                 });
             }
-            Ok(_) => {
-                self.saved.accounts[i].priming_pending_for = None;
-            }
-            Err(
+            Ok(_)
+            | Err(
                 ClientError::Unauthorized
                 | ClientError::RateLimited { .. }
                 | ClientError::Http(400..=499),
             ) => {
-                self.saved.accounts[i].priming_pending_for = None;
+                if five.is_some() {
+                    self.saved.accounts[i].five_hour_priming_pending_for = None;
+                }
+                if weekly.is_some() {
+                    self.saved.accounts[i].priming_pending_for = None;
+                }
             }
             Err(_) => {} // An unknown outcome retains its durable reconciliation marker.
         }
@@ -3449,6 +3552,351 @@ mod tests {
             assert_eq!(engine.saved.accounts[0].priming_pending_for, None);
         }
         assert_eq!(count(&fake, INFERENCE_URL), 1);
+    }
+    #[tokio::test]
+    async fn both_windows_share_one_durable_priming_request() {
+        for (language, message) in [
+            (
+                "en",
+                "The 5-hour and weekly windows were started for b@example.invalid.",
+            ),
+            (
+                "ro",
+                "Ferestrele de 5 ore și săptămânală au fost pornite pentru b@example.invalid.",
+            ),
+        ] {
+            let fake = Arc::new(Fake::default());
+            let (temp, handle, _clock, paths) =
+                fixture(vec![account("b", 1000)], None, 1000, fake.clone());
+            handle.tick(true).await.unwrap();
+            let mut notices = handle.notifications();
+            let mut engine = handle.inner.owner.lock().await;
+            engine.saved.settings.auto_start_window_enabled = true;
+            engine.saved.settings.language = language.into();
+            let a = &mut engine.saved.accounts[0];
+            a.expected_five_hour_reset_at = Some(950);
+            a.expected_weekly_reset_at = Some(900);
+            let usage = a.last_usage.as_mut().unwrap();
+            usage.five_hour.resets_at = None;
+            usage.seven_day.resets_at = None;
+            let directory = temp.path().join("vault");
+            *fake.hook.lock().unwrap() = Some(Box::new(move |request| {
+                assert_eq!(request.url, INFERENCE_URL);
+                let vault = Vault::with_key(directory, [7; 32]).unwrap();
+                let saved = vault.load::<Persisted>(RECORD).unwrap().unwrap();
+                assert_eq!(saved.accounts[0].five_hour_priming_pending_for, Some(950));
+                assert_eq!(saved.accounts[0].priming_pending_for, Some(900));
+                assert_eq!(saved.readings["b"].priming_attempt_at, Some(1000));
+            }));
+            let expected = engine.live().unwrap().identity_fingerprint;
+            engine.prime("b", &expected).await.unwrap();
+            let a = &engine.saved.accounts[0];
+            assert_eq!(a.five_hour_primed_for_reset_at, Some(950));
+            assert_eq!(a.primed_for_reset_at, Some(900));
+            assert_eq!(a.expected_five_hour_reset_at, Some(10000));
+            assert_eq!(a.expected_weekly_reset_at, Some(90000));
+            assert_eq!(a.five_hour_priming_pending_for, None);
+            assert_eq!(a.priming_pending_for, None);
+            assert_eq!(notices.try_recv().unwrap().body, message);
+            engine.prime("b", &expected).await.unwrap();
+            assert_eq!(count(&fake, INFERENCE_URL), 1);
+            assert!(notices.try_recv().is_err());
+            assert!(!paths.credentials_file.exists());
+            assert!(!paths.global_config_file.exists());
+        }
+    }
+    #[tokio::test]
+    async fn an_inactive_five_hour_window_starts_at_the_next_check_without_switching() {
+        let fake = Arc::new(Fake::default());
+        let (_temp, handle, clock, paths) = fixture(
+            vec![account("a", 1000), account("b", 1000)],
+            Some("a"),
+            1000,
+            fake.clone(),
+        );
+        handle.tick(true).await.unwrap();
+        let credentials = std::fs::read(&paths.credentials_file).unwrap();
+        let config = std::fs::read(&paths.global_config_file).unwrap();
+        {
+            let mut engine = handle.inner.owner.lock().await;
+            engine.saved.settings.auto_start_window_enabled = true;
+            let a = &mut engine.saved.accounts[1];
+            a.expected_five_hour_reset_at = Some(1100);
+            a.last_usage.as_mut().unwrap().five_hour.resets_at = Some(1100);
+        }
+        let mut notices = handle.notifications();
+        clock.0.store(1200, Ordering::SeqCst);
+        handle.tick(true).await.unwrap();
+        assert_eq!(
+            notices.try_recv().unwrap().body,
+            "The 5-hour window was started for b@example.invalid."
+        );
+        let snapshot = handle.get_snapshot();
+        let b = snapshot.accounts.iter().find(|a| a.id == "b").unwrap();
+        assert_eq!(b.five_hour_primed_at, Some(1200));
+        assert_eq!(b.primed_at, None);
+        assert_eq!(snapshot.active_id.as_deref(), Some("a"));
+        assert_eq!(std::fs::read(&paths.credentials_file).unwrap(), credentials);
+        assert_eq!(std::fs::read(&paths.global_config_file).unwrap(), config);
+        // Its reading is still fresh; the expired remembered window, rather than
+        // the usual 15-minute refresh cadence, made this account participate.
+        assert_eq!(count(&fake, INFERENCE_URL), 3);
+        clock.0.store(1500, Ordering::SeqCst);
+        handle.tick(true).await.unwrap();
+        assert_eq!(count(&fake, INFERENCE_URL), 4); // Only the active account.
+    }
+    #[tokio::test]
+    async fn active_readings_resolve_both_windows_without_an_extra_priming_request() {
+        for ordinary in [true, false] {
+            for report_resets in [true, false] {
+                let fake = Arc::new(Fake::default());
+                let (_temp, handle, _clock, _paths) =
+                    fixture(vec![account("a", 1000)], Some("a"), 1000, fake.clone());
+                {
+                    let mut engine = handle.inner.owner.lock().await;
+                    engine.saved.settings.auto_start_window_enabled = true;
+                    engine.saved.accounts[0].expected_five_hour_reset_at = Some(900);
+                    engine.saved.accounts[0].expected_weekly_reset_at = Some(900);
+                    engine.saved.accounts[0].five_hour_priming_pending_for = Some(900);
+                    engine.saved.accounts[0].priming_pending_for = Some(900);
+                }
+                if !report_resets {
+                    fake.replies.lock().unwrap().push_back((
+                        INFERENCE_URL,
+                        Ok(HttpResponse {
+                            status: 200,
+                            body: json!({}),
+                            headers: BTreeMap::from([
+                                (
+                                    "anthropic-ratelimit-unified-5h-utilization".into(),
+                                    "0.2".into(),
+                                ),
+                                (
+                                    "anthropic-ratelimit-unified-7d-utilization".into(),
+                                    "0.2".into(),
+                                ),
+                            ]),
+                        }),
+                    ));
+                }
+                handle.tick(ordinary).await.unwrap();
+                assert_eq!(count(&fake, INFERENCE_URL), 1);
+                assert_eq!(count(&fake, USAGE_URL), usize::from(ordinary));
+                let snapshot = handle.get_snapshot();
+                assert_eq!(snapshot.accounts[0].five_hour_primed_at, Some(1000));
+                assert_eq!(snapshot.accounts[0].primed_at, Some(900));
+                let engine = handle.inner.owner.lock().await;
+                assert_eq!(engine.saved.accounts[0].five_hour_priming_pending_for, None);
+                assert_eq!(engine.saved.accounts[0].priming_pending_for, None);
+            }
+        }
+    }
+    #[tokio::test]
+    async fn five_hour_unknown_outcomes_survive_restart_and_require_fresh_reconciliation() {
+        for retry in [false, true] {
+            let fake = Arc::new(Fake::default());
+            let (temp, handle, clock, paths) =
+                fixture(vec![account("b", 1000)], None, 1000, fake.clone());
+            handle.tick(true).await.unwrap();
+            *fake.usage.lock().unwrap() = json!({
+                "five_hour":{"utilization":0,"resets_at":null},
+                "seven_day":{"utilization":20,"resets_at":90000},"limits":[]
+            });
+            {
+                let mut engine = handle.inner.owner.lock().await;
+                engine.saved.settings.auto_start_window_enabled = true;
+                engine.saved.accounts[0].expected_five_hour_reset_at = Some(900);
+                engine.saved.accounts[0]
+                    .last_usage
+                    .as_mut()
+                    .unwrap()
+                    .five_hour
+                    .resets_at = None;
+                fake.replies
+                    .lock()
+                    .unwrap()
+                    .push_back((INFERENCE_URL, Err(ClientError::Transport)));
+                let expected = engine.live().unwrap().identity_fingerprint;
+                engine.prime("b", &expected).await.unwrap();
+                engine.saved.settings.auto_start_window_enabled = false;
+                engine.prime("b", &expected).await.unwrap();
+                assert_eq!(
+                    engine.saved.accounts[0].expected_five_hour_reset_at,
+                    Some(900)
+                );
+                assert_eq!(
+                    engine.saved.accounts[0].five_hour_priming_pending_for,
+                    Some(900)
+                );
+                assert_eq!(engine.saved.accounts[0].five_hour_started_at, None);
+                engine.saved.settings.auto_start_window_enabled = true;
+                engine.persist().unwrap();
+            }
+            drop(handle);
+            let vault = Vault::with_key(temp.path().join("vault"), [7; 32]).unwrap();
+            let saved = vault.load::<Persisted>(RECORD).unwrap().unwrap();
+            assert_eq!(saved.accounts[0].five_hour_priming_pending_for, Some(900));
+            assert_eq!(saved.accounts[0].priming_pending_for, None);
+            let reopened = RuntimeHandle::from_parts(
+                vault,
+                ActiveStore::file(paths),
+                ClaudeClient::with_transport("2.1.287", fake.clone()).unwrap(),
+                clock.clone(),
+            )
+            .unwrap();
+            clock.0.store(1030, Ordering::SeqCst);
+            reopened.refresh_account("b").await.unwrap();
+            assert_eq!(count(&fake, INFERENCE_URL), 1);
+            // Waiting out the retry delay alone does not permit another request.
+            clock.0.store(1901, Ordering::SeqCst);
+            {
+                let mut engine = reopened.inner.owner.lock().await;
+                let expected = engine.live().unwrap().identity_fingerprint;
+                engine.prime("b", &expected).await.unwrap();
+            }
+            assert_eq!(count(&fake, INFERENCE_URL), 1);
+            if !retry {
+                fake.usage.lock().unwrap()["five_hour"]["resets_at"] = json!(10000);
+            }
+            reopened.refresh_account("b").await.unwrap();
+            assert_eq!(count(&fake, INFERENCE_URL), if retry { 2 } else { 1 });
+            let engine = reopened.inner.owner.lock().await;
+            let a = &engine.saved.accounts[0];
+            assert_eq!(a.five_hour_priming_pending_for, None);
+            assert_eq!(a.five_hour_primed_for_reset_at, Some(900));
+            assert_eq!(a.expected_five_hour_reset_at, Some(10000));
+        }
+    }
+    #[tokio::test]
+    async fn first_observations_disabled_automation_and_unverified_accounts_do_not_prime() {
+        for enabled in [true, false] {
+            let fake = Arc::new(Fake::default());
+            let (_temp, handle, _clock, _paths) =
+                fixture(vec![account("b", 1000)], None, 1000, fake.clone());
+            let mut engine = handle.inner.owner.lock().await;
+            engine.saved.settings.auto_start_window_enabled = enabled;
+            let a = &mut engine.saved.accounts[0];
+            a.identity_verified = true;
+            let usage = a.last_usage.as_mut().unwrap();
+            usage.five_hour.resets_at = Some(950);
+            usage.seven_day.resets_at = Some(900);
+            let expected = engine.live().unwrap().identity_fingerprint;
+            engine.prime("b", &expected).await.unwrap();
+            assert_eq!(
+                engine.saved.accounts[0].expected_five_hour_reset_at,
+                Some(950)
+            );
+            assert_eq!(engine.saved.accounts[0].expected_weekly_reset_at, Some(900));
+            engine.saved.accounts[0].identity_verified = !enabled;
+            engine.prime("b", &expected).await.unwrap();
+            assert_eq!(count(&fake, INFERENCE_URL), 0);
+            assert_eq!(engine.saved.accounts[0].five_hour_priming_pending_for, None);
+            assert_eq!(engine.saved.accounts[0].priming_pending_for, None);
+            assert_eq!(engine.saved.accounts[0].five_hour_started_at, None);
+        }
+    }
+    #[tokio::test]
+    async fn the_next_five_hour_reset_is_primed_after_restart_while_the_week_stays_open() {
+        let fake = Arc::new(Fake::default());
+        let (temp, handle, clock, paths) =
+            fixture(vec![account("b", 1000)], None, 1000, fake.clone());
+        handle.tick(true).await.unwrap();
+        {
+            let mut engine = handle.inner.owner.lock().await;
+            engine.saved.settings.auto_start_window_enabled = true;
+            engine.saved.accounts[0].expected_five_hour_reset_at = Some(950);
+            let expected = engine.live().unwrap().identity_fingerprint;
+            engine.prime("b", &expected).await.unwrap();
+        }
+        drop(handle);
+        let reopened = RuntimeHandle::from_parts(
+            Vault::with_key(temp.path().join("vault"), [7; 32]).unwrap(),
+            ActiveStore::file(paths),
+            ClaudeClient::with_transport("2.1.287", fake.clone()).unwrap(),
+            clock.clone(),
+        )
+        .unwrap();
+        clock.0.store(10001, Ordering::SeqCst);
+        fake.usage.lock().unwrap()["five_hour"]["resets_at"] = Value::Null;
+        fake.replies.lock().unwrap().push_back((
+            INFERENCE_URL,
+            Ok(HttpResponse {
+                status: 200,
+                body: json!({}),
+                headers: BTreeMap::from([
+                    (
+                        "anthropic-ratelimit-unified-5h-utilization".into(),
+                        "0.2".into(),
+                    ),
+                    (
+                        "anthropic-ratelimit-unified-7d-utilization".into(),
+                        "0.2".into(),
+                    ),
+                    (
+                        "anthropic-ratelimit-unified-5h-reset".into(),
+                        "28001".into(),
+                    ),
+                    (
+                        "anthropic-ratelimit-unified-7d-reset".into(),
+                        "90000".into(),
+                    ),
+                ]),
+            }),
+        ));
+        reopened.tick(true).await.unwrap();
+        let engine = reopened.inner.owner.lock().await;
+        let a = &engine.saved.accounts[0];
+        assert_eq!(count(&fake, INFERENCE_URL), 2);
+        assert_eq!(a.five_hour_primed_for_reset_at, Some(10000));
+        assert_eq!(a.five_hour_started_at, Some(10001));
+        assert_eq!(a.expected_five_hour_reset_at, Some(28001));
+        assert_eq!(a.expected_weekly_reset_at, Some(90000));
+        assert_eq!(a.primed_for_reset_at, None);
+    }
+    #[tokio::test]
+    async fn a_refused_priming_request_never_marks_either_window_started() {
+        for refusal in [
+            Ok(HttpResponse {
+                status: 429,
+                body: json!({}),
+                headers: BTreeMap::from([
+                    (
+                        "anthropic-ratelimit-unified-5h-utilization".into(),
+                        "1".into(),
+                    ),
+                    (
+                        "anthropic-ratelimit-unified-7d-utilization".into(),
+                        "1".into(),
+                    ),
+                ]),
+            }),
+            Err(ClientError::Unauthorized),
+        ] {
+            let fake = Arc::new(Fake::default());
+            let (_temp, handle, _clock, _paths) =
+                fixture(vec![account("b", 1000)], None, 1000, fake.clone());
+            handle.tick(true).await.unwrap();
+            let mut notices = handle.notifications();
+            let mut engine = handle.inner.owner.lock().await;
+            engine.saved.settings.auto_start_window_enabled = true;
+            let a = &mut engine.saved.accounts[0];
+            a.expected_five_hour_reset_at = Some(950);
+            a.expected_weekly_reset_at = Some(900);
+            fake.replies
+                .lock()
+                .unwrap()
+                .push_back((INFERENCE_URL, refusal));
+            let expected = engine.live().unwrap().identity_fingerprint;
+            engine.prime("b", &expected).await.unwrap();
+            let a = &engine.saved.accounts[0];
+            assert_eq!(count(&fake, INFERENCE_URL), 1);
+            assert_eq!(a.five_hour_priming_pending_for, None);
+            assert_eq!(a.priming_pending_for, None);
+            assert_eq!(a.five_hour_primed_for_reset_at, None);
+            assert_eq!(a.primed_for_reset_at, None);
+            assert_eq!(a.five_hour_started_at, None);
+            assert!(notices.try_recv().is_err());
+        }
     }
     #[tokio::test]
     async fn cancelled_deferred_login_and_stale_ids_never_add_an_account() {

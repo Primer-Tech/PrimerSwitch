@@ -421,6 +421,10 @@
                 >{/if}
             </dd>
           </div>
+          {#if account.fiveHourPrimedAt !== null}<div>
+              <dt>{t($language, 'fiveHourPrimedLabel')}</dt>
+              <dd>{date(account.fiveHourPrimedAt, $language)}</dd>
+            </div>{/if}
           {#if account.primedAt !== null}<div>
               <dt>{t($language, 'primedLabel')}</dt>
               <dd>{date(account.primedAt, $language)}</dd>

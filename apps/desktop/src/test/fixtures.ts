@@ -50,6 +50,7 @@ export function account(
       lastOutcome: null,
     },
     primedAt: now - 3 * 86400,
+    fiveHourPrimedAt: now - 2 * 3600,
     ...overrides,
   };
 }

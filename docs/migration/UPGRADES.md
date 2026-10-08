@@ -1,6 +1,6 @@
 # Updating without resetting your data
 
-PrimerSwitch 0.1.1, the 0.2.0 Codex update and the 0.2.1 quota-selection fix keep the application and storage identity of the 0.1.0 preview. Existing saved accounts and settings use the same encrypted record.
+PrimerSwitch 0.1.1, the 0.2.0 Codex update, the 0.2.1 quota-selection fix and the 0.2.2 window-priming update keep the application and storage identity of the 0.1.0 preview. Existing saved accounts and settings use the same encrypted record.
 
 ## Installing the branded update
 
@@ -46,3 +46,15 @@ bytes. No application was started and no real credentials were accessed.
 The release's separate Ultracodex 0.3.7 companion handles Codex jobs inside
 Claude Code. It is an integration update, so installing PrimerSwitch alone
 does not replace arbitrary `codex exec` launchers. See [Codex usage](CODEX_USAGE.md).
+
+## Window priming 0.2.2 update
+
+Install 0.2.2 over 0.2.1 in the existing directory under the same Windows user.
+The existing **Start the weekly window** preference becomes **Start the 5-hour
+and weekly windows**, retaining its saved enabled/disabled value. It now starts
+expired 5-hour windows on inactive Claude accounts at the next ordinary check,
+and shares one tiny message when both windows are due. New optional encrypted
+state fields retain the reset and retry history; older records remain compatible.
+The installer qualification baseline is pinned to the exact published 0.2.1
+Windows installer. Current qualification and release status are recorded in
+[the evidence ledger](PROGRESS.md).

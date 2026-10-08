@@ -2975,7 +2975,7 @@ checksum = "925383efa346730478fb4838dbe9137d2a47675ad789c546d150a6e1dd4ab31c"
 
 [[package]]
 name = "primerswitch-desktop"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -3054,7 +3054,7 @@ dependencies = [
 
 [[package]]
 name = "provider-claude"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3074,7 +3074,7 @@ dependencies = [
 
 [[package]]
 name = "provider-codex"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4000,7 +4000,7 @@ dependencies = [
 
 [[package]]
 name = "switcher-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "chrono",
  "serde",
@@ -4011,7 +4011,7 @@ dependencies = [
 
 [[package]]
 name = "switcher-diagnostics"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "provider-claude",
@@ -4025,7 +4025,7 @@ dependencies = [
 
 [[package]]
 name = "switcher-platform"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "chacha20poly1305",
  "fs2",
@@ -4045,7 +4045,7 @@ dependencies = [
 
 [[package]]
 name = "switcher-runtime"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "base64 0.22.1",

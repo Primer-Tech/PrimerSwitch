@@ -84,6 +84,7 @@ export const accountSchema = z
       })
       .strict(),
     primedAt: timestamp,
+    fiveHourPrimedAt: timestamp,
   })
   .strict();
 export const snapshotSchema = z

@@ -12,6 +12,7 @@ import {
   type CodexLogin,
   type CodexAccount,
   type CodexReason,
+  type CodexResetOutcome,
 } from './codex-types';
 export type CodexError = CodexReason | 'actionFailed' | 'unsafeData';
 /** Only stable native reason strings are shown; anything else becomes a generic failure. */
@@ -26,6 +27,7 @@ export function codexError(error: unknown): CodexError {
   return parsed.success ? parsed.data : 'actionFailed';
 }
 export type CodexNotice =
+  | { kind: 'resetComplete'; accountId: string; outcome: CodexResetOutcome }
   | { kind: 'loginComplete'; accountId: string | null }
   | { kind: 'deleteComplete' }
   | { kind: 'importedCurrent'; added: number }
@@ -43,6 +45,7 @@ export type CodexPending =
   | 'codex_import_current'
   | 'codex_import_switcher'
   | 'codex_refresh_account'
+  | 'codex_consume_reset'
   | 'codex_refresh_all'
   | 'codex_delete_account'
   | 'codex_switch_account'
@@ -210,7 +213,11 @@ export function createCodexController(bridge: CodexBridge = codexNativeBridge) {
       if (command === 'codex_refresh_account' && account.authKind !== 'chatgpt')
         return false;
       // The account Codex is signed in with cannot be removed; switch away first.
-      if (command === 'codex_delete_account' && account.selected) return false;
+      if (
+        command === 'codex_delete_account' &&
+        (account.selected || account.reset.pending)
+      )
+        return false;
     }
     const before = snapshot?.accounts.length ?? 0;
     set({ pending: command, pendingId: target, error: null, notice: null });
@@ -276,6 +283,40 @@ export function createCodexController(bridge: CodexBridge = codexNativeBridge) {
         },
       });
       return true;
+    } catch (error) {
+      set({ error: failure(error) });
+      void read();
+      return false;
+    } finally {
+      set({ pending: null, pendingId: null });
+    }
+  }
+  async function consumeReset(id: string): Promise<boolean> {
+    const account = state.snapshot?.accounts.find(
+      (account) => account.id === id,
+    );
+    if (blocked() || !account?.reset.usable.enabled) return false;
+    set({
+      pending: 'codex_consume_reset',
+      pendingId: id,
+      error: null,
+      notice: null,
+    });
+    try {
+      const result = accept(await bridge.call('codex_consume_reset', { id }));
+      const reset = result.accounts.find((account) => account.id === id)?.reset;
+      if (reset?.lastOutcome && !reset.pending) {
+        set({
+          notice: {
+            kind: 'resetComplete',
+            accountId: id,
+            outcome: reset.lastOutcome,
+          },
+        });
+        return true;
+      }
+      set({ error: result.error ?? 'resetUnconfirmed' });
+      return false;
     } catch (error) {
       set({ error: failure(error) });
       void read();
@@ -403,6 +444,7 @@ export function createCodexController(bridge: CodexBridge = codexNativeBridge) {
     refreshAll: () => action('codex_refresh_all'),
     deleteAccount: (id: string) => action('codex_delete_account', { id }),
     switchAccount,
+    consumeReset,
     beginLogin,
     cancelLogin,
     pollLogin,

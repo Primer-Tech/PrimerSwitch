@@ -30,6 +30,10 @@ use switcher_platform::{
 use tempfile::TempDir;
 use zeroize::{Zeroize, Zeroizing};
 
+#[path = "codex_reset.rs"]
+mod reset;
+pub(crate) use reset::ResetJob;
+
 const RECORD: &str = "codex-state";
 const QUARANTINE: &str = "codex-state-quarantine";
 /// Background reading of the active account while it is within `NEAR_LIMIT_BAND`
@@ -216,6 +220,10 @@ struct SavedAccount {
     /// transient refresh failure; two in a row mean the sign-in is gone.
     #[serde(default)]
     auth_failures: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_reset_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_reset_outcome: Option<ResetOutcome>,
 }
 impl Drop for SavedAccount {
     fn drop(&mut self) {
@@ -437,6 +445,7 @@ pub(crate) struct QuotaReport {
     binding: Binding,
     owned: Option<OwnedResult>,
     outcome: Result<CodexRateLimits, CodexError>,
+    reset: Option<(String, Result<ResetOutcome, CodexError>)>,
 }
 impl QuotaJob {
     pub(crate) async fn run(self) -> QuotaReport {
@@ -454,7 +463,19 @@ impl QuotaJob {
             result
         }
         .await;
-        let owned = match self.target {
+        let owned = self.target.finish().await;
+        QuotaReport {
+            account_id: self.account_id,
+            binding: self.binding,
+            owned,
+            outcome,
+            reset: None,
+        }
+    }
+}
+impl QuotaTarget {
+    async fn finish(self) -> Option<OwnedResult> {
+        match self {
             QuotaTarget::Owned { home, original, .. } => {
                 // Codex writes auth.json in place; give a just-exited child's file a
                 // moment instead of losing a rotation to a transient sharing error.
@@ -473,12 +494,6 @@ impl QuotaJob {
                 Some(OwnedResult { original, rotated })
             }
             QuotaTarget::Active(_) => None,
-        };
-        QuotaReport {
-            account_id: self.account_id,
-            binding: self.binding,
-            owned,
-            outcome,
         }
     }
 }
@@ -741,11 +756,14 @@ impl CodexEngine {
                         rate_limit_reached_type: (five >= 100).then(|| "primary".into()),
                     }],
                     reset_credits_available: None,
+                    reset_credit_details: None,
                 }),
                 quota_read_at: Some(now),
                 needs_sign_in: false,
                 last_attempt_at: Some(now),
                 auth_failures: 0,
+                pending_reset_key: None,
+                last_reset_outcome: None,
             });
             engine.verified_now.insert(id);
         }
@@ -1083,6 +1101,11 @@ impl CodexEngine {
                     quota_state: self.quota_state(account, now),
                     error: self.account_errors.get(&account.id).copied(),
                     needs_sign_in: account.needs_sign_in,
+                    reset: CodexResetView {
+                        pending: account.pending_reset_key.is_some(),
+                        last_outcome: account.last_reset_outcome,
+                        usable: self.reset_capability(account, now),
+                    },
                 }
             })
             .collect();
@@ -1157,6 +1180,9 @@ impl CodexEngine {
                 if self.selected_id.as_ref() == Some(&id) {
                     // auth.json still holds it; Codex keeps using it until another switch.
                     return Err(CodexReason::ActiveAccount);
+                }
+                if self.saved.accounts[index].pending_reset_key.is_some() {
+                    return Err(CodexReason::ResetUnconfirmed);
                 }
                 self.saved.accounts.remove(index);
                 self.verified_now.remove(&id);
@@ -1341,6 +1367,8 @@ impl CodexEngine {
             needs_sign_in: false,
             last_attempt_at: None,
             auth_failures: 0,
+            pending_reset_key: None,
+            last_reset_outcome: None,
         });
         Ok(self.saved.accounts.len() - 1)
     }
@@ -1858,6 +1886,34 @@ impl CodexEngine {
             self.saved.accounts[index].set_auth(&auth)?;
         }
         let id = report.account_id.clone();
+        let mut reset_error = None;
+        if let Some((key, outcome)) = &report.reset {
+            let account = &mut self.saved.accounts[index];
+            if account.pending_reset_key.as_ref() != Some(key)
+                || !account.binding.same_owner(&report.binding)
+            {
+                return Err(CodexReason::ExternalChange);
+            }
+            match outcome {
+                Ok(outcome) => {
+                    account.last_reset_outcome = Some(*outcome);
+                    account.pending_reset_key = None;
+                    // A completed reset invalidates old percentages even if the
+                    // required post-redemption read fails.
+                    if matches!(outcome, ResetOutcome::Reset | ResetOutcome::AlreadyRedeemed) {
+                        account.quota = None;
+                        account.quota_read_at = None;
+                    }
+                }
+                Err(error) => {
+                    reset_error = Some(if *error == CodexError::IdentityMismatch {
+                        CodexReason::IdentityMismatch
+                    } else {
+                        CodexReason::ResetUnconfirmed
+                    });
+                }
+            }
+        }
         if !matches!(report.outcome, Err(CodexError::AuthRequired)) {
             self.saved.accounts[index].auth_failures = 0;
         }
@@ -1910,7 +1966,17 @@ impl CodexEngine {
                 self.account_errors.insert(id, provider_reason(error));
             }
         }
-        self.save(vault)?;
+        if let Some(error) = reset_error {
+            self.account_errors.insert(report.account_id, error);
+            self.error = Some(error);
+        }
+        if let Err(error) = self.save(vault) {
+            // The durable pending key may still be on disk. Never allow a new
+            // redemption until reopening that record succeeds.
+            self.writable = false;
+            self.reason = Some(error);
+            return Err(error);
+        }
         // An active reading may have let Codex rotate auth.json; adopt it now.
         self.observe(vault, now)
     }
@@ -2262,7 +2328,32 @@ fn quota_view(quota: &CodexRateLimits) -> Result<CodexQuotaView, CodexReason> {
             .as_ref()
             .map(|v| v.available_count)
             .filter(|v| *v >= 0),
+        reset_credit_details: reset_expiry_details(quota),
     })
+}
+
+/// Dates only: never export opaque credit IDs, display strings or raw rows.
+fn reset_expiry_details(quota: &CodexRateLimits) -> Option<Vec<CodexResetCreditView>> {
+    let credits = quota.rate_limit_reset_credits.as_ref()?.credits.as_ref()?;
+    let mut seen = BTreeSet::new();
+    let mut details: Vec<_> = credits
+        .iter()
+        .take(256)
+        .filter(|credit| {
+            credit.status == "available"
+                && credit.reset_type == "codexRateLimits"
+                && !credit.id.is_empty()
+                && credit
+                    .expires_at
+                    .is_none_or(|date| (0..=253_402_300_799).contains(&date))
+                && seen.insert(&credit.id)
+        })
+        .map(|credit| CodexResetCreditView {
+            expires_at: credit.expires_at,
+        })
+        .collect();
+    details.sort_by_key(|credit| (credit.expires_at.is_none(), credit.expires_at));
+    Some(details)
 }
 
 #[cfg(test)]

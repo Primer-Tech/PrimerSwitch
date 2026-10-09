@@ -39,7 +39,33 @@ const controller = createController({
 // Codex preview states: ?codex=switching | signin | limited | setup | empty
 const codexDemo = codexDemoSnapshot();
 const codexScenario = new URLSearchParams(location.search).get('codex');
-if (codexScenario === 'switching')
+if (codexScenario?.startsWith('reset')) {
+  codexDemo.accounts[0].planType = 'team';
+  codexDemo.accounts[0].quota!.resetCreditsAvailable =
+    codexScenario === 'reset-unknown'
+      ? null
+      : codexScenario === 'reset-zero' || codexScenario === 'reset-pending'
+        ? 0
+        : 2;
+  codexDemo.accounts[0].reset = {
+    pending: codexScenario === 'reset-pending',
+    lastOutcome: null,
+    usable: codexCapability(
+      codexScenario === 'reset-unknown'
+        ? 'resetUnavailable'
+        : codexScenario === 'reset-zero'
+          ? 'noResetCredits'
+          : undefined,
+    ),
+  };
+  codexDemo.accounts[0].quota!.resetCreditDetails =
+    codexScenario === 'reset-team'
+      ? [
+          { expiresAt: Math.floor(Date.now() / 1000) + 7 * 86400 },
+          { expiresAt: Math.floor(Date.now() / 1000) + 14 * 86400 },
+        ]
+      : null;
+} else if (codexScenario === 'switching')
   codexDemo.switching = {
     targetId: 'codex-research',
     stage: 'restarting',

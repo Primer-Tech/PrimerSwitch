@@ -102,6 +102,14 @@ async fn native_fake_output_overflow_and_active_quota() {
     let quota = client.read_rate_limits().await.unwrap();
     assert_eq!(quota.account_id.as_deref(), Some("fixture-workspace"));
     assert_eq!(quota.ordinary_usage_allowed, Some(true));
+    assert_eq!(
+        client
+            .consume_reset("native-fixture-reset-key")
+            .await
+            .unwrap(),
+        ResetOutcome::AlreadyRedeemed
+    );
+    client.read_rate_limits().await.unwrap();
     client.shutdown().await.unwrap();
 }
 

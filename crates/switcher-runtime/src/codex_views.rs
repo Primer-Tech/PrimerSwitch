@@ -28,6 +28,11 @@ pub enum CodexReason {
     SwitcherUnavailable,
     /// The active login cannot be removed; switch to another account first.
     ActiveAccount,
+    /// Codex did not provide a current reset-credit count.
+    ResetUnavailable,
+    NoResetCredits,
+    /// An uncertain redemption must be retried with its original durable key.
+    ResetUnconfirmed,
 }
 impl std::fmt::Display for CodexReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -132,10 +137,19 @@ pub struct CodexLimitView {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct CodexResetCreditView {
+    /// Backend Unix seconds; null explicitly means this credit does not expire.
+    pub expires_at: Option<i64>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CodexQuotaView {
     pub ordinary_usage_allowed: Option<bool>,
     pub limits: Vec<CodexLimitView>,
     pub reset_credits_available: Option<i64>,
+    /// Optional and omission-preserving for older encrypted quota observations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_credit_details: Option<Vec<CodexResetCreditView>>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -158,6 +172,14 @@ pub struct CodexAccountView {
     pub quota_state: CodexQuotaState,
     pub error: Option<CodexReason>,
     pub needs_sign_in: bool,
+    pub reset: CodexResetView,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexResetView {
+    pub pending: bool,
+    pub last_outcome: Option<provider_codex::ResetOutcome>,
+    pub usable: CodexCapability,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

@@ -23,8 +23,18 @@ export const codexReasonSchema = z.enum([
   'switchInProgress',
   'switcherUnavailable',
   'activeAccount',
+  'resetUnavailable',
+  'noResetCredits',
+  'resetUnconfirmed',
 ]);
 export type CodexReason = z.infer<typeof codexReasonSchema>;
+export const codexResetOutcomeSchema = z.enum([
+  'reset',
+  'alreadyRedeemed',
+  'nothingToReset',
+  'noCredit',
+]);
+export type CodexResetOutcome = z.infer<typeof codexResetOutcomeSchema>;
 export const codexCapabilitySchema = z
   .object({ enabled: z.boolean(), blockedReason: codexReasonSchema.nullable() })
   .strict();
@@ -80,6 +90,22 @@ export const codexAccountSchema = z
         ordinaryUsageAllowed: z.boolean().nullable(),
         limits: z.array(limitSchema),
         resetCreditsAvailable: z.number().int().nonnegative().nullable(),
+        resetCreditDetails: z
+          .array(
+            z
+              .object({
+                expiresAt: z
+                  .number()
+                  .int()
+                  .min(0)
+                  .max(253_402_300_799)
+                  .nullable(),
+              })
+              .strict(),
+          )
+          .max(256)
+          .nullable()
+          .optional(),
       })
       .strict()
       .nullable(),
@@ -87,6 +113,13 @@ export const codexAccountSchema = z
     quotaState: z.enum(['unread', 'fresh', 'cached', 'unavailable']),
     error: codexReasonSchema.nullable(),
     needsSignIn: z.boolean(),
+    reset: z
+      .object({
+        pending: z.boolean(),
+        lastOutcome: codexResetOutcomeSchema.nullable(),
+        usable: codexCapabilitySchema,
+      })
+      .strict(),
   })
   .strict();
 export const codexLoginSchema = z

@@ -9,6 +9,7 @@ export interface CodexCommandArgs {
   codex_import_current: undefined;
   codex_import_switcher: undefined;
   codex_refresh_account: { id: string };
+  codex_consume_reset: { id: string };
   codex_refresh_all: undefined;
   codex_switch_account: { id: string };
   codex_delete_account: { id: string };
@@ -30,6 +31,7 @@ const commands: readonly CodexCommand[] = [
   'codex_import_current',
   'codex_import_switcher',
   'codex_refresh_account',
+  'codex_consume_reset',
   'codex_refresh_all',
   'codex_switch_account',
   'codex_delete_account',

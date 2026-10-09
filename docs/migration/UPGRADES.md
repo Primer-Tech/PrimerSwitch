@@ -64,3 +64,7 @@ is published with the preservation report and package provenance. The owner's
 local upgrade also retained all four existing opaque state/key files exactly
 before the application was restarted. See [the evidence ledger](PROGRESS.md)
 for qualification scope.
+
+## Manual Codex resets 0.2.3 local update
+
+Install the locally built 0.2.3 Windows installer over 0.2.2 in the existing directory under the same user. It retains the application identity, existing vault/master key, Claude state and settings. New Codex request/outcome fields are optional; existing format-1 records remain compatible. This local build adds explicit manual reset controls and full reset-availability readings for personal and workspace accounts. It is separate from the published 0.2.2 release. Local validation and installation preservation are recorded in [PROGRESS.md](PROGRESS.md).

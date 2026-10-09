@@ -66,7 +66,7 @@ fn main() {
             }
             "account/rateLimits/read" => {
                 assert_eq!(request["params"]["supportsLunaReserve"], false);
-                assert_eq!(request["params"]["excludeResetCreditDetails"], true);
+                assert_eq!(request["params"]["excludeResetCreditDetails"], false);
                 json!({"accountId":"fixture-workspace","ordinaryUsageAllowed":true,"rateLimits":{"limitId":"codex","primary":{"usedPercent":12,"windowDurationMins":300,"resetsAt":null}},"rateLimitsByLimitId":{"codex":{"limitId":"codex","secondary":null}}})
             }
             "config/read" => {
@@ -76,6 +76,13 @@ fn main() {
             "configRequirements/read" => {
                 assert!(request["params"].is_null());
                 json!({"requirements":null})
+            }
+            "account/rateLimitResetCredit/consume" => {
+                assert_eq!(
+                    request["params"]["idempotencyKey"],
+                    "native-fixture-reset-key"
+                );
+                json!({"outcome":"alreadyRedeemed"})
             }
             _ => panic!("unexpected fixture method"),
         };

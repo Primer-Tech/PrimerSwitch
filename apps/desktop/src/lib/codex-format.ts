@@ -6,6 +6,7 @@ import type {
   CodexReason,
   CodexSnapshot,
   CodexWindow,
+  CodexResetOutcome,
 } from './codex-types';
 
 const reasonKeys: Record<CodexReason, MessageKey> = {
@@ -29,7 +30,36 @@ const reasonKeys: Record<CodexReason, MessageKey> = {
   switchInProgress: 'codexReason_switchInProgress',
   switcherUnavailable: 'codexReason_switcherUnavailable',
   activeAccount: 'codexReason_activeAccount',
+  resetUnavailable: 'codexReason_resetUnavailable',
+  noResetCredits: 'codexReason_noResetCredits',
+  resetUnconfirmed: 'codexReason_resetUnconfirmed',
 };
+export function codexResetOutcome(
+  outcome: CodexResetOutcome,
+  locale: Language,
+): string {
+  const keys = {
+    reset: 'codexResetDone',
+    alreadyRedeemed: 'codexResetDone',
+    nothingToReset: 'codexResetNotLimited',
+    noCredit: 'codexReason_noResetCredits',
+  } as const;
+  return t(locale, keys[outcome]);
+}
+/** Exact local date and time, with an explicit timezone at the expiry boundary. */
+export function codexResetExpiryDate(
+  timestamp: number,
+  locale: Language,
+): string {
+  return new Intl.DateTimeFormat(localeName(locale), {
+    day: 'numeric',
+    month: 'short',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    timeZoneName: 'short',
+  }).format(timestamp * 1000);
+}
 /** Friendly, localized text for a native reason; unknown failures stay generic. */
 export function codexMessage(
   reason: CodexError | null,
@@ -81,6 +111,8 @@ const plans: Record<string, string> = {
   prolite: 'Pro Lite',
   team: 'Team',
   business: 'Business',
+  selfservebusinessprolite: 'Business Premium',
+  selfservebusinessusagebased: 'Business',
   enterprise: 'Enterprise',
   edu: 'Edu',
 };

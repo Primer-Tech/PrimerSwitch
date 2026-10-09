@@ -101,6 +101,60 @@ fn private_context() -> (tempfile::TempDir, CodexContext) {
     (dir, context)
 }
 #[tokio::test]
+async fn explicit_reset_uses_the_durable_key_and_parses_only_known_outcomes() {
+    for (wire, expected) in [
+        ("reset", crate::ResetOutcome::Reset),
+        ("alreadyRedeemed", crate::ResetOutcome::AlreadyRedeemed),
+        ("nothingToReset", crate::ResetOutcome::NothingToReset),
+        ("noCredit", crate::ResetOutcome::NoCredit),
+    ] {
+        let (mut client, state) = fake(
+            false,
+            vec![(
+                "account/rateLimitResetCredit/consume",
+                vec![reply(json!({"outcome":wire}))],
+            )],
+        );
+        assert_eq!(
+            client.consume_reset("fixture-durable-key").await.unwrap(),
+            expected
+        );
+        assert_eq!(
+            state.lock().unwrap().requests[0]["params"],
+            json!({"idempotencyKey":"fixture-durable-key"})
+        );
+    }
+    let (mut client, state) = fake(
+        false,
+        vec![(
+            "account/rateLimitResetCredit/consume",
+            vec![reply(json!({"outcome":"secret-sentinel"}))],
+        )],
+    );
+    assert_eq!(
+        client.consume_reset("same-key").await.unwrap_err(),
+        CodexError::Protocol
+    );
+    assert!(state.lock().unwrap().closed);
+}
+#[tokio::test]
+async fn reset_refuses_login_context_and_invalid_keys_without_sending() {
+    let (mut isolated, state) = fake(true, vec![]);
+    assert_eq!(
+        isolated.consume_reset("key").await.unwrap_err(),
+        CodexError::UnsafeContext
+    );
+    assert!(state.lock().unwrap().requests.is_empty());
+    for key in ["", "bad\nkey", &"a".repeat(129)] {
+        let (mut client, state) = fake(false, vec![]);
+        assert_eq!(
+            client.consume_reset(key).await.unwrap_err(),
+            CodexError::Protocol
+        );
+        assert!(state.lock().unwrap().requests.is_empty());
+    }
+}
+#[tokio::test]
 async fn handshake_order_and_private_home() {
     let (_dir, context) = private_context();
     let (mut client, state) = fake(
@@ -288,7 +342,7 @@ async fn quota_preserves_all_buckets_nulls_and_native_amounts() {
     );
     assert_eq!(
         state.lock().unwrap().requests[0]["params"],
-        json!({"supportsLunaReserve":false,"excludeResetCreditDetails":true})
+        json!({"supportsLunaReserve":false,"excludeResetCreditDetails":false})
     );
     let (mut isolated, _) = fake(true, vec![]);
     assert_eq!(

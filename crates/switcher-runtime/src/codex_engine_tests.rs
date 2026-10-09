@@ -94,6 +94,9 @@ impl Plan {
 struct FakeFactory {
     plans: Mutex<VecDeque<Plan>>,
     calls: Arc<Mutex<Vec<String>>>,
+    resets: Arc<Mutex<VecDeque<Result<ResetOutcome, CodexError>>>>,
+    after_resets: Arc<Mutex<VecDeque<Result<CodexRateLimits, CodexError>>>>,
+    reset_keys: Arc<Mutex<Vec<String>>>,
 }
 impl FakeFactory {
     fn enqueue(&self, plan: Plan) {
@@ -123,6 +126,10 @@ impl ClientFactory for FakeFactory {
             home: context.home().to_owned(),
             plan,
             calls: self.calls.clone(),
+            resets: self.resets.clone(),
+            after_resets: self.after_resets.clone(),
+            reset_keys: self.reset_keys.clone(),
+            after_reset: false,
         }))
     }
 }
@@ -130,6 +137,10 @@ struct FakeClient {
     home: PathBuf,
     plan: Plan,
     calls: Arc<Mutex<Vec<String>>>,
+    resets: Arc<Mutex<VecDeque<Result<ResetOutcome, CodexError>>>>,
+    after_resets: Arc<Mutex<VecDeque<Result<CodexRateLimits, CodexError>>>>,
+    reset_keys: Arc<Mutex<Vec<String>>>,
+    after_reset: bool,
 }
 #[async_trait]
 impl CodexService for FakeClient {
@@ -172,7 +183,25 @@ impl CodexService for FakeClient {
         if let Some(bytes) = self.plan.rotate_quota.take() {
             fs::write(self.home.join("auth.json"), bytes).unwrap();
         }
-        self.plan.quota.clone()
+        if self.after_reset {
+            self.after_resets
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| self.plan.quota.clone())
+        } else {
+            self.plan.quota.clone()
+        }
+    }
+    async fn consume_reset(&mut self, key: &str) -> Result<ResetOutcome, CodexError> {
+        self.calls.lock().unwrap().push("reset".into());
+        self.reset_keys.lock().unwrap().push(key.into());
+        self.after_reset = true;
+        self.resets
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("every reset is explicitly planned")
     }
     async fn shutdown(&mut self) -> Result<(), CodexError> {
         self.calls.lock().unwrap().push("shutdown".into());
@@ -423,6 +452,391 @@ fn observe_adopts_rotations_and_keeps_every_new_login() {
     assert_eq!(f.saved_bytes("ws-a"), rotated);
     // Unchanged file: no extra vault write.
     f.engine.observe(&f.vault, 130).unwrap();
+    f.claude_untouched();
+}
+
+fn reset_quota(
+    workspace: Option<&str>,
+    count: Option<i64>,
+    plan: &str,
+    used: i32,
+) -> CodexRateLimits {
+    let mut limits = quota(workspace, used, used);
+    limits.rate_limits.plan_type = Some(plan.into());
+    limits.rate_limit_reset_credits = count.map(|available_count| ResetCreditSummary {
+        available_count,
+        // Detail rows can be capped or absent. The count remains authoritative.
+        credits: Some(vec![]),
+    });
+    limits
+}
+fn allow_fixture_reset(f: &mut Fixture, id: &str, plan: &str) {
+    let index = f.engine.account_index(id).unwrap();
+    let workspace = f.engine.saved.accounts[index].binding.workspace.clone();
+    f.engine.saved.accounts[index].quota =
+        Some(quota_view(&reset_quota(workspace.as_deref(), Some(2), plan, 100)).unwrap());
+    f.engine.saved.accounts[index].quota_read_at = Some(100);
+    f.engine.verified_now.insert(id.into());
+    f.engine.save(&f.vault).unwrap();
+}
+fn fixture_reset_credit(id: &str, expires_at: Option<i64>) -> ResetCredit {
+    ResetCredit {
+        id: id.into(),
+        reset_type: "codexRateLimits".into(),
+        status: "available".into(),
+        granted_at: 100,
+        expires_at,
+        title: Some("private-credit-title-sentinel".into()),
+        description: Some("private-credit-description-sentinel".into()),
+    }
+}
+#[test]
+fn reset_expiry_details_preserve_dates_and_count_without_exporting_private_rows() {
+    let mut limits = reset_quota(Some("ws-a"), Some(7), "team", 100);
+    let mut redeemed = fixture_reset_credit("redeemed-private-id", Some(1000));
+    redeemed.status = "redeemed".into();
+    let mut other_type = fixture_reset_credit("unknown-type-private-id", Some(1000));
+    other_type.reset_type = "futureResetType".into();
+    limits.rate_limit_reset_credits.as_mut().unwrap().credits = Some(vec![
+        fixture_reset_credit("later-private-id", Some(1_800_003_600)),
+        fixture_reset_credit("forever-private-id", None),
+        fixture_reset_credit("earlier-private-id", Some(1_800_000_000)),
+        fixture_reset_credit("earlier-private-id", Some(1_800_000_000)),
+        redeemed,
+        other_type,
+        fixture_reset_credit("invalid-private-id", Some(-1)),
+        fixture_reset_credit("overflow-private-id", Some(i64::MAX)),
+    ]);
+    let view = quota_view(&limits).unwrap();
+    let expected = json!([
+        {"expiresAt":1_800_000_000_i64},
+        {"expiresAt":1_800_003_600_i64},
+        {"expiresAt":null}
+    ]);
+    let mut serialized = serde_json::to_value(&view).unwrap();
+    assert_eq!(serialized["resetCreditsAvailable"], 7);
+    assert_eq!(serialized["resetCreditDetails"], expected);
+    assert!(!serialized.to_string().contains("private-"));
+    let mut f = Fixture::new();
+    f.engine.saved.accounts[0].quota = Some(view);
+    f.engine.save(&f.vault).unwrap();
+    let reopened = CodexEngine::load(&f.vault);
+    assert_eq!(
+        serde_json::to_value(reopened.saved.accounts[0].quota.as_ref().unwrap()).unwrap()["resetCreditDetails"],
+        expected
+    );
+    // Historical cached quotas do not gain a field merely by round-tripping.
+    serialized
+        .as_object_mut()
+        .unwrap()
+        .remove("resetCreditDetails");
+    let old: CodexQuotaView = serde_json::from_value(serialized.clone()).unwrap();
+    assert!(old.reset_credit_details.is_none());
+    assert_eq!(serde_json::to_value(old).unwrap(), serialized);
+    limits.rate_limit_reset_credits.as_mut().unwrap().credits = None;
+    assert!(quota_view(&limits).unwrap().reset_credit_details.is_none());
+    limits.rate_limit_reset_credits.as_mut().unwrap().credits = Some(vec![]);
+    assert!(
+        quota_view(&limits)
+            .unwrap()
+            .reset_credit_details
+            .unwrap()
+            .is_empty()
+    );
+}
+#[tokio::test]
+async fn explicit_codex_resets_work_for_personal_and_team_plans_and_refresh_usage() {
+    for plan in [
+        "plus",
+        "pro",
+        "team",
+        "business",
+        "self_serve_business_prolite",
+    ] {
+        let mut f = Fixture::new();
+        let a = f.id_of("ws-a");
+        allow_fixture_reset(&mut f, &a, plan);
+        let active = f.active();
+        f.factory.enqueue(Plan::quota(Ok(reset_quota(
+            Some("ws-a"),
+            Some(2),
+            plan,
+            100,
+        ))));
+        f.factory
+            .resets
+            .lock()
+            .unwrap()
+            .push_back(Ok(ResetOutcome::Reset));
+        let mut after = reset_quota(Some("ws-a"), Some(1), plan, 0);
+        after.rate_limit_reset_credits.as_mut().unwrap().credits =
+            Some(vec![fixture_reset_credit(
+                "remaining-private-id",
+                Some(1000),
+            )]);
+        f.factory.after_resets.lock().unwrap().push_back(Ok(after));
+        let job = f.engine.plan_reset(&a, &f.vault, 110).unwrap();
+        let key = f.engine.saved.accounts[0]
+            .pending_reset_key
+            .clone()
+            .unwrap();
+        assert_eq!(
+            f.vault.load::<Saved>(RECORD).unwrap().unwrap().accounts[0]
+                .pending_reset_key
+                .as_deref(),
+            Some(key.as_str())
+        );
+        assert!(
+            f.factory.reset_keys.lock().unwrap().is_empty(),
+            "key persisted before any consume"
+        );
+        let report = job.run().await;
+        f.engine.finish_quota(report, &f.vault, 120).unwrap();
+        let view = f.view(&a);
+        assert!(!view.reset.pending);
+        assert_eq!(view.reset.last_outcome, Some(ResetOutcome::Reset));
+        assert_eq!(
+            view.quota.as_ref().unwrap().reset_credits_available,
+            Some(1)
+        );
+        assert_eq!(
+            view.quota
+                .as_ref()
+                .unwrap()
+                .reset_credit_details
+                .as_ref()
+                .unwrap()[0]
+                .expires_at,
+            Some(1000)
+        );
+        assert_eq!(
+            view.quota.as_ref().unwrap().limits[0]
+                .primary
+                .as_ref()
+                .unwrap()
+                .used_percent,
+            0
+        );
+        assert_eq!(
+            f.factory.calls(),
+            vec!["start-Active", "quota", "reset", "quota", "shutdown"]
+        );
+        assert_eq!(f.active(), active);
+        assert!(f.daemon.calls.lock().unwrap().is_empty());
+        let json = serde_json::to_string(&view).unwrap();
+        assert!(!json.contains(&key) && !json.contains("secret-sentinel"));
+        f.claude_untouched();
+    }
+}
+#[tokio::test]
+async fn uncertain_codex_reset_survives_restart_and_reuses_key_even_when_no_credits_remain() {
+    let mut f = Fixture::new();
+    let a = f.id_of("ws-a");
+    allow_fixture_reset(&mut f, &a, "team");
+    f.factory.enqueue(Plan::quota(Ok(reset_quota(
+        Some("ws-a"),
+        Some(1),
+        "team",
+        100,
+    ))));
+    f.factory
+        .resets
+        .lock()
+        .unwrap()
+        .push_back(Err(CodexError::Timeout));
+    f.factory
+        .after_resets
+        .lock()
+        .unwrap()
+        .push_back(Ok(reset_quota(Some("ws-a"), Some(0), "team", 0)));
+    let report = f.engine.plan_reset(&a, &f.vault, 110).unwrap().run().await;
+    f.engine.finish_quota(report, &f.vault, 120).unwrap();
+    assert!(f.view(&a).reset.pending);
+    assert_eq!(f.view(&a).reset.last_outcome, None);
+    let key = f.factory.reset_keys.lock().unwrap()[0].clone();
+    let installation = f.engine.installation.take();
+    f.engine = CodexEngine::load(&f.vault).with_test_seams(
+        f.factory.clone(),
+        f.daemon.clone(),
+        f.inventory.clone(),
+        f.switcher.clone(),
+    );
+    f.engine.installation = installation;
+    f.engine.observe(&f.vault, 130).unwrap();
+    assert!(f.view(&a).reset.pending && f.view(&a).reset.usable.enabled);
+    f.factory.enqueue(Plan::quota(Ok(reset_quota(
+        Some("ws-a"),
+        Some(0),
+        "team",
+        0,
+    ))));
+    f.factory
+        .resets
+        .lock()
+        .unwrap()
+        .push_back(Ok(ResetOutcome::AlreadyRedeemed));
+    let report = f.engine.plan_reset(&a, &f.vault, 140).unwrap().run().await;
+    f.engine.finish_quota(report, &f.vault, 150).unwrap();
+    assert_eq!(
+        *f.factory.reset_keys.lock().unwrap(),
+        vec![key.clone(), key]
+    );
+    assert_eq!(
+        f.view(&a).reset.last_outcome,
+        Some(ResetOutcome::AlreadyRedeemed)
+    );
+    assert!(!f.view(&a).reset.pending);
+    f.claude_untouched();
+}
+#[tokio::test]
+async fn reset_never_consumes_when_backend_owner_is_missing_or_changed() {
+    for workspace in [None, Some("other-workspace")] {
+        let mut f = Fixture::new();
+        let a = f.id_of("ws-a");
+        allow_fixture_reset(&mut f, &a, "team");
+        f.factory.enqueue(Plan::quota(Ok(reset_quota(
+            workspace,
+            Some(2),
+            "team",
+            100,
+        ))));
+        let report = f.engine.plan_reset(&a, &f.vault, 110).unwrap().run().await;
+        f.engine.finish_quota(report, &f.vault, 120).unwrap();
+        assert!(f.factory.reset_keys.lock().unwrap().is_empty());
+        assert_eq!(f.view(&a).error, Some(CodexReason::IdentityMismatch));
+        assert!(f.view(&a).reset.pending);
+    }
+}
+#[tokio::test]
+async fn inactive_reset_adopts_rotations_without_switching_and_failed_refresh_discards_old_usage() {
+    let mut f = Fixture::new();
+    let b = f.add("user-b", "ws-b", "initial");
+    allow_fixture_reset(&mut f, &b, "business");
+    let active = f.active();
+    let rotated = auth("user-b", "ws-b", "rotated-reset");
+    let mut plan = Plan::quota(Ok(reset_quota(Some("ws-b"), Some(1), "business", 100)));
+    plan.rotate_shutdown = Some(rotated.clone());
+    f.factory.enqueue(plan);
+    f.factory
+        .resets
+        .lock()
+        .unwrap()
+        .push_back(Ok(ResetOutcome::Reset));
+    f.factory
+        .after_resets
+        .lock()
+        .unwrap()
+        .push_back(Err(CodexError::ServiceUnavailable));
+    let report = f.engine.plan_reset(&b, &f.vault, 110).unwrap().run().await;
+    f.engine.finish_quota(report, &f.vault, 120).unwrap();
+    assert_eq!(f.saved_bytes("ws-b"), rotated);
+    assert_eq!(f.active(), active);
+    assert!(f.view(&b).quota.is_none());
+    assert_eq!(f.view(&b).reset.last_outcome, Some(ResetOutcome::Reset));
+    assert!(!f.view(&b).reset.pending);
+    assert_eq!(f.factory.calls()[0], "start-Owned");
+    f.claude_untouched();
+}
+#[tokio::test]
+async fn reset_revalidates_count_and_retains_definite_non_consuming_outcomes() {
+    for outcome in [ResetOutcome::NothingToReset, ResetOutcome::NoCredit] {
+        let mut f = Fixture::new();
+        let a = f.id_of("ws-a");
+        allow_fixture_reset(&mut f, &a, "team");
+        f.factory.enqueue(Plan::quota(Ok(reset_quota(
+            Some("ws-a"),
+            Some(1),
+            "team",
+            50,
+        ))));
+        f.factory.resets.lock().unwrap().push_back(Ok(outcome));
+        let report = f.engine.plan_reset(&a, &f.vault, 110).unwrap().run().await;
+        f.engine.finish_quota(report, &f.vault, 120).unwrap();
+        assert!(!f.view(&a).reset.pending);
+        assert_eq!(f.view(&a).reset.last_outcome, Some(outcome));
+    }
+    let mut f = Fixture::new();
+    let a = f.id_of("ws-a");
+    allow_fixture_reset(&mut f, &a, "team");
+    f.factory.enqueue(Plan::quota(Ok(reset_quota(
+        Some("ws-a"),
+        Some(0),
+        "team",
+        100,
+    ))));
+    let report = f.engine.plan_reset(&a, &f.vault, 110).unwrap().run().await;
+    f.engine.finish_quota(report, &f.vault, 120).unwrap();
+    assert!(f.factory.reset_keys.lock().unwrap().is_empty());
+    assert_eq!(f.view(&a).reset.last_outcome, Some(ResetOutcome::NoCredit));
+}
+#[test]
+fn reset_capabilities_distinguish_unknown_zero_and_stale_without_plan_restrictions() {
+    let mut f = Fixture::new();
+    let a = f.id_of("ws-a");
+    allow_fixture_reset(&mut f, &a, "team");
+    assert!(f.view(&a).reset.usable.enabled);
+    f.engine.saved.accounts[0]
+        .quota
+        .as_mut()
+        .unwrap()
+        .reset_credits_available = None;
+    assert_eq!(
+        f.view(&a).reset.usable.blocked_reason,
+        Some(CodexReason::ResetUnavailable)
+    );
+    f.engine.saved.accounts[0]
+        .quota
+        .as_mut()
+        .unwrap()
+        .reset_credits_available = Some(0);
+    assert_eq!(
+        f.engine.plan_reset(&a, &f.vault, 110).err(),
+        Some(CodexReason::NoResetCredits)
+    );
+    allow_fixture_reset(&mut f, &a, "team");
+    assert_eq!(
+        f.engine
+            .reset_capability(&f.engine.saved.accounts[0], 2000)
+            .blocked_reason,
+        Some(CodexReason::ResetUnavailable)
+    );
+    f.engine.demo = true;
+    assert_eq!(
+        f.engine.plan_reset(&a, &f.vault, 110).err(),
+        Some(CodexReason::VaultUnavailable)
+    );
+    assert!(f.factory.calls().is_empty());
+}
+#[tokio::test]
+async fn pending_codex_reset_cannot_be_deleted_and_storage_failure_sends_nothing() {
+    let mut f = Fixture::new();
+    let b = f.add("user-b", "ws-b", "initial");
+    allow_fixture_reset(&mut f, &b, "team");
+    let job = f.engine.plan_reset(&b, &f.vault, 110).unwrap();
+    assert_eq!(
+        f.engine
+            .command(CodexCommand::Delete(b.clone()), &f.vault, 120)
+            .await
+            .err(),
+        Some(CodexReason::ResetUnconfirmed)
+    );
+    drop(job);
+    assert!(f.factory.reset_keys.lock().unwrap().is_empty());
+
+    let mut f = Fixture::new();
+    let a = f.id_of("ws-a");
+    allow_fixture_reset(&mut f, &a, "team");
+    let record = f._root.path().join("vault/codex-state.vault");
+    let kept = f._root.path().join("vault/codex-state-fixture-kept.vault");
+    fs::rename(&record, &kept).unwrap();
+    fs::create_dir(&record).unwrap();
+    assert_eq!(
+        f.engine.plan_reset(&a, &f.vault, 110).err(),
+        Some(CodexReason::VaultUnavailable)
+    );
+    assert!(!f.engine.writable);
+    assert!(f.factory.calls().is_empty());
+    assert!(kept.is_file());
     f.claude_untouched();
 }
 
@@ -679,6 +1093,7 @@ fn background_readings_prefer_the_active_account_then_the_oldest_inactive_one() 
             ordinary_usage_allowed: Some(true),
             limits: vec![],
             reset_credits_available: None,
+            reset_credit_details: None,
         });
     };
     set(&mut f, &a, 1000);
@@ -1224,6 +1639,7 @@ fn main_quota_at(five: i32, five_reset: i64, week: i32, week_reset: i64) -> Code
             rate_limit_reached_type: None,
         }],
         reset_credits_available: None,
+        reset_credit_details: None,
     }
 }
 fn main_quota(five: i32, week: i32) -> CodexQuotaView {

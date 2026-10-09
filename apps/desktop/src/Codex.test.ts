@@ -89,6 +89,224 @@ function switched(
 }
 afterEach(() => language.set('en'));
 describe('Codex accounts page', () => {
+  it.each(['plus', 'team', 'business'])(
+    'offers the same manual reset for a %s account',
+    async (planType) => {
+      const raw = codexSnapshot();
+      const account = raw.accounts[0];
+      account.planType = planType;
+      account.quota!.resetCreditsAvailable = 2;
+      const firstExpiry = Date.UTC(2030, 4, 20, 12, 34) / 1000;
+      const secondExpiry = firstExpiry + 7 * 86400;
+      account.quota!.resetCreditDetails = [
+        { expiresAt: firstExpiry },
+        { expiresAt: secondExpiry },
+      ];
+      account.reset.usable = codexCapability();
+      const { call } = await setup(raw);
+      const resets = section('Available resets');
+      expect(resets.getByText('2 resets available')).toBeVisible();
+      const result = structuredClone(raw);
+      result.revision++;
+      result.accounts[0].reset.lastOutcome = 'reset';
+      result.accounts[0].quota!.resetCreditsAvailable = 1;
+      result.accounts[0].quota!.resetCreditDetails = [
+        { expiresAt: secondExpiry },
+      ];
+      result.accounts[0].quota!.limits[0].primary!.usedPercent = 0;
+      const pending = deferred();
+      call.mockReturnValueOnce(pending.promise);
+      const button = resets.getByRole('button', { name: 'Use one reset' });
+      await fireEvent.click(button);
+      expect(call).toHaveBeenLastCalledWith('codex_consume_reset', {
+        id: account.id,
+      });
+      expect(
+        resets.getByRole('button', { name: 'Resetting usage…' }),
+      ).toBeDisabled();
+      expect(
+        resets.getByRole('button', { name: 'Refresh resets' }),
+      ).toBeDisabled();
+      const before = call.mock.calls.filter(
+        ([command]) => command === 'codex_consume_reset',
+      ).length;
+      await fireEvent.click(button);
+      expect(
+        call.mock.calls.filter(
+          ([command]) => command === 'codex_consume_reset',
+        ),
+      ).toHaveLength(before);
+      pending.resolve(result);
+      await resets.findByText('1 resets available');
+      const expiryList = resets.getByRole('list', {
+        name: 'Reset expiry dates',
+      });
+      expect(expiryList.querySelectorAll('time')).toHaveLength(1);
+      expect(expiryList.querySelector('time')).toHaveAttribute(
+        'datetime',
+        new Date(secondExpiry * 1000).toISOString(),
+      );
+      expect(await screen.findAllByText('Reset applied.')).not.toHaveLength(0);
+      expect(
+        activeCard().getByRole('meter', { name: '5-hour window' }),
+      ).toHaveAttribute('aria-valuenow', '0');
+    },
+  );
+  it.each(['en', 'ro'] as const)(
+    'shows exact localized reset expiry dates and explicit non-expiring credits (%s)',
+    async (locale) => {
+      const raw = codexSnapshot();
+      const expiry = Date.UTC(2030, 4, 20, 12, 34) / 1000;
+      raw.accounts[0].quota!.resetCreditsAvailable = 3;
+      raw.accounts[0].quota!.resetCreditDetails = [
+        { expiresAt: null },
+        { expiresAt: expiry },
+        { expiresAt: expiry },
+      ];
+      await setup(raw, locale);
+      const resets = section(t(locale, 'availableResets'));
+      const list = resets.getByRole('list', {
+        name: t(locale, 'codexResetExpiryDates'),
+      });
+      const rows = within(list).getAllByRole('listitem');
+      expect(rows).toHaveLength(2);
+      expect(
+        within(rows[0]).getByText(locale === 'ro' ? '2 resetări' : '2 resets'),
+      ).toBeVisible();
+      const time = rows[0].querySelector('time')!;
+      expect(time).toHaveAttribute(
+        'datetime',
+        new Date(expiry * 1000).toISOString(),
+      );
+      expect(time.textContent).toContain('2030');
+      expect(time.textContent).toContain(locale === 'ro' ? 'mai' : 'May');
+      expect(time.textContent).toMatch(/\d{1,2}:\d{2}/);
+      expect(
+        within(rows[1]).getByText(t(locale, 'codexResetNoExpiry')),
+      ).toBeVisible();
+      expect(
+        resets.queryByText(t(locale, 'codexResetExpiryUnknown')),
+      ).toBeNull();
+    },
+  );
+  it.each([null, [], undefined])(
+    'keeps unavailable expiry details distinct from non-expiring credits (%s)',
+    async (details) => {
+      const raw = codexSnapshot();
+      raw.accounts[0].quota!.resetCreditsAvailable = 3;
+      raw.accounts[0].quota!.resetCreditDetails = details;
+      await setup(raw);
+      const resets = section('Available resets');
+      expect(resets.getByText('3 resets available')).toBeVisible();
+      expect(resets.getByText('Expiry dates unavailable.')).toBeVisible();
+      expect(resets.queryByText('Does not expire')).toBeNull();
+      expect(resets.queryByRole('list')).toBeNull();
+    },
+  );
+  it('shows partial expiry details without replacing the authoritative available count', async () => {
+    const raw = codexSnapshot();
+    raw.accounts[0].quota!.resetCreditsAvailable = 4;
+    raw.accounts[0].quota!.resetCreditDetails = [
+      { expiresAt: Date.UTC(2030, 4, 20, 12, 34) / 1000 },
+    ];
+    await setup(raw);
+    const resets = section('Available resets');
+    expect(resets.getByText('4 resets available')).toBeVisible();
+    expect(
+      resets.getByText('Expiry details available for 1 of 4 resets.'),
+    ).toBeVisible();
+    expect(resets.queryByText('Does not expire')).toBeNull();
+  });
+  it.each([
+    [null, 'Reset availability unknown', 'resetUnavailable'],
+    [0, '0 resets available', 'noResetCredits'],
+  ] as const)(
+    'keeps unknown and empty Teams reset states visible (%s)',
+    async (count, label, reason) => {
+      const raw = codexSnapshot();
+      raw.accounts[0].planType = 'team';
+      raw.accounts[0].quota!.resetCreditsAvailable = count;
+      raw.accounts[0].reset.usable = codexCapability(reason);
+      const { call } = await setup(raw);
+      const resets = section('Available resets');
+      expect(resets.getByText(label)).toBeVisible();
+      expect(
+        resets.getByRole('button', { name: 'Use one reset' }),
+      ).toBeDisabled();
+      await fireEvent.click(
+        resets.getByRole('button', { name: 'Refresh resets' }),
+      );
+      expect(call).toHaveBeenLastCalledWith('codex_refresh_account', {
+        id: raw.accounts[0].id,
+      });
+    },
+  );
+  it('shows the Romanian reset action and lets an uncertain reset be checked with zero credits', async () => {
+    const raw = codexSnapshot();
+    raw.accounts[0].planType = 'team';
+    raw.accounts[0].quota!.resetCreditsAvailable = 0;
+    raw.accounts[0].reset = {
+      pending: true,
+      lastOutcome: null,
+      usable: codexCapability(),
+    };
+    const { call } = await setup(raw, 'ro');
+    const resets = section('Resetări disponibile');
+    expect(resets.getByText('Resetări disponibile: 0')).toBeVisible();
+    const result = structuredClone(raw);
+    result.revision++;
+    result.accounts[0].reset.pending = false;
+    result.accounts[0].reset.lastOutcome = 'alreadyRedeemed';
+    result.accounts[0].reset.usable = codexCapability('noResetCredits');
+    call.mockResolvedValueOnce(result);
+    await fireEvent.click(
+      resets.getByRole('button', { name: 'Verifică resetarea anterioară' }),
+    );
+    expect(call).toHaveBeenLastCalledWith('codex_consume_reset', {
+      id: raw.accounts[0].id,
+    });
+    expect(
+      await screen.findAllByText('Resetarea a fost aplicată.'),
+    ).not.toHaveLength(0);
+    expect(
+      resets.getByRole('button', { name: 'Folosește o resetare' }),
+    ).toBeDisabled();
+  });
+  it('shows the reset controls in an inactive account details dialog', async () => {
+    const raw = codexSnapshot();
+    raw.accounts[1].planType = 'team';
+    raw.accounts[1].quota!.resetCreditsAvailable = 1;
+    const expiry = Date.UTC(2030, 4, 20, 12, 34) / 1000;
+    raw.accounts[1].quota!.resetCreditDetails = [{ expiresAt: expiry }];
+    raw.accounts[1].reset.usable = codexCapability();
+    const { call } = await setup(raw);
+    await fireEvent.click(
+      within(row('personal@example.invalid')).getByRole('button', {
+        name: /More/,
+      }),
+    );
+    await fireEvent.click(
+      within(row('personal@example.invalid')).getByRole('button', {
+        name: 'Details',
+      }),
+    );
+    const dialog = within(screen.getByRole('dialog'));
+    expect(dialog.getByText('1 resets available')).toBeVisible();
+    expect(
+      dialog
+        .getByRole('list', { name: 'Reset expiry dates' })
+        .querySelector('time'),
+    ).toHaveAttribute('datetime', new Date(expiry * 1000).toISOString());
+    await fireEvent.click(
+      dialog.getByRole('button', { name: 'Use one reset' }),
+    );
+    expect(call).toHaveBeenLastCalledWith('codex_consume_reset', {
+      id: raw.accounts[1].id,
+    });
+    expect(
+      call.mock.calls.some(([command]) => command === 'codex_switch_account'),
+    ).toBe(false);
+  });
   it('shows every saved account with both windows, plan and a plain-language status', async () => {
     await setup();
     const table = screen.getByRole('table');
@@ -651,12 +869,13 @@ describe('Codex accounts page', () => {
     await fireEvent.click(screen.getByRole('tab', { name: /Claude/ }));
     await screen.findByText(t('en', 'claudeSubtitle'));
     const claude = skeleton();
-    // The same cards in the same order; only the provider card differs.
+    // Shared cards retain their order; Codex adds manual resets beside its setup.
     expect(codex.headings).toEqual([
       'Active account',
       'Saved accounts',
       'Next up',
       'Automation',
+      'Available resets',
       'Codex setup',
     ]);
     expect(claude.headings).toEqual([

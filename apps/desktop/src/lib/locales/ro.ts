@@ -245,7 +245,7 @@ export const ro: Record<keyof typeof en, string> = {
     'Alege un interval între 2 și 15 minute și un prag între 50% și 100%.',
   globalPreferences: 'Aspect și limbă',
   settingsProviderScope:
-    'Comutarea automată, ordinea resetărilor săptămânale, intervalul de verificare și pragul de comutare se aplică pentru Claude și Codex. Pornirea ferestrelor de 5 ore și săptămânală și folosirea resetărilor se aplică doar pentru Claude. Aspectul și limba se aplică ambilor furnizori.',
+    'Comutarea automată, ordinea resetărilor săptămânale, intervalul de verificare și pragul de comutare se aplică pentru Claude și Codex. Pornirea ferestrelor de 5 ore și săptămânală și folosirea automată a resetărilor se aplică doar pentru Claude. Resetările Codex pot fi folosite manual din detaliile contului. Aspectul și limba se aplică ambilor furnizori.',
   sharedAutomation: 'Automatizare pentru Claude și Codex',
   claudeOnlyAutomation: 'Doar pentru Claude',
 
@@ -317,6 +317,29 @@ export const ro: Record<keyof typeof en, string> = {
   codexSpendBlocked: 'Limita de cheltuieli a spațiului de lucru a fost atinsă.',
   codexCreditsUnlimited: 'Nelimitate',
   codexCreditsAvailable: 'Disponibile',
+  codexResetCount: 'Resetări disponibile: {count}',
+  codexResetUnknown: 'Disponibilitatea resetărilor este necunoscută',
+  codexResetExpiryDates: 'Datele de expirare a resetărilor',
+  codexResetOne: '1 resetare',
+  codexResetMany: '{count} resetări',
+  codexResetExpires: 'Expiră',
+  codexResetNoExpiry: 'Nu expiră',
+  codexResetExpiryUnknown: 'Datele de expirare sunt indisponibile.',
+  codexResetExpiryPartial:
+    'Date de expirare disponibile pentru {shown} din {count} resetări.',
+  codexUseReset: 'Folosește o resetare',
+  codexRetryReset: 'Verifică resetarea anterioară',
+  codexUsingReset: 'Se resetează utilizarea…',
+  codexRefreshResets: 'Actualizează resetările',
+  codexResetHelp:
+    'Folosește o resetare disponibilă pe acest cont pentru a redeschide ferestrele de utilizare eligibile.',
+  codexResetPending:
+    'Resetarea anterioară este neconfirmată. Verific-o din nou pentru a recupera rezultatul fără să folosești încă o resetare.',
+  codexResetDone: 'Resetarea a fost aplicată.',
+  codexResetCached:
+    'Informație salvată. Actualizează pentru a verifica disponibilitatea curentă.',
+  codexResetNotLimited:
+    'Nu există o fereastră de utilizare eligibilă pentru resetare. Nu s-a folosit nicio resetare.',
   codexOtherLimit: 'Altă limită',
   codexPlanFree: 'Gratuit',
   codexWindowShort: 'Fereastră scurtă',
@@ -405,4 +428,10 @@ export const ro: Record<keyof typeof en, string> = {
     'Conturile din Codex Switcher nu au fost găsite sau nu au putut fi citite.',
   codexReason_activeAccount:
     'Comută pe alt cont înainte să-l ștergi pe acesta.',
+  codexReason_resetUnavailable:
+    'Actualizează pentru a verifica resetările disponibile. Codex poate să nu ofere informația pentru acest cont sau spațiu de lucru.',
+  codexReason_noResetCredits:
+    'Nu există resetări disponibile pentru acest cont.',
+  codexReason_resetUnconfirmed:
+    'Rezultatul resetării nu a putut fi confirmat. Verifică resetarea anterioară pentru a recupera rezultatul.',
 };

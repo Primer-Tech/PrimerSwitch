@@ -257,6 +257,17 @@ async fn codex_import_switcher(runtime: State<'_, RuntimeHandle>) -> Reply<Codex
 async fn codex_refresh_all(runtime: State<'_, RuntimeHandle>) -> Reply<CodexSnapshot> {
     runtime.codex_refresh_all().await.map_err(|e| e.to_string())
 }
+
+#[tauri::command]
+async fn codex_consume_reset(
+    runtime: State<'_, RuntimeHandle>,
+    id: String,
+) -> Reply<CodexSnapshot> {
+    runtime
+        .codex_consume_reset(&id)
+        .await
+        .map_err(|e| e.to_string())
+}
 /// Writes the selected sign-in and restarts Codex's shared daemon so open terminals
 /// reconnect on it. Progress is published through `codex_snapshot_changed`.
 #[tauri::command]
@@ -316,6 +327,7 @@ fn main() {
             codex_delete_account,
             codex_import_switcher,
             codex_refresh_all,
+            codex_consume_reset,
             codex_switch_account
         ])
         .setup(move |app| {

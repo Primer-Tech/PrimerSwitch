@@ -704,11 +704,36 @@ impl CodexClient {
         let mut response = self
             .request(
                 "account/rateLimits/read",
-                json!({"supportsLunaReserve":false,"excludeResetCreditDetails":true}),
+                json!({"supportsLunaReserve":false,"excludeResetCreditDetails":false}),
                 30,
             )
             .await?;
         let parsed = serde_json::from_value(response.0.take()).map_err(|_| CodexError::Protocol);
+        if parsed.is_err() {
+            self.dead = true;
+            let _ = self.transport.shutdown().await;
+        }
+        parsed
+    }
+    /// Only an explicit user action calls this method. The runtime durably owns the
+    /// key and reuses it when the response to a redemption is lost.
+    pub async fn consume_reset(&mut self, key: &str) -> Result<crate::ResetOutcome, CodexError> {
+        if self.kind == ContextKind::Isolated {
+            return Err(CodexError::UnsafeContext);
+        }
+        if key.is_empty() || key.len() > 128 || key.chars().any(char::is_control) {
+            return Err(CodexError::Protocol);
+        }
+        let mut response = self
+            .request(
+                "account/rateLimitResetCredit/consume",
+                json!({"idempotencyKey": key}),
+                30,
+            )
+            .await?;
+        let parsed = serde_json::from_value::<crate::models::ResetResponse>(response.0.take())
+            .map(|response| response.outcome)
+            .map_err(|_| CodexError::Protocol);
         if parsed.is_err() {
             self.dead = true;
             let _ = self.transport.shutdown().await;
@@ -750,6 +775,7 @@ pub trait CodexService: Send {
     async fn cancel_login(&mut self) -> Result<CancelOutcome, CodexError>;
     async fn read_account(&mut self) -> Result<AccountObservation, CodexError>;
     async fn read_rate_limits(&mut self) -> Result<CodexRateLimits, CodexError>;
+    async fn consume_reset(&mut self, key: &str) -> Result<crate::ResetOutcome, CodexError>;
     async fn shutdown(&mut self) -> Result<(), CodexError>;
 }
 #[async_trait]
@@ -771,6 +797,9 @@ impl CodexService for CodexClient {
     }
     async fn read_rate_limits(&mut self) -> Result<CodexRateLimits, CodexError> {
         CodexClient::read_rate_limits(self).await
+    }
+    async fn consume_reset(&mut self, key: &str) -> Result<crate::ResetOutcome, CodexError> {
+        CodexClient::consume_reset(self, key).await
     }
     async fn shutdown(&mut self) -> Result<(), CodexError> {
         self.dead = true;

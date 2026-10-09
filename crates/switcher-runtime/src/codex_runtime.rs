@@ -2,7 +2,7 @@
 //! restart and its graceful drain) runs outside the owner lock, serialized by
 //! `codex_job`, so Claude actions and polling are never blocked by it.
 use super::*;
-use crate::codex_engine::{CodexAutoSwitch, CodexAutomation, QuotaJob, SwitchJob};
+use crate::codex_engine::{CodexAutoSwitch, CodexAutomation, QuotaJob, ResetJob, SwitchJob};
 
 /// Background cadence: follow auth.json, read at most one due quota, then decide
 /// automatic switching.
@@ -70,6 +70,7 @@ impl RuntimeHandle {
         self.codex_snapshot_command(CodexCommand::Discover).await
     }
     pub async fn codex_begin_login(&self) -> Result<CodexLoginLaunch, CodexReason> {
+        let _job = self.codex_job_lock().await?;
         let intent = self.inner.codex_intent.fetch_add(1, Ordering::AcqRel) + 1;
         match self.run_codex(CodexCommand::BeginLogin(intent)).await? {
             CodexOutput::Login(value) => Ok(value),
@@ -132,6 +133,43 @@ impl RuntimeHandle {
     pub async fn codex_refresh_account(&self, id: &str) -> Result<CodexSnapshot, CodexReason> {
         let _job = self.codex_job_lock().await?;
         self.codex_quota(id, true).await?;
+        Ok(self.get_codex_snapshot())
+    }
+    pub async fn codex_consume_reset(&self, id: &str) -> Result<CodexSnapshot, CodexReason> {
+        let _job = self.codex_job_lock().await?;
+        let job: ResetJob = {
+            let mut engine = self.inner.owner.lock().await;
+            let now = engine.clock.now();
+            let result = {
+                let Engine { codex, vault, .. } = &mut *engine;
+                codex.plan_reset(
+                    id,
+                    vault.as_ref().ok_or(CodexReason::VaultUnavailable)?,
+                    now,
+                )
+            };
+            if let Err(error) = &result {
+                engine.codex.error = Some(*error);
+            }
+            self.publish_codex_only(&mut engine, result.is_ok());
+            result?
+        };
+        let report = job.run().await;
+        let mut engine = self.inner.owner.lock().await;
+        let now = engine.clock.now();
+        let result = {
+            let Engine { codex, vault, .. } = &mut *engine;
+            codex.finish_quota(
+                report,
+                vault.as_ref().ok_or(CodexReason::VaultUnavailable)?,
+                now,
+            )
+        };
+        if let Err(error) = &result {
+            engine.codex.error = Some(*error);
+        }
+        self.publish_codex_only(&mut engine, false);
+        result?;
         Ok(self.get_codex_snapshot())
     }
     /// Read every saved ChatGPT account, the active one first. Per-account failures

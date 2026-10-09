@@ -237,7 +237,7 @@ export const en = {
     'Choose an interval between 2 and 15 minutes and a threshold between 50% and 100%.',
   globalPreferences: 'Appearance and language',
   settingsProviderScope:
-    'Automatic switching, the weekly reset order, the check interval and the switch threshold apply to Claude and Codex. Starting the 5-hour and weekly windows and using resets apply to Claude only. Appearance and language apply to both.',
+    'Automatic switching, the weekly reset order, the check interval and the switch threshold apply to Claude and Codex. Starting the 5-hour and weekly windows and using resets automatically apply to Claude only. Codex resets can be used manually in its account details. Appearance and language apply to both.',
   sharedAutomation: 'Automation for Claude and Codex',
   claudeOnlyAutomation: 'Claude only',
 
@@ -306,6 +306,28 @@ export const en = {
   codexSpendBlocked: 'The workspace spending limit has been reached.',
   codexCreditsUnlimited: 'Unlimited',
   codexCreditsAvailable: 'Available',
+  codexResetCount: '{count} resets available',
+  codexResetUnknown: 'Reset availability unknown',
+  codexResetExpiryDates: 'Reset expiry dates',
+  codexResetOne: '1 reset',
+  codexResetMany: '{count} resets',
+  codexResetExpires: 'Expires',
+  codexResetNoExpiry: 'Does not expire',
+  codexResetExpiryUnknown: 'Expiry dates unavailable.',
+  codexResetExpiryPartial:
+    'Expiry details available for {shown} of {count} resets.',
+  codexUseReset: 'Use one reset',
+  codexRetryReset: 'Check previous reset',
+  codexUsingReset: 'Resetting usage…',
+  codexRefreshResets: 'Refresh resets',
+  codexResetHelp:
+    'Uses one available reset on this account to reopen eligible usage windows.',
+  codexResetPending:
+    'The previous reset is unconfirmed. Check it again to recover the result without using another reset.',
+  codexResetDone: 'Reset applied.',
+  codexResetCached: 'Saved reading. Refresh to check the current availability.',
+  codexResetNotLimited:
+    'There is no eligible usage window to reset. No reset was used.',
   codexOtherLimit: 'Other limit',
   codexPlanFree: 'Free',
   codexWindowShort: 'Short window',
@@ -391,4 +413,9 @@ export const en = {
     'Codex Switcher’s accounts weren’t found or couldn’t be read.',
   codexReason_activeAccount:
     'Switch to another account before removing this one.',
+  codexReason_resetUnavailable:
+    'Refresh to check reset availability. Codex may not provide it for this account or workspace.',
+  codexReason_noResetCredits: 'No resets are available for this account.',
+  codexReason_resetUnconfirmed:
+    'The reset result could not be confirmed. Check the previous reset to recover its result.',
 } as const;

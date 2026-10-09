@@ -174,6 +174,10 @@ function row(
       freesAt,
       failure,
       blocked,
+      resets: {
+        available: account.quota?.resetCreditsAvailable ?? null,
+        usableAt: null,
+      },
     },
     now,
     locale,
@@ -243,8 +247,15 @@ function row(
       snapshot.capabilities.refreshQuota.enabled &&
       chatgpt &&
       !account.needsSignIn,
-    canDelete: !account.selected && snapshot.capabilities.deleteSaved.enabled,
-    deleteReason: account.selected ? t(locale, 'deleteActiveReason') : null,
+    canDelete:
+      !account.selected &&
+      !account.reset.pending &&
+      snapshot.capabilities.deleteSaved.enabled,
+    deleteReason: account.selected
+      ? t(locale, 'deleteActiveReason')
+      : account.reset.pending
+        ? codexMessage('resetUnconfirmed', locale)
+        : null,
   };
 }
 

@@ -77,6 +77,70 @@ function switched(
   return raw;
 }
 describe('Codex contract and redacted IPC', () => {
+  it('accepts older quotas and date-only details but rejects IDs and invalid expiry timestamps', () => {
+    const raw = codexSnapshot();
+    expect(codexSnapshotSchema.safeParse(raw).success).toBe(true);
+    raw.accounts[0].quota!.resetCreditDetails = [
+      { expiresAt: null },
+      { expiresAt: 1_800_000_000 },
+    ];
+    expect(codexSnapshotSchema.safeParse(raw).success).toBe(true);
+    for (const detail of [
+      { expiresAt: -1 },
+      { expiresAt: Number.MAX_SAFE_INTEGER },
+      { expiresAt: 1_800_000_000, id: 'private-credit-id-sentinel' },
+    ]) {
+      raw.accounts[0].quota!.resetCreditDetails = [detail];
+      expect(codexSnapshotSchema.safeParse(raw).success).toBe(false);
+    }
+  });
+  it('rejects reset keys and arbitrary reset outcomes over IPC', () => {
+    const raw = codexSnapshot();
+    const account = raw.accounts[0];
+    account.reset = {
+      ...account.reset,
+      idempotencyKey: 'secret-sentinel',
+    } as unknown as typeof account.reset;
+    expect(codexSnapshotSchema.safeParse(raw).success).toBe(false);
+    account.reset = {
+      pending: false,
+      lastOutcome: 'secret-sentinel',
+      usable: codexCapability(),
+    } as unknown as typeof account.reset;
+    expect(codexSnapshotSchema.safeParse(raw).success).toBe(false);
+  });
+  it('uses native reset capabilities and blocks cached, demo and concurrent redemptions', async () => {
+    const raw = codexSnapshot();
+    const { c, call, event } = setup(raw);
+    await c.start();
+    const before = call.mock.calls.length;
+    expect(await c.consumeReset(raw.accounts[0].id)).toBe(false);
+    expect(call).toHaveBeenCalledTimes(before);
+    raw.revision++;
+    raw.accounts[0].reset.usable = codexCapability();
+    raw.demo = true;
+    event(raw);
+    expect(await c.consumeReset(raw.accounts[0].id)).toBe(false);
+    raw.demo = false;
+    raw.revision++;
+    event(raw);
+    const pending = deferred();
+    call.mockReturnValueOnce(pending.promise);
+    const first = c.consumeReset(raw.accounts[0].id);
+    expect(await c.consumeReset(raw.accounts[0].id)).toBe(false);
+    const result = structuredClone(raw);
+    result.revision++;
+    result.accounts[0].reset = {
+      pending: true,
+      lastOutcome: null,
+      usable: codexCapability(),
+    };
+    result.error = 'resetUnconfirmed';
+    pending.resolve(result);
+    expect(await first).toBe(false);
+    expect(get(c).error).toBe('resetUnconfirmed');
+    expect(get(c).snapshot?.accounts[0].reset.pending).toBe(true);
+  });
   it('parses the seamless-switch snapshot strictly and rejects retired or credential-shaped data', () => {
     const raw = codexSnapshot();
     expect(codexSnapshotSchema.parse(raw)).toEqual(raw);

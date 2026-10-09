@@ -13,6 +13,7 @@
     locked,
     lockReason,
     facts,
+    extra,
     onrefresh,
     onswitch,
     onsignin,
@@ -25,6 +26,7 @@
     lockReason: string | null;
     /** Provider-specific facts, as `<div><dt/><dd/></div>` rows. */
     facts?: Snippet;
+    extra?: Snippet;
     onrefresh: (trigger: HTMLElement) => void;
     onswitch: (trigger: HTMLElement) => void;
     onsignin: (trigger: HTMLElement) => void;
@@ -74,6 +76,7 @@
       </dd>
     </div>
   </dl>
+  {@render extra?.()}
   <div class="actions">
     <button
       class="delete"

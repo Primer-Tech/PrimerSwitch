@@ -18,6 +18,12 @@ Evidence levels are distinct:
 
 Live validation is a later separate test scope. A reset/inference call is a real side effect, so plan fixture coverage first and record any live usage explicitly. This planning task did not switch accounts, consume resets, import real credentials or make authenticated API calls. Do not run the original probes on the real home: even `--probe-switch-logic` writes a backup.
 
+### Codex manual reset acceptance (0.2.3)
+
+The owner's 2026-10-09 request authorizes manual Codex reset redemption, superseding the initial read-only reset scope. Use fake app-server transports and fixture homes to verify positive, zero and missing counts for personal, Team and Business plans; every documented consume outcome; current backend workspace verification; encrypted idempotency-key persistence before sending; timeout/restart reconciliation with the same key even when the count becomes zero; storage failures that send nothing; inactive credential rotation; and quota rereads after redemption. Pending outcomes must prevent deletion and never expose the key over IPC. UI checks cover both languages, active and inactive accounts, disabled/unknown states, repeated-click exclusion and read-only demos. Local installer qualification must preserve existing encrypted state and the protected key byte-for-byte before relaunch. These checks do not establish live OpenAI account entitlement or consume a real credit.
+
+Expiry fixtures cover authoritative counts exceeding capped details, unavailable versus explicit non-expiring credits, filtering non-available/unknown-type/invalid-date rows, duplicate IDs, encrypted reopen and historical omission, date-only IPC, local date/time/timezone presentation in both languages, active/inactive details and expiry updates after consuming a reset.
+
 ## 2. Golden fixtures and model/policy tests
 
 Keep compact sanitized fixtures with explicit provenance: source symbol + commit or primary protocol version. Derive expected outputs from the specification, not from a ported function's output. The Swift probe contains useful examples, but its debug guards and home mutation must not enter production code.

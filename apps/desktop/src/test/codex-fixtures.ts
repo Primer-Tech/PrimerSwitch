@@ -69,6 +69,11 @@ export function codexAccount(
     quotaState: 'fresh',
     error: null,
     needsSignIn: false,
+    reset: {
+      pending: false,
+      lastOutcome: null,
+      usable: codexCapability('resetUnavailable'),
+    },
     ...overrides,
   };
 }

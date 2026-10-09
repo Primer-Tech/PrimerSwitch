@@ -2,6 +2,8 @@
 
 Status: authorized by the owner, follows the branded 0.1.1 release. Source implementation is complete; final native CI and preview packaging are in progress. Practical workflow and scope: [CODEX_USAGE.md](CODEX_USAGE.md). Resume with AGENTS.md, DEVELOPMENT_CONTRACT.md, PROGRESS.md and CODEX_RESEARCH.md. Original Claude records, settings, polling and provider behavior remain compatible.
 
+Owner update, 2026-10-09: manual Codex reset redemption and consistent personal/Team/Business availability are authorized for the local 0.2.3 update. This supersedes the initial exclusion of manual reset redemption below. Keep automatic redemption and email nudges excluded. Fetch native reset details, require backend owner verification before consume, persist/reuse the encrypted request key through unknown outcomes, and refresh native usage afterward. See [the manual reset contract](CODEX_USAGE.md#manual-usage-resets-023-local-update).
+
 ## Supported first delivery
 
 Add a real Codex provider in the same branded desktop app, English by default with Romanian. Pin the reviewed compatibility adapter to installed Codex 0.160.0, official commit a956835d020762cb2b570053af06f643a11c0ecc. Discover/verify the native executable without shell/npm launcher evaluation; unknown versions block credential writes. Codex is a separately installed local dependency.

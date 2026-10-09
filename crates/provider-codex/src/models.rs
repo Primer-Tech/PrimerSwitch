@@ -89,6 +89,21 @@ pub struct ResetCredit {
     pub title: Option<String>,
     pub description: Option<String>,
 }
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ResetOutcome {
+    Reset,
+    AlreadyRedeemed,
+    NothingToReset,
+    NoCredit,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ResetResponse {
+    pub outcome: ResetOutcome,
+}
 macro_rules! redacted_debug { ($($ty:ty),*) => {$(
 impl fmt::Debug for $ty { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str(concat!(stringify!($ty), "([REDACTED])")) } }
 )*}; }

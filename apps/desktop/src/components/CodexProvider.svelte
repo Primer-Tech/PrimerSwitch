@@ -5,6 +5,7 @@
     codexElapsed,
     codexImportedMessage,
     codexMessage,
+    codexResetOutcome,
   } from '../lib/codex-format';
   import type { CodexController, CodexNotice } from '../lib/codex-controller';
   import type { CodexAccount } from '../lib/codex-types';
@@ -22,6 +23,7 @@
   import DeleteDialog from './DeleteDialog.svelte';
   import Modal from './Modal.svelte';
   import Icon from './Icon.svelte';
+  import CodexResets from './CodexResets.svelte';
   let {
     controller,
     now,
@@ -44,6 +46,9 @@
     automation?: Settings | null;
   } = $props();
   let snapshot = $derived($controller.snapshot);
+  let activeRaw = $derived(
+    snapshot?.accounts.find((a) => a.id === snapshot.selectedId) ?? null,
+  );
   let pending = $derived($controller.pending);
   let switching = $derived(snapshot?.switching ?? null);
   let switchPending = $derived(pending === 'codex_switch_account');
@@ -147,6 +152,8 @@
       }
       case 'deleteComplete':
         return t($language, 'codexDeleteComplete');
+      case 'resetComplete':
+        return codexResetOutcome(notice.outcome, $language);
       case 'importedCurrent':
         return codexImportedMessage('current', notice.added, $language);
       case 'importedSwitcher':
@@ -511,6 +518,21 @@
   ondelete={askDelete}
 >
   {#snippet providerCard()}
+    {#if activeRaw?.authKind === 'chatgpt'}
+      <section class="panel side-panel" aria-labelledby="codex-resets-heading">
+        <div class="panel-heading">
+          <h2 id="codex-resets-heading">{t($language, 'availableResets')}</h2>
+        </div>
+        <CodexResets
+          account={activeRaw}
+          {locked}
+          working={pending === 'codex_consume_reset' &&
+            $controller.pendingId === activeRaw.id}
+          onreset={() => void controller.consumeReset(activeRaw!.id)}
+          onrefresh={() => void controller.refreshAccount(activeRaw!.id)}
+        />
+      </section>
+    {/if}
     <section
       class="panel side-panel setup-panel"
       aria-labelledby="codex-setup-heading"
@@ -589,6 +611,21 @@
       onsignin={() => signIn(details, returnFocus)}
       ondelete={() => askDelete(details!, returnFocus)}
     >
+      {#snippet extra()}
+        {#if saved?.authKind === 'chatgpt'}
+          <section aria-label={t($language, 'availableResets')}>
+            <h3>{t($language, 'availableResets')}</h3>
+            <CodexResets
+              account={saved}
+              {locked}
+              working={pending === 'codex_consume_reset' &&
+                $controller.pendingId === saved.id}
+              onreset={() => void controller.consumeReset(saved.id)}
+              onrefresh={() => void controller.refreshAccount(saved.id)}
+            />
+          </section>
+        {/if}
+      {/snippet}
       {#snippet facts()}
         {#if saved}
           <div>

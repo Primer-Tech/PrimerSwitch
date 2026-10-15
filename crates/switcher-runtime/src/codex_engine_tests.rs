@@ -1665,6 +1665,7 @@ fn record_reading(engine: &mut CodexEngine, id: &str, quota: CodexQuotaView, at:
     account.last_attempt_at = Some(at);
     engine.verified_now.insert(id.into());
     engine.account_errors.remove(id);
+    engine.observe_return_window(index, at);
 }
 impl Fixture {
     fn read(&mut self, id: &str, quota: CodexQuotaView, at: i64) {
@@ -1693,6 +1694,7 @@ fn switch_to(f: &Fixture, id: &str, peak: i32) -> CodexAutomation {
     };
     let active = f.engine.selected_id.clone().unwrap();
     CodexAutomation::Switch(CodexAutoSwitch {
+        previous_id: active.clone(),
         target_id: id.into(),
         target_name: name(id),
         previous_name: name(&active),
@@ -2052,7 +2054,7 @@ fn automatic_switching_rereads_an_old_target_first_and_cools_down() {
     f.read(&b, main_quota(10, 10), NOW);
     assert_eq!(f.engine.automation(NOW, &policy), switch_to(&f, &b, 97));
     // At most one automatic switch per ten minutes.
-    f.engine.begin_auto_switch(NOW);
+    f.engine.begin_auto_switch(NOW, &f.vault).unwrap();
     assert_eq!(f.engine.automation(NOW, &policy), CodexAutomation::Idle);
     assert_eq!(
         f.engine.automation(NOW + AUTO_SWITCH_COOLDOWN - 1, &policy),
@@ -2399,4 +2401,775 @@ async fn automatic_switching_stays_off_when_the_shared_setting_is_off() {
     assert_eq!(handle.get_codex_snapshot().next_id, Some(b));
     assert!(daemon.calls.lock().unwrap().is_empty());
     assert!(notifications.try_recv().is_err());
+}
+
+fn account_preferences(f: &mut Fixture, id: &str, automation: AccountAutomation) {
+    let index = f.engine.account_index(id).unwrap();
+    f.engine.saved.accounts[index].automation = automation;
+}
+fn preferred(f: &mut Fixture, id: &str, threshold: Option<f64>, priority: u16) {
+    account_preferences(
+        f,
+        id,
+        AccountAutomation {
+            threshold,
+            priority: Some(priority),
+            return_on_five_hour_reset: true,
+            ..AccountAutomation::default()
+        },
+    );
+}
+fn return_to(f: &Fixture, id: &str) -> CodexAutomation {
+    let CodexAutomation::Switch(mut plan) = switch_to(f, id, 0) else {
+        unreachable!()
+    };
+    plan.peak = None;
+    CodexAutomation::Return(plan)
+}
+fn reopen(f: &mut Fixture, now: i64) {
+    let mut engine = CodexEngine::load(&f.vault).with_test_seams(
+        f.factory.clone(),
+        f.daemon.clone(),
+        f.inventory.clone(),
+        f.switcher.clone(),
+    );
+    engine.installation = f.engine.installation.take();
+    engine.availability = CodexAvailability::Supported;
+    engine.discovered_at = Some(now);
+    engine.observe(&f.vault, now).unwrap();
+    f.engine = engine;
+}
+
+#[tokio::test]
+async fn codex_account_preferences_are_local_validated_decimal_and_omission_preserving() {
+    let mut f = Fixture::new();
+    let a = f.id_of("ws-a");
+    let b = f.add("user-b", "ws-b", "saved");
+    let original_auth = f.saved_bytes("ws-b");
+    let historical = serde_json::to_value(&f.engine.saved).unwrap();
+    assert!(historical.get("return_hold_until").is_none());
+    assert!(historical.get("last_auto_switch_at").is_none());
+    assert!(historical["accounts"].as_array().unwrap().iter().all(|a| {
+        a.get("automation").is_none() && a.get("preferred_return_reset_at").is_none()
+    }));
+    let view = AccountAutomationView {
+        enabled: false,
+        threshold: Some(99.5),
+        priority: Some(2),
+        return_on_five_hour_reset: true,
+    };
+    f.engine
+        .command(
+            CodexCommand::UpdateAccountAutomation(b.clone(), view.clone()),
+            &f.vault,
+            NOW,
+        )
+        .await
+        .unwrap();
+    assert_eq!(f.view(&b).automation, view);
+    assert_eq!(f.view(&b).effective_threshold, 99.5);
+    assert_eq!(f.view(&a).automation, AccountAutomationView::default());
+    assert_eq!(f.saved_bytes("ws-b"), original_auth);
+    assert!(f.factory.calls().is_empty());
+    for threshold in [49.9, 100.1, f64::NAN, f64::INFINITY] {
+        let invalid = AccountAutomationView {
+            threshold: Some(threshold),
+            ..view.clone()
+        };
+        assert_eq!(
+            f.engine
+                .command(
+                    CodexCommand::UpdateAccountAutomation(b.clone(), invalid),
+                    &f.vault,
+                    NOW
+                )
+                .await
+                .err(),
+            Some(CodexReason::InvalidAutomation)
+        );
+        assert_eq!(f.view(&b).automation, view);
+    }
+    for priority in [0, 100] {
+        let invalid = AccountAutomationView {
+            priority: Some(priority),
+            ..view.clone()
+        };
+        assert_eq!(
+            f.engine
+                .command(
+                    CodexCommand::UpdateAccountAutomation(b.clone(), invalid),
+                    &f.vault,
+                    NOW
+                )
+                .await
+                .err(),
+            Some(CodexReason::InvalidAutomation)
+        );
+    }
+    f.engine
+        .command(
+            CodexCommand::UpdateAccountAutomation(b.clone(), AccountAutomationView::default()),
+            &f.vault,
+            NOW,
+        )
+        .await
+        .unwrap();
+    let current = serde_json::to_value(&f.engine.saved).unwrap();
+    assert!(
+        current["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|a| a.get("automation").is_none())
+    );
+    reopen(&mut f, NOW);
+    assert_eq!(f.view(&b).automation, AccountAutomationView::default());
+    f.claude_untouched();
+}
+
+#[test]
+fn codex_provider_and_account_thresholds_drive_selection_cadence_status_and_priority() {
+    let settings = Settings {
+        threshold: 94.0,
+        claude_threshold: Some(70.5),
+        codex_threshold: Some(96.5),
+        ..Settings::default()
+    };
+    let policy = CodexPolicy::from(&settings);
+    assert_eq!(policy.threshold, 96.5);
+    assert_eq!(settings.threshold_for(ProviderId::Claude), 70.5);
+    let mut f = Fixture::new();
+    let a = f.id_of("ws-a");
+    let b = f.add("user-b", "ws-b", "saved");
+    let c = f.add("user-c", "ws-c", "saved");
+    account_preferences(
+        &mut f,
+        &a,
+        AccountAutomation {
+            threshold: Some(80.0),
+            ..AccountAutomation::default()
+        },
+    );
+    account_preferences(
+        &mut f,
+        &b,
+        AccountAutomation {
+            threshold: Some(60.0),
+            priority: Some(1),
+            ..AccountAutomation::default()
+        },
+    );
+    account_preferences(
+        &mut f,
+        &c,
+        AccountAutomation {
+            threshold: Some(99.5),
+            priority: Some(2),
+            ..AccountAutomation::default()
+        },
+    );
+    f.read(&a, main_quota(79, 20), NOW);
+    f.read(&b, main_quota(60, 20), NOW);
+    f.read(&c, main_quota(91, 20), NOW);
+    assert_eq!(f.next(&policy), Some(c.clone()));
+    assert_eq!(
+        f.engine.active_interval(&policy),
+        ACTIVE_NEAR_LIMIT_INTERVAL
+    );
+    assert_eq!(f.engine.automation(NOW, &policy), CodexAutomation::Idle);
+    f.read(&a, main_quota_at(80, NOW + 1200, 20, NOW + 86400), NOW);
+    assert_eq!(f.engine.automation(NOW, &policy), switch_to(&f, &c, 80));
+    let view = f.engine.snapshot(false, NOW, &policy);
+    let active = view.accounts.iter().find(|v| v.id == a).unwrap();
+    assert!(active.exhausted);
+    assert_eq!(active.effective_threshold, 80.0);
+    assert_eq!(active.frees_at, Some(NOW + 1200));
+    // Headroom comes before priority, and each uses its own threshold.
+    f.read(&b, main_quota(58, 20), NOW);
+    assert_eq!(f.order(&policy), vec![c.clone(), b.clone()]);
+    f.read(&b, main_quota(50, 20), NOW);
+    assert_eq!(f.order(&policy), vec![b.clone(), c.clone()]);
+    let index = f.engine.account_index(&b).unwrap();
+    f.engine.saved.accounts[index].automation.enabled = false;
+    assert_eq!(f.order(&policy), vec![c.clone()]);
+    f.read(&a, main_quota(69, 20), NOW);
+    assert_eq!(f.engine.active_interval(&policy), policy.poll_interval);
+    f.claude_untouched();
+}
+
+#[test]
+fn lowering_the_codex_default_arms_the_already_observed_five_hour_window() {
+    let mut f = Fixture::new();
+    let a = f.id_of("ws-a");
+    preferred(&mut f, &a, None, 1);
+    f.read(&a, main_quota(80, 20), NOW);
+    assert!(
+        f.engine.saved.accounts[0]
+            .preferred_return_reset_at
+            .is_none()
+    );
+    let settings = Settings {
+        threshold: 95.0,
+        codex_threshold: Some(80.0),
+        claude_threshold: Some(99.5),
+        ..Settings::default()
+    };
+    f.engine.set_policy(&CodexPolicy::from(&settings), NOW);
+    assert_eq!(
+        f.engine.saved.accounts[0].preferred_return_reset_at,
+        Some(NOW + 3600)
+    );
+    assert!(f.factory.calls().is_empty());
+    f.claude_untouched();
+}
+
+#[tokio::test]
+async fn an_eighty_percent_rotation_returns_once_after_natural_recovery_across_restart() {
+    let mut f = Fixture::new();
+    let a = f.id_of("ws-a");
+    let b = f.add("user-b", "ws-b", "saved");
+    preferred(&mut f, &a, Some(80.0), 1);
+    f.read(&a, main_quota_at(80, NOW + 1200, 20, NOW + 86400), NOW);
+    f.read(&b, main_quota(20, 20), NOW);
+    assert_eq!(
+        f.engine.automation(NOW, &CodexPolicy::default()),
+        switch_to(&f, &b, 80)
+    );
+    let ai = f.engine.account_index(&a).unwrap();
+    assert_eq!(
+        f.engine.saved.accounts[ai].preferred_return_reset_at,
+        Some(NOW + 1200)
+    );
+    f.engine.begin_auto_switch(NOW, &f.vault).unwrap();
+    let job = f.engine.begin_switch(&b, &f.vault, NOW).unwrap().unwrap();
+    f.engine
+        .finish_switch(&job, &job.run().await, &f.vault, NOW + 1, true)
+        .unwrap();
+    reopen(&mut f, NOW + 1200);
+    assert_eq!(
+        f.engine.saved.accounts[ai].preferred_return_reset_at,
+        Some(NOW + 1200)
+    );
+    assert_eq!(
+        f.engine.due_quota(NOW + 1200, &CodexPolicy::default()),
+        Some(a.clone())
+    );
+    f.read(&b, main_quota(20, 20), NOW + 1200);
+    assert_eq!(
+        f.engine.automation(NOW + 1200, &CodexPolicy::default()),
+        CodexAutomation::Refresh(a.clone())
+    );
+    f.read(
+        &a,
+        main_quota_at(0, NOW + 18000, 20, NOW + 86400),
+        NOW + 1200,
+    );
+    assert_eq!(
+        f.engine.automation(NOW + 1200, &CodexPolicy::default()),
+        return_to(&f, &a)
+    );
+    f.engine.begin_auto_switch(NOW + 1200, &f.vault).unwrap();
+    let job = f
+        .engine
+        .begin_switch(&a, &f.vault, NOW + 1200)
+        .unwrap()
+        .unwrap();
+    f.engine
+        .finish_switch(&job, &job.run().await, &f.vault, NOW + 1201, true)
+        .unwrap();
+    assert!(f.engine.saved.return_hold_until.is_none());
+    assert_eq!(f.engine.saved.accounts[ai].preferred_return_reset_at, None);
+    assert_eq!(
+        f.engine.saved.accounts[ai].preferred_return_handled_reset_at,
+        Some(NOW + 1200)
+    );
+    reopen(&mut f, NOW + 1801);
+    f.write_active(&auth("user-b", "ws-b", "saved"));
+    f.engine.observe(&f.vault, NOW + 1801).unwrap();
+    f.engine.saved.return_hold_until = None;
+    f.read(&b, main_quota(20, 20), NOW + 1801);
+    f.read(
+        &a,
+        main_quota_at(0, NOW + 18000, 20, NOW + 86400),
+        NOW + 1801,
+    );
+    assert_eq!(
+        f.engine.automation(NOW + 1801, &CodexPolicy::default()),
+        CodexAutomation::Idle
+    );
+    f.claude_untouched();
+}
+
+#[test]
+fn preferred_returns_respect_all_reported_headroom_missing_windows_identity_and_priorities() {
+    let mut f = Fixture::new();
+    let a = f.id_of("ws-a");
+    let b = f.add("user-b", "ws-b", "saved");
+    preferred(&mut f, &b, Some(80.0), 1);
+    f.read(
+        &b,
+        main_quota_at(80, NOW - 600, 20, NOW + 86400),
+        NOW - 1800,
+    );
+    f.read(&a, main_quota(20, 20), NOW);
+    let recovery = main_quota_at(0, NOW + 18000, 20, NOW + 86400);
+    for week in [76, 80, 99, 100] {
+        f.read(&b, main_quota_at(0, NOW + 18000, week, NOW + 86400), NOW);
+        assert_eq!(
+            f.engine.automation(NOW, &CodexPolicy::default()),
+            CodexAutomation::Idle
+        );
+        assert_ne!(
+            f.engine
+                .due_quota(NOW + RETURN_RETRY, &CodexPolicy::default()),
+            Some(b.clone())
+        );
+    }
+    let mut missing_five = recovery.clone();
+    missing_five.limits[0].primary = None;
+    f.read(&b, missing_five, NOW);
+    assert_eq!(
+        f.engine.automation(NOW, &CodexPolicy::default()),
+        CodexAutomation::Idle
+    );
+    let mut unknown_duration = recovery.clone();
+    unknown_duration.limits[0]
+        .primary
+        .as_mut()
+        .unwrap()
+        .window_duration_mins = None;
+    f.read(&b, unknown_duration, NOW);
+    assert_eq!(
+        f.engine.automation(NOW, &CodexPolicy::default()),
+        CodexAutomation::Idle
+    );
+    let mut unknown_new_date = recovery.clone();
+    unknown_new_date.limits[0]
+        .primary
+        .as_mut()
+        .unwrap()
+        .resets_at = None;
+    unknown_new_date.limits[0]
+        .primary
+        .as_mut()
+        .unwrap()
+        .used_percent = 1;
+    f.read(&b, unknown_new_date.clone(), NOW);
+    assert_eq!(
+        f.engine.automation(NOW, &CodexPolicy::default()),
+        CodexAutomation::Idle
+    );
+    // Explicit zero use with no started window is fresh recovery evidence.
+    unknown_new_date.limits[0]
+        .primary
+        .as_mut()
+        .unwrap()
+        .used_percent = 0;
+    unknown_new_date.limits[0]
+        .secondary
+        .as_mut()
+        .unwrap()
+        .resets_at = None;
+    f.read(&b, unknown_new_date, NOW);
+    assert_eq!(
+        f.engine.automation(NOW, &CodexPolicy::default()),
+        return_to(&f, &b)
+    );
+    let index = f.engine.account_index(&b).unwrap();
+    f.engine.saved.accounts[index].pending_reset_key = Some("fixture-pending-key".into());
+    assert_eq!(
+        f.engine.automation(NOW, &CodexPolicy::default()),
+        CodexAutomation::Idle
+    );
+    f.engine.saved.accounts[index].pending_reset_key = None;
+    f.engine.verified_now.remove(&b);
+    assert_eq!(
+        f.engine.automation(NOW, &CodexPolicy::default()),
+        CodexAutomation::Idle
+    );
+    f.read(&b, recovery, NOW);
+    f.engine.saved.accounts[index].automation.enabled = false;
+    assert_eq!(
+        f.engine.automation(NOW, &CodexPolicy::default()),
+        CodexAutomation::Idle
+    );
+    f.engine.saved.accounts[index].automation.enabled = true;
+    let ai = f.engine.account_index(&a).unwrap();
+    f.engine.saved.accounts[ai].automation.priority = Some(1);
+    assert_eq!(
+        f.engine.automation(NOW, &CodexPolicy::default()),
+        CodexAutomation::Idle
+    );
+    f.engine.saved.accounts[ai].automation.priority = Some(2);
+    assert_eq!(
+        f.engine.automation(NOW, &CodexPolicy::default()),
+        return_to(&f, &b)
+    );
+}
+
+#[tokio::test]
+async fn manual_return_holds_resume_and_failure_cooldowns_survive_restart() {
+    let mut f = Fixture::new();
+    let a = f.id_of("ws-a");
+    let b = f.add("user-b", "ws-b", "saved");
+    preferred(&mut f, &b, None, 1);
+    f.read(
+        &b,
+        main_quota_at(100, NOW - 600, 20, NOW + 86400),
+        NOW - 1800,
+    );
+    f.read(&b, main_quota_at(0, NOW + 18000, 20, NOW + 86400), NOW);
+    f.read(&a, main_quota(20, 20), NOW);
+    f.engine.hold_automatic_returns(NOW, &f.vault).unwrap();
+    reopen(&mut f, NOW);
+    f.read(&a, main_quota(20, 20), NOW);
+    f.read(&b, main_quota_at(0, NOW + 18000, 20, NOW + 86400), NOW);
+    assert_eq!(
+        f.engine
+            .snapshot(false, NOW, &CodexPolicy::default())
+            .return_hold_until,
+        Some(NOW + 900)
+    );
+    assert_eq!(
+        f.engine.automation(NOW + 899, &CodexPolicy::default()),
+        CodexAutomation::Idle
+    );
+    assert_eq!(
+        f.engine.automation(NOW + 900, &CodexPolicy::default()),
+        return_to(&f, &b)
+    );
+    f.engine
+        .command(CodexCommand::ResumeAutomaticReturns, &f.vault, NOW)
+        .await
+        .unwrap();
+    assert_eq!(
+        f.engine
+            .snapshot(false, NOW, &CodexPolicy::default())
+            .return_hold_until,
+        None
+    );
+    assert_eq!(
+        f.engine.automation(NOW, &CodexPolicy::default()),
+        return_to(&f, &b)
+    );
+    f.engine.begin_auto_switch(NOW, &f.vault).unwrap();
+    *f.inventory.0.lock().unwrap() = CodexProcessSummary {
+        daemon_running: true,
+        other_clients: 99,
+        ..CodexProcessSummary::default()
+    };
+    assert_eq!(
+        f.engine.begin_switch(&b, &f.vault, NOW).err(),
+        Some(CodexReason::DaemonRestartFailed)
+    );
+    reopen(&mut f, NOW + 1);
+    f.read(&a, main_quota(20, 20), NOW + 1);
+    f.read(&b, main_quota_at(0, NOW + 18000, 20, NOW + 86400), NOW + 1);
+    assert_eq!(
+        f.engine.automation(NOW + 599, &CodexPolicy::default()),
+        CodexAutomation::Idle
+    );
+    assert_eq!(
+        f.engine.automation(NOW + 600, &CodexPolicy::default()),
+        return_to(&f, &b)
+    );
+    assert_eq!(f.active(), auth("user-a", "ws-a", "initial"));
+    f.claude_untouched();
+}
+
+#[tokio::test]
+async fn failed_or_unidentified_recovery_readings_are_backed_off_and_never_authorize_returns() {
+    let mut f = Fixture::new();
+    let a = f.id_of("ws-a");
+    let b = f.add("user-b", "ws-b", "saved");
+    preferred(&mut f, &b, None, 1);
+    f.read(
+        &b,
+        main_quota_at(100, NOW - 600, 20, NOW + 86400),
+        NOW - 1800,
+    );
+    f.read(&a, main_quota(20, 20), NOW);
+    f.factory
+        .enqueue(Plan::quota(Err(CodexError::ServiceUnavailable)));
+    let report = f.engine.plan_quota(&b, NOW, false).unwrap().run().await;
+    f.engine.finish_quota(report, &f.vault, NOW).unwrap();
+    assert_eq!(
+        f.engine.automation(NOW + 60, &CodexPolicy::default()),
+        CodexAutomation::Idle
+    );
+    assert_ne!(
+        f.engine.due_quota(NOW + 60, &CodexPolicy::default()),
+        Some(b.clone())
+    );
+    reopen(&mut f, NOW + 60);
+    f.read(&a, main_quota(20, 20), NOW + 60);
+    assert_eq!(
+        f.engine.automation(NOW + 60, &CodexPolicy::default()),
+        CodexAutomation::Idle
+    );
+    assert_eq!(
+        f.engine
+            .automation(NOW + ERROR_RETRY, &CodexPolicy::default()),
+        CodexAutomation::Refresh(b.clone())
+    );
+    f.read(
+        &b,
+        main_quota_at(0, NOW + 18000, 20, NOW + 86400),
+        NOW + ERROR_RETRY,
+    );
+    let mut unknown = quota(None, 0, 20);
+    unknown.rate_limits.primary.as_mut().unwrap().resets_at = Some(NOW + 18000);
+    f.factory.enqueue(Plan::quota(Ok(unknown)));
+    let report = f
+        .engine
+        .plan_quota(&b, NOW + ERROR_RETRY + 1, false)
+        .unwrap()
+        .run()
+        .await;
+    f.engine
+        .finish_quota(report, &f.vault, NOW + ERROR_RETRY + 1)
+        .unwrap();
+    assert!(!f.engine.verified_now.contains(&b));
+    assert_eq!(
+        f.engine
+            .automation(NOW + ERROR_RETRY + 1, &CodexPolicy::default()),
+        CodexAutomation::Idle
+    );
+    assert!(f.factory.reset_keys.lock().unwrap().is_empty());
+    f.claude_untouched();
+}
+
+#[tokio::test]
+async fn a_banked_codex_reset_handles_the_natural_return_marker_without_automatic_redemption() {
+    let mut f = Fixture::new();
+    let b = f.add("user-b", "ws-b", "saved");
+    preferred(&mut f, &b, None, 1);
+    allow_fixture_reset(&mut f, &b, "pro");
+    let index = f.engine.account_index(&b).unwrap();
+    f.engine.observe_return_window(index, 100);
+    assert_eq!(
+        f.engine.saved.accounts[index].preferred_return_reset_at,
+        Some(9000)
+    );
+    f.factory.enqueue(Plan::quota(Ok(reset_quota(
+        Some("ws-b"),
+        Some(2),
+        "pro",
+        100,
+    ))));
+    f.factory
+        .resets
+        .lock()
+        .unwrap()
+        .push_back(Ok(ResetOutcome::Reset));
+    f.factory
+        .after_resets
+        .lock()
+        .unwrap()
+        .push_back(Ok(quota(Some("ws-b"), 0, 20)));
+    let report = f.engine.plan_reset(&b, &f.vault, 110).unwrap().run().await;
+    f.engine.finish_quota(report, &f.vault, 120).unwrap();
+    assert_eq!(
+        f.engine.saved.accounts[index].preferred_return_reset_at,
+        None
+    );
+    assert_eq!(
+        f.engine.saved.accounts[index].preferred_return_handled_reset_at,
+        Some(9000)
+    );
+    assert_eq!(f.factory.reset_keys.lock().unwrap().len(), 1);
+    reopen(&mut f, 9100);
+    assert_eq!(
+        f.engine.saved.accounts[index].preferred_return_reset_at,
+        None
+    );
+    f.claude_untouched();
+}
+
+#[tokio::test]
+async fn background_codex_return_reuses_seamless_switch_and_reports_natural_recovery() {
+    let mut f = Fixture::new();
+    let a = f.id_of("ws-a");
+    let b = f.add("user-b", "ws-b", "saved");
+    preferred(&mut f, &b, Some(80.0), 1);
+    f.read(
+        &b,
+        main_quota_at(80, NOW - 600, 20, NOW + 86400),
+        NOW - 1800,
+    );
+    f.read(&a, main_quota(20, 20), NOW);
+    let mut recovery = quota(Some("ws-b"), 0, 20);
+    recovery.rate_limits.primary.as_mut().unwrap().resets_at = None;
+    recovery.rate_limits.secondary.as_mut().unwrap().resets_at = None;
+    f.factory.enqueue(Plan::quota(Ok(recovery.clone())));
+    f.factory.enqueue(Plan::quota(Ok(recovery)));
+    let daemon = f.daemon.clone();
+    let factory = f.factory.clone();
+    let (_temp, handle) = runtime(
+        &mut f,
+        Settings {
+            claude_threshold: Some(50.0),
+            codex_threshold: Some(95.0),
+            ..Settings::default()
+        },
+    )
+    .await;
+    let mut notifications = handle.notifications();
+    handle.codex_tick().await;
+    let notice = notifications.try_recv().unwrap();
+    assert_eq!(notice.title, "Codex switched to user-b@example.invalid");
+    assert!(notice.body.contains("5-hour limit recovered"));
+    assert!(!notice.body.contains("reached its limit"));
+    assert_eq!(handle.get_codex_snapshot().selected_id, Some(b.clone()));
+    assert_eq!(handle.get_codex_snapshot().return_hold_until, None);
+    assert_eq!(*daemon.calls.lock().unwrap(), vec!["state", "restart"]);
+    until(|| {
+        factory
+            .calls()
+            .iter()
+            .filter(|call| *call == "shutdown")
+            .count()
+            == 2
+    })
+    .await;
+    handle.codex_tick().await;
+    assert_eq!(daemon.calls.lock().unwrap().len(), 2);
+    assert!(notifications.try_recv().is_err());
+    assert!(factory.reset_keys.lock().unwrap().is_empty());
+}
+
+fn ready_return(f: &mut Fixture) -> (String, String, CodexAutoSwitch) {
+    let a = f.id_of("ws-a");
+    let b = f.add("user-b", "ws-b", "saved");
+    preferred(f, &b, Some(80.0), 1);
+    f.read(
+        &b,
+        main_quota_at(80, NOW - 600, 20, NOW + 86400),
+        NOW - 1800,
+    );
+    f.read(&a, main_quota(20, 20), NOW);
+    f.read(&b, main_quota_at(0, NOW + 18000, 20, NOW + 86400), NOW);
+    let CodexAutomation::Return(plan) = f.engine.automation(NOW, &CodexPolicy::default()) else {
+        panic!("fixture has a recovered higher-priority account");
+    };
+    (a, b, plan)
+}
+
+#[tokio::test]
+async fn external_owner_selection_persists_a_hold_but_same_owner_rotation_does_not() {
+    let mut f = Fixture::new();
+    let a = f.id_of("ws-a");
+    f.write_active(&auth("user-a", "ws-a", "rotated"));
+    f.engine.observe(&f.vault, NOW).unwrap();
+    assert_eq!(f.engine.selected_id, Some(a));
+    assert_eq!(f.engine.saved.return_hold_until, None);
+    let external = auth("user-c", "ws-c", "external");
+    f.write_active(&external);
+    f.engine.observe(&f.vault, NOW + 1).unwrap();
+    let c = f.id_of("ws-c");
+    assert_eq!(f.engine.selected_id, Some(c.clone()));
+    assert_eq!(f.saved_bytes("ws-c"), external);
+    assert_eq!(f.engine.saved.return_hold_until, Some(NOW + 901));
+    reopen(&mut f, NOW + 2);
+    assert_eq!(f.engine.saved.return_hold_until, Some(NOW + 901));
+    f.engine
+        .command(CodexCommand::ResumeAutomaticReturns, &f.vault, NOW + 3)
+        .await
+        .unwrap();
+    f.write_active(&auth("user-c", "ws-c", "rotated"));
+    f.engine.observe(&f.vault, NOW + 4).unwrap();
+    assert_eq!(f.engine.selected_id, Some(c));
+    assert_eq!(f.engine.saved.return_hold_until, None);
+    assert!(f.factory.calls().is_empty());
+    f.claude_untouched();
+}
+
+#[test]
+fn a_prepared_codex_return_preserves_an_external_login_before_or_during_replacement() {
+    for during_replace in [false, true] {
+        let mut f = Fixture::new();
+        let (_, _, plan) = ready_return(&mut f);
+        let external = auth("user-c", "ws-c", "external");
+        if during_replace {
+            let path = f.home.join("auth.json");
+            let bytes = external.clone();
+            f.engine.before_automatic_replace =
+                Some(Box::new(move || fs::write(path, bytes).unwrap()));
+        } else {
+            f.write_active(&external);
+        }
+        f.engine.begin_auto_switch(NOW, &f.vault).unwrap();
+        assert_eq!(
+            f.engine
+                .begin_automatic_switch(&plan, true, &CodexPolicy::default(), &f.vault, NOW)
+                .err(),
+            Some(CodexReason::ExternalChange)
+        );
+        assert_eq!(f.active(), external);
+        assert_eq!(f.saved_bytes("ws-c"), external);
+        assert_eq!(f.engine.selected_id, Some(f.id_of("ws-c")));
+        assert_eq!(
+            f.engine.saved.return_hold_until,
+            Some(NOW + MANUAL_RETURN_HOLD)
+        );
+        assert!(f.daemon.calls.lock().unwrap().is_empty());
+        reopen(&mut f, NOW + 1);
+        assert_eq!(
+            f.engine.saved.return_hold_until,
+            Some(NOW + MANUAL_RETURN_HOLD)
+        );
+        f.claude_untouched();
+    }
+}
+
+#[tokio::test]
+async fn external_selection_during_return_preflight_and_preference_edits_cancel_the_old_plan() {
+    let mut f = Fixture::new();
+    let (_, b, plan) = ready_return(&mut f);
+    // An inactive quota reader finishes while another client selects account c.
+    let mut recovery = quota(Some("ws-b"), 0, 20);
+    recovery.rate_limits.primary.as_mut().unwrap().resets_at = Some(NOW + 18000);
+    f.factory.enqueue(Plan::quota(Ok(recovery)));
+    let report = f.engine.plan_quota(&b, NOW, false).unwrap().run().await;
+    let external = auth("user-c", "ws-c", "external");
+    f.write_active(&external);
+    f.engine.finish_quota(report, &f.vault, NOW).unwrap();
+    let c = f.id_of("ws-c");
+    f.read(&c, main_quota(20, 20), NOW);
+    assert_eq!(
+        f.engine.automation(NOW, &CodexPolicy::default()),
+        CodexAutomation::Idle
+    );
+    f.engine.begin_auto_switch(NOW, &f.vault).unwrap();
+    assert_eq!(
+        f.engine
+            .begin_automatic_switch(&plan, true, &CodexPolicy::default(), &f.vault, NOW)
+            .err(),
+        Some(CodexReason::ExternalChange)
+    );
+    assert_eq!(f.active(), external);
+    assert!(f.daemon.calls.lock().unwrap().is_empty());
+    // A local preference or manual hold written after planning is revalidated too.
+    let mut f = Fixture::new();
+    let (_, b, plan) = ready_return(&mut f);
+    let index = f.engine.account_index(&b).unwrap();
+    f.engine.saved.accounts[index].automation.enabled = false;
+    f.engine.begin_auto_switch(NOW, &f.vault).unwrap();
+    assert_eq!(
+        f.engine
+            .begin_automatic_switch(&plan, true, &CodexPolicy::default(), &f.vault, NOW)
+            .err(),
+        Some(CodexReason::ExternalChange)
+    );
+    assert_eq!(f.active(), auth("user-a", "ws-a", "initial"));
+    f.engine.saved.accounts[index].automation.enabled = true;
+    f.engine.hold_automatic_returns(NOW, &f.vault).unwrap();
+    assert_eq!(
+        f.engine
+            .begin_automatic_switch(&plan, true, &CodexPolicy::default(), &f.vault, NOW)
+            .err(),
+        Some(CodexReason::ExternalChange)
+    );
+    assert_eq!(f.active(), auth("user-a", "ws-a", "initial"));
+    f.claude_untouched();
 }

@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import type { Settings } from './types';
+import type { AccountAutomation, Settings } from './types';
 import { t } from './i18n';
 
 export interface CommandArgs {
@@ -11,6 +11,8 @@ export interface CommandArgs {
   delete_account: { id: string };
   set_renewal_day: { id: string; day: number | null };
   update_settings: { settings: Settings };
+  update_account_automation: { id: string; automation: AccountAutomation };
+  resume_automatic_returns: undefined;
   import_current: undefined;
   begin_login: undefined;
   finish_login: { id: string; code: string };
@@ -31,6 +33,8 @@ const commands: readonly Command[] = [
   'delete_account',
   'set_renewal_day',
   'update_settings',
+  'update_account_automation',
+  'resume_automatic_returns',
   'import_current',
   'begin_login',
   'finish_login',

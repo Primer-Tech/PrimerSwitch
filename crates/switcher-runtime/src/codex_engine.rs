@@ -6,7 +6,7 @@
 //! daemon per CODEX_HOME that owns the loaded login. A switch preserves the outgoing
 //! login, writes the selected one to auth.json atomically and runs Codex's official
 //! `codex app-server daemon restart`; terminals reconnect and resume their threads.
-use crate::{codex_context::*, codex_views::*};
+use crate::{AccountAutomationView, codex_context::*, codex_views::*};
 use async_trait::async_trait;
 use provider_codex::*;
 use serde::{Deserialize, Serialize};
@@ -20,8 +20,8 @@ use std::{
     },
 };
 use switcher_core::{
-    CandidateOrder, CandidateRank, HEADROOM_MARGIN, ProviderId, Settings, compare_candidates,
-    reset_hour_bucket,
+    AccountAutomation, CandidateOrder, CandidateRank, HEADROOM_MARGIN, ProviderId, Settings,
+    compare_candidates, reset_hour_bucket,
 };
 use switcher_platform::{
     Vault,
@@ -47,6 +47,8 @@ const ERROR_RETRY: i64 = 900;
 /// A rejected sign-in is retried rarely; a new sign-in or a manual refresh clears it.
 const SIGN_IN_RETRY: i64 = 6 * 3600;
 const FRESH_SECONDS: i64 = 900;
+const RETURN_RETRY: i64 = 120;
+const MANUAL_RETURN_HOLD: i64 = 900;
 /// Leave a nearly expired active token to Codex's own refresh in the background.
 const ACTIVE_EXPIRY_MARGIN: i64 = 600;
 /// At most one automatic switch attempt per ten minutes.
@@ -69,7 +71,7 @@ impl From<&Settings> for CodexPolicy {
     fn from(settings: &Settings) -> Self {
         Self {
             auto_switch: settings.auto_switch_enabled,
-            threshold: settings.threshold,
+            threshold: settings.threshold_for(ProviderId::Codex),
             poll_interval: i64::try_from(settings.poll_interval).unwrap_or(i64::MAX),
             order: settings.candidate_order(),
         }
@@ -87,6 +89,8 @@ pub(crate) enum CodexAutomation {
     /// The best target was not read recently: read it, then decide again.
     Refresh(String),
     Switch(CodexAutoSwitch),
+    /// A preferred account's observed spent five-hour window naturally recovered.
+    Return(CodexAutoSwitch),
     /// The active account needs replacing, but every other account is at its limit.
     Exhausted {
         /// The account whose blocking windows reopen first, and when.
@@ -95,6 +99,7 @@ pub(crate) enum CodexAutomation {
 }
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CodexAutoSwitch {
+    pub previous_id: String,
     pub target_id: String,
     pub target_name: String,
     pub previous_name: String,
@@ -167,6 +172,7 @@ fn usable_rank(account: &SavedAccount, threshold: f64) -> Option<CandidateRank<'
     let margin = threshold - HEADROOM_MARGIN;
     Some(CandidateRank {
         id: &account.id,
+        priority: account.automation.priority,
         headroom: windows
             .iter()
             .flatten()
@@ -224,6 +230,12 @@ struct SavedAccount {
     pending_reset_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_reset_outcome: Option<ResetOutcome>,
+    #[serde(default, skip_serializing_if = "AccountAutomation::is_default")]
+    automation: AccountAutomation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    preferred_return_reset_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    preferred_return_handled_reset_at: Option<i64>,
 }
 impl Drop for SavedAccount {
     fn drop(&mut self) {
@@ -284,12 +296,18 @@ impl Binding {
 struct Saved {
     format: u32,
     accounts: Vec<SavedAccount>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    return_hold_until: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_auto_switch_at: Option<i64>,
 }
 impl Default for Saved {
     fn default() -> Self {
         Self {
             format: 1,
             accounts: Vec::new(),
+            return_hold_until: None,
+            last_auto_switch_at: None,
         }
     }
 }
@@ -610,6 +628,8 @@ pub(crate) enum CodexCommand {
     ImportCurrent,
     ImportSwitcher,
     Delete(String),
+    UpdateAccountAutomation(String, AccountAutomationView),
+    ResumeAutomaticReturns,
     Observe,
 }
 pub(crate) enum CodexOutput {
@@ -643,11 +663,14 @@ pub(crate) struct CodexEngine {
     environment: CodexEnvironmentView,
     switcher_available: bool,
     discovered_at: Option<i64>,
-    /// Automation state, kept in memory only: the last automatic switch attempt, the
-    /// last every-account-limited notice and the last failure notice.
-    last_auto_switch_at: Option<i64>,
+    /// Session-only notice throttling; cooldowns and manual holds are durable.
     last_exhausted_notice_at: Option<i64>,
     last_auto_failure: Option<(String, CodexReason, i64)>,
+    /// Current provider default supplied by the serialized runtime owner. The
+    /// authoritative value lives only in shared Settings, not this Codex record.
+    policy_threshold: f64,
+    #[cfg(test)]
+    before_automatic_replace: Option<Box<dyn FnOnce() + Send>>,
 }
 impl CodexEngine {
     pub fn load(vault: &Vault) -> Self {
@@ -699,9 +722,11 @@ impl CodexEngine {
             environment: CodexEnvironmentView::default(),
             switcher_available: false,
             discovered_at: None,
-            last_auto_switch_at: None,
             last_exhausted_notice_at: None,
             last_auto_failure: None,
+            policy_threshold: CodexPolicy::default().threshold,
+            #[cfg(test)]
+            before_automatic_replace: None,
         }
     }
     /// Discover once at startup, and retry a failed discovery every `retry` seconds.
@@ -764,6 +789,9 @@ impl CodexEngine {
                 auth_failures: 0,
                 pending_reset_key: None,
                 last_reset_outcome: None,
+                automation: AccountAutomation::default(),
+                preferred_return_reset_at: None,
+                preferred_return_handled_reset_at: None,
             });
             engine.verified_now.insert(id);
         }
@@ -779,6 +807,14 @@ impl CodexEngine {
         *self = Self::empty(false);
         self.writable = false;
         self.reason = Some(CodexReason::VaultUnavailable);
+    }
+    pub(crate) fn set_policy(&mut self, policy: &CodexPolicy, now: i64) {
+        self.policy_threshold = policy.threshold;
+        // A lower provider default can trigger a switch from an already fresh
+        // observation, before the next reader. Arm that same observed window.
+        for index in 0..self.saved.accounts.len() {
+            self.observe_return_window(index, now);
+        }
     }
     fn save(&self, vault: &Vault) -> Result<(), CodexReason> {
         if !self.writable {
@@ -893,9 +929,16 @@ impl CodexEngine {
             .accounts
             .iter()
             .filter(move |a| {
-                !self.account_errors.contains_key(&a.id) && self.switch_capability(a).enabled
+                a.automation.enabled
+                    && !self.account_errors.contains_key(&a.id)
+                    && self.switch_capability(a).enabled
             })
-            .filter_map(move |a| Some((a, usable_rank(a, threshold)?)))
+            .filter_map(move |a| {
+                Some((
+                    a,
+                    usable_rank(a, a.automation.effective_threshold(threshold))?,
+                ))
+            })
     }
     /// The account automatic switching uses next, by the order shared with Claude:
     /// preferred headroom, then `policy.order`, then the lower 5-hour usage, then id.
@@ -917,8 +960,9 @@ impl CodexEngine {
     /// target reading is refreshed first. Without any target nothing switches.
     pub(crate) fn automation(&self, now: i64, policy: &CodexPolicy) -> CodexAutomation {
         let cooling = self
+            .saved
             .last_auto_switch_at
-            .is_some_and(|at| now >= at && now - at < AUTO_SWITCH_COOLDOWN);
+            .is_some_and(|at| now < at || now.saturating_sub(at) < AUTO_SWITCH_COOLDOWN);
         if !policy.auto_switch
             || cooling
             || self.common_block().is_some()
@@ -933,16 +977,14 @@ impl CodexEngine {
         else {
             return CodexAutomation::Idle;
         };
-        let Some(quota) = active
-            .quota
-            .as_ref()
-            .filter(|q| reaches(q, policy.threshold))
-        else {
-            return CodexAutomation::Idle;
+        let threshold = active.automation.effective_threshold(policy.threshold);
+        let Some(quota) = active.quota.as_ref().filter(|q| reaches(q, threshold)) else {
+            return self.automatic_return(active, now, policy);
         };
         match self.next_candidate(policy) {
             Some(target) if self.quota_state(target, now) == CodexQuotaState::Fresh => {
                 CodexAutomation::Switch(CodexAutoSwitch {
+                    previous_id: active.id.clone(),
                     target_id: target.id.clone(),
                     target_name: target.name.clone(),
                     previous_name: active.name.clone(),
@@ -955,12 +997,111 @@ impl CodexEngine {
                     .saved
                     .accounts
                     .iter()
-                    .filter_map(|a| Some((frees_at(a.quota.as_ref()?, policy.threshold)?, a)))
+                    .filter(|a| a.automation.enabled)
+                    .filter_map(|a| {
+                        Some((
+                            frees_at(
+                                a.quota.as_ref()?,
+                                a.automation.effective_threshold(policy.threshold),
+                            )?,
+                            a,
+                        ))
+                    })
                     .min_by_key(|(at, _)| *at)
                     .map(|(at, a)| (a.name.clone(), at)),
             },
             None => CodexAutomation::Idle,
         }
+    }
+    /// Returning is opt-in, only to an explicitly higher priority, and requires an
+    /// observed natural reset plus a fresh backend-identified recovery reading.
+    fn automatic_return(
+        &self,
+        active: &SavedAccount,
+        now: i64,
+        policy: &CodexPolicy,
+    ) -> CodexAutomation {
+        if self
+            .saved
+            .return_hold_until
+            .is_some_and(|until| until > now)
+        {
+            return CodexAutomation::Idle;
+        }
+        let mut targets: Vec<_> = self
+            .saved
+            .accounts
+            .iter()
+            .filter(|a| {
+                a.automation.enabled
+                    && a.automation.return_on_five_hour_reset
+                    && a.automation.is_higher_priority_than(&active.automation)
+                    && self.switch_capability(a).enabled
+                    && a.pending_reset_key.is_none()
+                    && a.preferred_return_reset_at.is_some_and(|reset| {
+                        reset <= now
+                            && a.preferred_return_handled_reset_at
+                                .is_none_or(|handled| handled < reset)
+                    })
+            })
+            .collect();
+        targets.sort_by(|a, b| {
+            a.automation
+                .priority
+                .cmp(&b.automation.priority)
+                .then_with(|| {
+                    match (
+                        usable_rank(a, a.automation.effective_threshold(policy.threshold)),
+                        usable_rank(b, b.automation.effective_threshold(policy.threshold)),
+                    ) {
+                        (Some(a), Some(b)) => compare_candidates(&a, &b, policy.order),
+                        _ => a.id.cmp(&b.id),
+                    }
+                })
+        });
+        for target in targets {
+            let reset = target.preferred_return_reset_at.unwrap();
+            let read_after_reset = target.quota_read_at.is_some_and(|read| read >= reset);
+            let recovered = natural_five_hour_recovery(target, reset, now);
+            let headroom = usable_rank(
+                target,
+                target.automation.effective_threshold(policy.threshold),
+            )
+            .is_some_and(|rank| rank.headroom);
+            // A known post-reset weekly limit, a missing window or a missing date
+            // waits for ordinary/reset scheduling, never a tight recovery loop.
+            if read_after_reset && !(recovered && headroom) {
+                continue;
+            }
+            if read_after_reset && self.quota_state(target, now) == CodexQuotaState::Fresh {
+                return CodexAutomation::Return(CodexAutoSwitch {
+                    previous_id: active.id.clone(),
+                    target_id: target.id.clone(),
+                    target_name: target.name.clone(),
+                    previous_name: active.name.clone(),
+                    peak: None,
+                });
+            }
+            if self.recovery_read_due(target, now) {
+                return CodexAutomation::Refresh(target.id.clone());
+            }
+        }
+        CodexAutomation::Idle
+    }
+    fn recovery_read_due(&self, account: &SavedAccount, now: i64) -> bool {
+        let failed = self.account_errors.contains_key(&account.id)
+            || account
+                .last_attempt_at
+                .is_some_and(|attempt| account.quota_read_at.is_none_or(|read| attempt > read));
+        let floor = if failed { ERROR_RETRY } else { RETURN_RETRY };
+        account
+            .last_attempt_at
+            .is_none_or(|at| now >= at && now.saturating_sub(at) >= floor)
+    }
+    pub(crate) fn selected_threshold(&self, policy: &CodexPolicy) -> f64 {
+        self.selected().map_or(policy.threshold, |a| {
+            a.automation.effective_threshold(policy.threshold)
+        })
     }
     /// Every other saved ChatGPT account has a successful reading that rules it out;
     /// an unread, failed or signed-out account leaves "all limited" unproven.
@@ -971,16 +1112,36 @@ impl CodexEngine {
             .filter(|a| {
                 self.selected_id.as_deref() != Some(&a.id)
                     && a.auth_kind == AuthKind::ManagedChatgpt
+                    && a.automation.enabled
             })
             .all(|a| {
                 !a.needs_sign_in
                     && !self.account_errors.contains_key(&a.id)
-                    && a.quota.as_ref().is_some_and(|q| reaches(q, threshold))
+                    && a.quota
+                        .as_ref()
+                        .is_some_and(|q| reaches(q, a.automation.effective_threshold(threshold)))
             })
     }
     /// An automatic switch is starting: the cooldown runs whatever its outcome.
-    pub(crate) fn begin_auto_switch(&mut self, now: i64) {
-        self.last_auto_switch_at = Some(now);
+    pub(crate) fn begin_auto_switch(&mut self, now: i64, vault: &Vault) -> Result<(), CodexReason> {
+        self.saved.last_auto_switch_at = Some(now);
+        self.save_automation(vault)
+    }
+    pub(crate) fn hold_automatic_returns(
+        &mut self,
+        now: i64,
+        vault: &Vault,
+    ) -> Result<(), CodexReason> {
+        self.saved.return_hold_until = Some(now.saturating_add(MANUAL_RETURN_HOLD));
+        self.save_automation(vault)
+    }
+    fn save_automation(&mut self, vault: &Vault) -> Result<(), CodexReason> {
+        if let Err(error) = self.save(vault) {
+            self.writable = false;
+            self.reason = Some(error);
+            return Err(error);
+        }
+        Ok(())
     }
     /// Whether to send the every-account-limited notice now (and record it).
     pub(crate) fn exhausted_notice_due(&mut self, now: i64) -> bool {
@@ -1029,6 +1190,7 @@ impl CodexEngine {
             .collect();
         result.switching = self.switching.clone();
         result.last_switch = self.last_switch.clone();
+        result.return_hold_until = self.saved.return_hold_until.filter(|until| *until > now);
         result.environment = self.environment.clone();
         if self.demo {
             result.executable_version = Some(MIN_CODEX_VERSION.into());
@@ -1101,6 +1263,14 @@ impl CodexEngine {
                     quota_state: self.quota_state(account, now),
                     error: self.account_errors.get(&account.id).copied(),
                     needs_sign_in: account.needs_sign_in,
+                    automation: (&account.automation).into(),
+                    effective_threshold: account.automation.effective_threshold(policy.threshold),
+                    exhausted: account.quota.as_ref().is_some_and(|q| {
+                        reaches(q, account.automation.effective_threshold(policy.threshold))
+                    }),
+                    frees_at: account.quota.as_ref().and_then(|q| {
+                        frees_at(q, account.automation.effective_threshold(policy.threshold))
+                    }),
                     reset: CodexResetView {
                         pending: account.pending_reset_key.is_some(),
                         last_outcome: account.last_reset_outcome,
@@ -1187,6 +1357,23 @@ impl CodexEngine {
                 self.saved.accounts.remove(index);
                 self.verified_now.remove(&id);
                 self.account_errors.remove(&id);
+                self.save(vault)?;
+            }
+            CodexCommand::UpdateAccountAutomation(id, view) => {
+                if self.pending_login.is_some() || self.switching.is_some() {
+                    return Err(CodexReason::Busy);
+                }
+                let automation = AccountAutomation::from(view);
+                automation
+                    .validate()
+                    .map_err(|_| CodexReason::InvalidAutomation)?;
+                let index = self.account_index(&id)?;
+                self.saved.accounts[index].automation = automation;
+                self.observe_return_window(index, now);
+                self.save(vault)?;
+            }
+            CodexCommand::ResumeAutomaticReturns => {
+                self.saved.return_hold_until = None;
                 self.save(vault)?;
             }
             CodexCommand::Observe => {
@@ -1292,26 +1479,52 @@ impl CodexEngine {
         if self.observed_generation.as_ref() == Some(&current.generation) {
             return Ok(());
         }
+        let previous = self.selected_id.clone();
+        let observed_before = self.observed_generation.is_some();
         let Some(bytes) = current.auth_bytes() else {
             self.selected_id = None;
             self.observed_generation = Some(current.generation);
+            if self.note_external_selection(previous.as_deref(), observed_before, now) {
+                self.save_automation(vault)?;
+            }
             return Ok(());
         };
         match OpaqueAuth::inspect(bytes) {
             Ok(inspection) if inspection.hybrid => {
                 self.repair_hybrid(bytes, &current, &store, vault, now)?;
+                if self.note_external_selection(previous.as_deref(), observed_before, now) {
+                    self.save_automation(vault)?;
+                }
                 return Ok(());
             }
             Ok(inspection) if inspection.kind != AuthKind::Unsupported => {
                 let auth = OpaqueAuth::parse(bytes.to_vec()).map_err(provider_reason)?;
                 let index = self.adopt_or_import(auth, CodexIdentityEvidence::ClaimsOnly, now)?;
                 self.selected_id = Some(self.saved.accounts[index].id.clone());
+                self.note_external_selection(previous.as_deref(), observed_before, now);
                 self.save(vault)?;
             }
-            _ => self.selected_id = None,
+            _ => {
+                self.selected_id = None;
+                if self.note_external_selection(previous.as_deref(), observed_before, now) {
+                    self.save_automation(vault)?;
+                }
+            }
         }
         self.observed_generation = Some(current.generation);
         Ok(())
+    }
+    fn note_external_selection(
+        &mut self,
+        previous: Option<&str>,
+        observed: bool,
+        now: i64,
+    ) -> bool {
+        if observed && previous != self.selected_id.as_deref() {
+            self.saved.return_hold_until = Some(now.saturating_add(MANUAL_RETURN_HOLD));
+            return true;
+        }
+        false
     }
     /// Save `auth` into the matching account (a rotation of the same login) or add it
     /// as a new account. Never drops a login PrimerSwitch has not seen before.
@@ -1369,6 +1582,9 @@ impl CodexEngine {
             auth_failures: 0,
             pending_reset_key: None,
             last_reset_outcome: None,
+            automation: AccountAutomation::default(),
+            preferred_return_reset_at: None,
+            preferred_return_handled_reset_at: None,
         });
         Ok(self.saved.accounts.len() - 1)
     }
@@ -1747,10 +1963,14 @@ impl CodexEngine {
     /// interval, or every minute while its latest reading is within `NEAR_LIMIT_BAND`
     /// points of the threshold (or limited) and automatic switching is on.
     pub(crate) fn active_interval(&self, policy: &CodexPolicy) -> i64 {
-        let near = self
-            .selected()
-            .and_then(|a| a.quota.as_ref())
-            .is_some_and(|q| reaches(q, policy.threshold - NEAR_LIMIT_BAND));
+        let near = self.selected().is_some_and(|a| {
+            a.quota.as_ref().is_some_and(|q| {
+                reaches(
+                    q,
+                    a.automation.effective_threshold(policy.threshold) - NEAR_LIMIT_BAND,
+                )
+            })
+        });
         if policy.auto_switch && near {
             ACTIVE_NEAR_LIMIT_INTERVAL
         } else {
@@ -1772,6 +1992,38 @@ impl CodexEngine {
                 && a.last_attempt_at
                     .is_none_or(|t| now < t || now - t >= ERROR_RETRY.min(interval))
         };
+        // A preferred reset gets a revalidation around its known reset time before
+        // an ordinary active reading. Failed recovery reads retain their backoff.
+        if policy.auto_switch
+            && self.pending_login.is_none()
+            && self
+                .saved
+                .last_auto_switch_at
+                .is_none_or(|at| now >= at && now.saturating_sub(at) >= AUTO_SWITCH_COOLDOWN)
+            && self
+                .saved
+                .return_hold_until
+                .is_none_or(|until| until <= now)
+            && let Some(active) = self.selected()
+            && let Some(target) = self
+                .saved
+                .accounts
+                .iter()
+                .filter(|a| {
+                    a.automation.enabled
+                        && a.automation.return_on_five_hour_reset
+                        && a.automation.is_higher_priority_than(&active.automation)
+                        && self.switch_capability(a).enabled
+                        && a.pending_reset_key.is_none()
+                        && a.preferred_return_reset_at.is_some_and(|reset| {
+                            reset <= now && a.quota_read_at.is_none_or(|read| read < reset)
+                        })
+                        && self.recovery_read_due(a, now)
+                })
+                .min_by_key(|a| (a.automation.priority, &a.id))
+        {
+            return Some(target.id.clone());
+        }
         if let Some(active) = self.selected().filter(eligible)
             && active
                 .quota_read_at
@@ -1865,6 +2117,27 @@ impl CodexEngine {
             target,
         })
     }
+    /// Preparation can fail before a reader exists (for example after policy
+    /// changes). Persist its retry floor too, so a due return never retries every
+    /// tick or immediately after restart.
+    pub(crate) fn record_quota_preparation_failure(
+        &mut self,
+        id: &str,
+        reason: CodexReason,
+        vault: &Vault,
+        now: i64,
+    ) -> Result<(), CodexReason> {
+        if matches!(reason, CodexReason::Busy | CodexReason::SwitchInProgress) {
+            return Ok(());
+        }
+        if let Ok(index) = self.account_index(id) {
+            self.saved.accounts[index].last_attempt_at = Some(now);
+            self.account_errors.insert(id.into(), reason);
+            self.verified_now.remove(id);
+            self.save_automation(vault)?;
+        }
+        Ok(())
+    }
     pub(crate) fn finish_quota(
         &mut self,
         report: QuotaReport,
@@ -1903,6 +2176,7 @@ impl CodexEngine {
                     if matches!(outcome, ResetOutcome::Reset | ResetOutcome::AlreadyRedeemed) {
                         account.quota = None;
                         account.quota_read_at = None;
+                        handle_return_marker(account);
                     }
                 }
                 Err(error) => {
@@ -1938,6 +2212,13 @@ impl CodexEngine {
                         self.verified_now.insert(id.clone());
                     }
                     self.account_errors.remove(&id);
+                    if proven {
+                        self.observe_return_window(index, now);
+                    } else {
+                        // An unlabelled successful reply cannot reuse older identity
+                        // evidence to authorize a preferred return.
+                        self.verified_now.remove(&id);
+                    }
                 }
                 Err(error) => {
                     self.account_errors.insert(id, error);
@@ -1989,6 +2270,54 @@ impl CodexEngine {
         vault: &Vault,
         now: i64,
     ) -> Result<Option<SwitchJob>, CodexReason> {
+        self.begin_switch_guarded(id, vault, now, None)
+    }
+    pub(crate) fn begin_automatic_switch(
+        &mut self,
+        plan: &CodexAutoSwitch,
+        returning: bool,
+        policy: &CodexPolicy,
+        vault: &Vault,
+        now: i64,
+    ) -> Result<Option<SwitchJob>, CodexReason> {
+        self.begin_switch_guarded(&plan.target_id, vault, now, Some((plan, returning, policy)))
+    }
+    fn automatic_target_still_eligible(
+        &self,
+        plan: &CodexAutoSwitch,
+        returning: bool,
+        policy: &CodexPolicy,
+        now: i64,
+    ) -> bool {
+        let Some(active) = self.selected().filter(|a| {
+            a.id == plan.previous_id && self.quota_state(a, now) == CodexQuotaState::Fresh
+        }) else {
+            return false;
+        };
+        if !policy.auto_switch {
+            return false;
+        }
+        if returning {
+            matches!(self.automatic_return(active, now, policy), CodexAutomation::Return(current) if current.target_id == plan.target_id)
+        } else {
+            active.quota.as_ref().is_some_and(|quota| {
+                reaches(
+                    quota,
+                    active.automation.effective_threshold(policy.threshold),
+                )
+            }) && self.next_candidate(policy).is_some_and(|target| {
+                target.id == plan.target_id
+                    && self.quota_state(target, now) == CodexQuotaState::Fresh
+            })
+        }
+    }
+    fn begin_switch_guarded(
+        &mut self,
+        id: &str,
+        vault: &Vault,
+        now: i64,
+        automatic: Option<(&CodexAutoSwitch, bool, &CodexPolicy)>,
+    ) -> Result<Option<SwitchJob>, CodexReason> {
         self.ready()?;
         if self.switching.is_some() {
             return Err(CodexReason::SwitchInProgress);
@@ -1997,6 +2326,12 @@ impl CodexEngine {
             return Err(CodexReason::Busy);
         }
         self.requalify()?;
+        if let Some((plan, returning, policy)) = automatic {
+            self.observe(vault, now)?;
+            if !self.automatic_target_still_eligible(plan, returning, policy, now) {
+                return Err(CodexReason::ExternalChange);
+            }
+        }
         let index = self.account_index(id)?;
         if self.selected_id.as_deref() == Some(id) {
             return Ok(None);
@@ -2027,16 +2362,51 @@ impl CodexEngine {
             self.requalify()?;
         }
         let store = self.store()?;
+        let expected_owner = if automatic.is_some() {
+            Some(
+                self.selected()
+                    .ok_or(CodexReason::ExternalChange)?
+                    .binding
+                    .clone(),
+            )
+        } else {
+            None
+        };
         let mut attempts = 0;
         let written = loop {
             attempts += 1;
             let current = store.read().map_err(store_reason)?;
+            if let Some(expected) = &expected_owner {
+                let same_owner = current.auth_bytes().is_some_and(|bytes| {
+                    OpaqueAuth::parse(bytes.to_vec()).is_ok_and(|auth| {
+                        Binding::from_auth(&auth).is_ok_and(|owner| owner.same_owner(expected))
+                    })
+                });
+                if !same_owner {
+                    // Follow and preserve the external selection before returning;
+                    // it must never become the outgoing login of this auto plan.
+                    self.observe(vault, now)?;
+                    self.hold_automatic_returns(now, vault)?;
+                    return Err(CodexReason::ExternalChange);
+                }
+                if let Some((plan, returning, policy)) = automatic
+                    && !self.automatic_target_still_eligible(plan, returning, policy, now)
+                {
+                    return Err(CodexReason::ExternalChange);
+                }
+            }
             if let Some(bytes) = current.auth_bytes() {
                 self.preserve_outgoing(bytes, now)?;
             }
             self.save(vault)?;
             let incoming =
                 Zeroizing::new(self.saved.accounts[self.account_index(id)?].auth.clone());
+            #[cfg(test)]
+            if automatic.is_some()
+                && let Some(writer) = self.before_automatic_replace.take()
+            {
+                writer();
+            }
             match store.replace(&incoming, &current.generation, vault) {
                 Ok(snapshot) => break snapshot,
                 // Codex refreshed the outgoing token meanwhile: keep it and try again.
@@ -2136,9 +2506,11 @@ impl CodexEngine {
                     if let Some(bytes) = current.auth_bytes()
                         && let Ok(auth) = OpaqueAuth::parse(bytes.to_vec())
                     {
+                        let previous = self.selected_id.clone();
                         let index =
                             self.adopt_or_import(auth, CodexIdentityEvidence::ClaimsOnly, now)?;
                         self.selected_id = Some(self.saved.accounts[index].id.clone());
+                        self.note_external_selection(previous.as_deref(), true, now);
                     }
                     self.observed_generation = Some(current.generation);
                 }
@@ -2164,12 +2536,50 @@ impl CodexEngine {
                 .then_some(CodexReason::DaemonRestartFailed),
         });
         self.switching = None;
+        if let Ok(index) = self.account_index(&job.target_id) {
+            self.observe_return_window(index, now);
+        }
         self.save(vault)?;
+        if self.selected_id.as_deref() != Some(&job.target_id) {
+            return Err(CodexReason::ExternalChange);
+        }
         Ok(false)
     }
     /// A switch whose locked first half succeeded must never stay "in progress".
     pub(crate) fn abort_switch(&mut self) {
         self.switching = None;
+    }
+    fn observe_return_window(&mut self, index: usize, now: i64) {
+        let active = self.selected_id.as_deref() == Some(&self.saved.accounts[index].id);
+        let verified = self.verified_now.contains(&self.saved.accounts[index].id);
+        let account = &mut self.saved.accounts[index];
+        if !verified || !account.automation.return_on_five_hour_reset {
+            return;
+        }
+        if active
+            && let Some(reset) = account.preferred_return_reset_at
+            && natural_five_hour_recovery(account, reset, now)
+        {
+            handle_return_marker(account);
+        }
+        if let (Some(quota), Some(read)) = (&account.quota, account.quota_read_at)
+            && let Some(reset) = main_windows(quota)
+                .filter(|w| {
+                    w.window_duration_mins == Some(300)
+                        && f64::from(w.used_percent)
+                            >= account
+                                .automation
+                                .effective_threshold(self.policy_threshold)
+                })
+                .filter_map(|w| w.resets_at)
+                .filter(|reset| *reset > read)
+                .max()
+            && account
+                .preferred_return_handled_reset_at
+                .is_none_or(|handled| handled < reset)
+        {
+            account.preferred_return_reset_at = Some(reset);
+        }
     }
 
     #[cfg(test)]
@@ -2185,6 +2595,31 @@ impl CodexEngine {
         self.processes = processes;
         self.switcher = switcher;
         self
+    }
+}
+fn natural_five_hour_recovery(account: &SavedAccount, reset: i64, now: i64) -> bool {
+    reset <= now
+        && account
+            .quota_read_at
+            .is_some_and(|read| read >= reset && read <= now)
+        && account.quota.as_ref().is_some_and(|quota| {
+            main_windows(quota).any(|window| {
+                window.window_duration_mins == Some(300)
+                    && window.used_percent < 100
+                    && match window.resets_at {
+                        Some(next) => next > now && next > reset,
+                        None => window.used_percent == 0,
+                    }
+            })
+        })
+}
+fn handle_return_marker(account: &mut SavedAccount) {
+    if let Some(reset) = account.preferred_return_reset_at.take() {
+        account.preferred_return_handled_reset_at = Some(
+            account
+                .preferred_return_handled_reset_at
+                .map_or(reset, |handled| handled.max(reset)),
+        );
     }
 }
 fn reset_passed(account: &SavedAccount, now: i64) -> bool {
@@ -2211,6 +2646,8 @@ fn wipe_json(value: &mut serde_json::Value) {
 fn sanitize(saved: Saved) -> (Saved, Saved) {
     let mut good = Saved::default();
     let mut bad = Saved::default();
+    good.return_hold_until = saved.return_hold_until;
+    good.last_auto_switch_at = saved.last_auto_switch_at;
     let mut ids = BTreeSet::new();
     for mut account in saved.accounts.into_iter() {
         let auth = OpaqueAuth::parse(account.auth.clone()).ok();
@@ -2218,6 +2655,7 @@ fn sanitize(saved: Saved) -> (Saved, Saved) {
             && account.id.len() <= 256
             && safe_text(&account.name).is_some()
             && !ids.contains(&account.id)
+            && account.automation.validate().is_ok()
             && auth
                 .as_ref()
                 .is_some_and(|auth| account.set_auth(auth).is_ok());

@@ -68,3 +68,9 @@ for qualification scope.
 ## Manual Codex resets 0.2.3 local update
 
 Install the locally built 0.2.3 Windows installer over 0.2.2 in the existing directory under the same user. It retains the application identity, existing vault/master key, Claude state and settings. New Codex request/outcome fields are optional; existing format-1 records remain compatible. This local build adds explicit manual reset controls and full reset-availability readings for personal and workspace accounts. It is separate from the published 0.2.2 release. Local validation and installation preservation are recorded in [PROGRESS.md](PROGRESS.md).
+
+## Account automation 0.2.4 update
+
+Install 0.2.4 over the existing Windows installation under the same user and keep the same folder. The application identity, encrypted accounts and master key are retained. Missing provider defaults inherit the old switch threshold; saving Settings establishes independent Claude and Codex defaults. New account preferences inherit the provider threshold, include the account in automatic switching, have no explicit priority, and leave preferred-account return off. Optional preference and return-ledger fields are omitted while unused, preserving historical record shapes. Existing priming and reset-credit settings retain their values.
+
+After upgrading, use the same Automation controls in each provider's account details to customize thresholds, exclude manual-only accounts, set priority, and enable return after a natural five-hour reset. Manual selection pauses returns for 15 minutes, with a visible resume control. Validation and the local installation's opaque file-preservation evidence are recorded in [PROGRESS.md](PROGRESS.md).

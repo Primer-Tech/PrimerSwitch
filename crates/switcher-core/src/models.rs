@@ -11,6 +11,51 @@ pub enum ProviderId {
     Codex,
 }
 
+/// Provider-independent automatic destination and natural recovery preferences.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct AccountAutomation {
+    pub enabled: bool,
+    pub threshold: Option<f64>,
+    pub priority: Option<u16>,
+    pub return_on_five_hour_reset: bool,
+}
+impl Default for AccountAutomation {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            threshold: None,
+            priority: None,
+            return_on_five_hour_reset: false,
+        }
+    }
+}
+impl AccountAutomation {
+    pub fn validate(&self) -> Result<(), crate::CoreError> {
+        if self.threshold.is_some_and(|n| !valid_threshold(n))
+            || self.priority.is_some_and(|n| !(1..=99).contains(&n))
+        {
+            return Err(crate::CoreError::InvalidSettings);
+        }
+        Ok(())
+    }
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+    pub fn effective_threshold(&self, default: f64) -> f64 {
+        self.threshold.unwrap_or(default)
+    }
+    /// Only explicit priorities authorize returning to another account. Equal or
+    /// unranked accounts cannot bounce between each other after recovery.
+    pub fn is_higher_priority_than(&self, other: &Self) -> bool {
+        self.priority
+            .is_some_and(|rank| other.priority.is_none_or(|current| rank < current))
+    }
+}
+fn valid_threshold(value: f64) -> bool {
+    value.is_finite() && (50.0..=100.0).contains(&value)
+}
+
 /// API timestamps are seconds; CLI credential expiry is read separately in milliseconds.
 pub fn parse_timestamp(value: &Value) -> Option<i64> {
     match value {
@@ -43,6 +88,12 @@ pub struct StoredAccount {
     pub provider: ProviderId,
     pub name: String,
     pub saved_at: i64,
+    #[serde(skip_serializing_if = "AccountAutomation::is_default")]
+    pub automation: AccountAutomation,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preferred_return_reset_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preferred_return_handled_reset_at: Option<i64>,
     pub oauth_account: Value,
     pub credentials: Value,
     pub refresh_fail_at: Option<i64>,
@@ -411,6 +462,10 @@ fn required_timestamp<'de, D: Deserializer<'de>>(d: D) -> Result<i64, D::Error> 
 pub struct Settings {
     pub poll_interval: u64,
     pub threshold: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claude_threshold: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codex_threshold: Option<f64>,
     pub auto_switch_enabled: bool,
     pub auto_start_window_enabled: bool,
     pub auto_use_resets_enabled: bool,
@@ -433,6 +488,8 @@ impl Default for Settings {
         Self {
             poll_interval: 300,
             threshold: 95.0,
+            claude_threshold: None,
+            codex_threshold: None,
             auto_switch_enabled: true,
             auto_start_window_enabled: true,
             auto_use_resets_enabled: true,
@@ -443,6 +500,13 @@ impl Default for Settings {
     }
 }
 impl Settings {
+    pub fn threshold_for(&self, provider: ProviderId) -> f64 {
+        match provider {
+            ProviderId::Claude => self.claude_threshold,
+            ProviderId::Codex => self.codex_threshold,
+        }
+        .unwrap_or(self.threshold)
+    }
     /// The candidate order selected by `prefer_soonest_weekly_reset`.
     pub fn candidate_order(&self) -> crate::CandidateOrder {
         crate::CandidateOrder::from_preference(self.prefer_soonest_weekly_reset)
@@ -450,8 +514,9 @@ impl Settings {
     pub fn validate(&self) -> Result<(), crate::CoreError> {
         if !(120..=900).contains(&self.poll_interval)
             || !self.poll_interval.is_multiple_of(30)
-            || !self.threshold.is_finite()
-            || !(50.0..=100.0).contains(&self.threshold)
+            || !valid_threshold(self.threshold)
+            || self.claude_threshold.is_some_and(|n| !valid_threshold(n))
+            || self.codex_threshold.is_some_and(|n| !valid_threshold(n))
             || !matches!(self.appearance.as_str(), "system" | "light" | "dark")
             || !matches!(self.language.as_str(), "en" | "ro")
         {

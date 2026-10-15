@@ -22,6 +22,9 @@ The [Codex 0.160.0 adapter](docs/migration/CODEX_USAGE.md) supports isolated man
 - Automatic switching, 5-hour and weekly window priming, reset-credit handling and notifications.
 - Encrypted account vault: DPAPI on Windows, an application-owned Keychain key on macOS, and encrypted Secret Service sessions on Linux.
 - Appearance, language, polling, threshold, automation and manual renewal-date preferences.
+- Independent Claude/Codex switch thresholds, per-account overrides, rotation inclusion and explicit account priorities. Preferred accounts can return automatically after a confirmed five-hour reset.
+
+Set each provider's default **% used** in Settings. In an account's details, its Automation controls can inherit that default or use a custom threshold; priority 1 is highest. Accounts excluded from automatic switching remain available for manual selection. **Return after 5-hour reset** requires inclusion and an explicit priority, waits for a fresh reading with sufficient usage left in every relevant window, and returns only to a higher-priority account. Manual account selection pauses preferred-account returns for 15 minutes; the Automation card shows the pause and lets you resume. Natural recovery does not spend reset credits. Existing accounts keep their prior behavior until you opt into these account controls.
 
 The adapter follows the original Claude subscription contracts. These include version-sensitive endpoints; fixture coverage is distinct from authenticated compatibility evidence. Priming and active polling send the original tiny Haiku inference request and consume tokens. Existing CLI sessions can retain an earlier login or model setting; switching changes the supported global CLI store.
 

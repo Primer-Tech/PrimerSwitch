@@ -107,6 +107,38 @@ const codexController = createCodexController({
   },
   subscribe: async () => () => {},
 });
+// Fictional automation previews remain read-only and never invoke native/provider calls.
+if (new URLSearchParams(location.search).get('automation') === 'custom') {
+  const now = Math.floor(Date.now() / 1000);
+  demo.settings.claudeThreshold = 82.5;
+  demo.settings.codexThreshold = 97.5;
+  demo.returnHoldUntil = codexDemo.returnHoldUntil = now + 15 * 60;
+  for (const account of [demo.accounts[0], codexDemo.accounts[0]]) {
+    account.automation = {
+      enabled: true,
+      threshold: 85.125,
+      priority: 3,
+      returnOnFiveHourReset: true,
+    };
+    account.effectiveThreshold = 85.125;
+  }
+  for (const account of [demo.accounts[1], codexDemo.accounts[2]]) {
+    account.automation = {
+      enabled: true,
+      threshold: null,
+      priority: 1,
+      returnOnFiveHourReset: true,
+    };
+  }
+  demo.accounts[2].automation = {
+    enabled: false,
+    threshold: 75,
+    priority: null,
+    returnOnFiveHourReset: false,
+  };
+  demo.accounts[2].effectiveThreshold = 75;
+  demo.consumptionPlan = ['b', 'a'];
+}
 mount(App, {
   target: document.getElementById('app')!,
   props: { controller, codexController },

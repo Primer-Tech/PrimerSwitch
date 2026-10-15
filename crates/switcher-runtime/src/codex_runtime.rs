@@ -30,8 +30,10 @@ impl RuntimeHandle {
             self.publish_codex_only(&mut engine, true);
         }
         let now = engine.clock.now();
+        let policy = CodexPolicy::from(&engine.saved.settings);
         let result = {
             let Engine { codex, vault, .. } = &mut *engine;
+            codex.set_policy(&policy, now);
             codex
                 .command(
                     command,
@@ -130,6 +132,20 @@ impl RuntimeHandle {
         self.codex_snapshot_command(CodexCommand::Delete(id.into()))
             .await
     }
+    pub async fn codex_update_account_automation(
+        &self,
+        id: &str,
+        automation: AccountAutomationView,
+    ) -> Result<CodexSnapshot, CodexReason> {
+        let _job = self.codex_job_lock().await?;
+        self.codex_snapshot_command(CodexCommand::UpdateAccountAutomation(id.into(), automation))
+            .await
+    }
+    pub async fn codex_resume_automatic_returns(&self) -> Result<CodexSnapshot, CodexReason> {
+        let _job = self.codex_job_lock().await?;
+        self.codex_snapshot_command(CodexCommand::ResumeAutomaticReturns)
+            .await
+    }
     pub async fn codex_refresh_account(&self, id: &str) -> Result<CodexSnapshot, CodexReason> {
         let _job = self.codex_job_lock().await?;
         self.codex_quota(id, true).await?;
@@ -157,8 +173,10 @@ impl RuntimeHandle {
         let report = job.run().await;
         let mut engine = self.inner.owner.lock().await;
         let now = engine.clock.now();
+        let policy = CodexPolicy::from(&engine.saved.settings);
         let result = {
             let Engine { codex, vault, .. } = &mut *engine;
+            codex.set_policy(&policy, now);
             codex.finish_quota(
                 report,
                 vault.as_ref().ok_or(CodexReason::VaultUnavailable)?,
@@ -202,9 +220,21 @@ impl RuntimeHandle {
                 return Err(CodexReason::VaultUnavailable);
             }
             let now = engine.clock.now();
-            let job = engine.codex.plan_quota(id, now, manual);
-            if manual && let Err(error) = &job {
-                engine.codex.error = Some(*error);
+            let policy = CodexPolicy::from(&engine.saved.settings);
+            engine.codex.set_policy(&policy, now);
+            let mut job = engine.codex.plan_quota(id, now, manual);
+            if let Err(error) = &job {
+                let error = *error;
+                let Engine { codex, vault, .. } = &mut *engine;
+                if let Some(vault) = vault.as_ref()
+                    && let Err(storage) =
+                        codex.record_quota_preparation_failure(id, error, vault, now)
+                {
+                    job = Err(storage);
+                }
+                if manual {
+                    engine.codex.error = Some(job.as_ref().err().copied().unwrap_or(error));
+                }
                 self.publish_codex_only(&mut engine, false);
             }
             job?
@@ -212,8 +242,10 @@ impl RuntimeHandle {
         let report = job.run().await;
         let mut engine = self.inner.owner.lock().await;
         let now = engine.clock.now();
+        let policy = CodexPolicy::from(&engine.saved.settings);
         let result = {
             let Engine { codex, vault, .. } = &mut *engine;
+            codex.set_policy(&policy, now);
             match vault.as_ref() {
                 Some(vault) => codex.finish_quota(report, vault, now),
                 None => Err(CodexReason::VaultUnavailable),
@@ -233,22 +265,48 @@ impl RuntimeHandle {
     /// reconnect on the new account; see codex_engine.rs.
     pub async fn codex_switch_account(&self, id: &str) -> Result<CodexSnapshot, CodexReason> {
         let _job = self.codex_job_lock().await?;
-        self.codex_switch_locked(id).await
+        {
+            let mut engine = self.inner.owner.lock().await;
+            if engine.demo || engine.vault.is_none() {
+                return Err(CodexReason::VaultUnavailable);
+            }
+            let now = engine.clock.now();
+            let policy = CodexPolicy::from(&engine.saved.settings);
+            let Engine { codex, vault, .. } = &mut *engine;
+            codex.set_policy(&policy, now);
+            // Save the user's manual choice before touching the active login.
+            codex.hold_automatic_returns(
+                now,
+                vault.as_ref().ok_or(CodexReason::VaultUnavailable)?,
+            )?;
+        }
+        self.codex_switch_locked(id, None).await
     }
     /// The seamless switch shared by the window and automatic switching; the caller
     /// holds `codex_job`.
-    async fn codex_switch_locked(&self, id: &str) -> Result<CodexSnapshot, CodexReason> {
+    async fn codex_switch_locked(
+        &self,
+        id: &str,
+        automatic: Option<(&CodexAutoSwitch, bool)>,
+    ) -> Result<CodexSnapshot, CodexReason> {
         let job: Option<SwitchJob> = {
             let mut engine = self.inner.owner.lock().await;
             if engine.demo || engine.vault.is_none() {
                 return Err(CodexReason::VaultUnavailable);
             }
             let now = engine.clock.now();
+            let policy = CodexPolicy::from(&engine.saved.settings);
             engine.codex.error = None;
             let result = {
                 let Engine { codex, vault, .. } = &mut *engine;
                 let vault = vault.as_ref().ok_or(CodexReason::VaultUnavailable)?;
-                codex.begin_switch(id, vault, now)
+                codex.set_policy(&policy, now);
+                match automatic {
+                    Some((plan, returning)) => {
+                        codex.begin_automatic_switch(plan, returning, &policy, vault, now)
+                    }
+                    None => codex.begin_switch(id, vault, now),
+                }
             };
             if let Err(error) = &result {
                 engine.codex.error = Some(*error);
@@ -326,15 +384,20 @@ impl RuntimeHandle {
     async fn codex_automate(&self) {
         let mut read: Vec<String> = Vec::new();
         loop {
-            let (step, now) = {
+            let (step, now, threshold) = {
                 let engine = self.inner.owner.lock().await;
                 if engine.demo || engine.vault.is_none() {
                     return;
                 }
                 let now = engine.clock.now();
                 let policy = CodexPolicy::from(&engine.saved.settings);
-                (engine.codex.automation(now, &policy), now)
+                (
+                    engine.codex.automation(now, &policy),
+                    now,
+                    engine.codex.selected_threshold(&policy),
+                )
             };
+            let returning = matches!(&step, CodexAutomation::Return(_));
             match step {
                 CodexAutomation::Idle => return,
                 CodexAutomation::Refresh(id) => {
@@ -352,9 +415,22 @@ impl RuntimeHandle {
                     }
                     return;
                 }
-                CodexAutomation::Switch(plan) => {
-                    self.inner.owner.lock().await.codex.begin_auto_switch(now);
-                    let result = self.codex_switch_locked(&plan.target_id).await;
+                CodexAutomation::Switch(plan) | CodexAutomation::Return(plan) => {
+                    {
+                        let mut engine = self.inner.owner.lock().await;
+                        let Engine { codex, vault, .. } = &mut *engine;
+                        let Some(vault) = vault.as_ref() else {
+                            return;
+                        };
+                        if let Err(error) = codex.begin_auto_switch(now, vault) {
+                            codex.error = Some(error);
+                            self.publish_codex_only(&mut engine, false);
+                            return;
+                        }
+                    }
+                    let result = self
+                        .codex_switch_locked(&plan.target_id, Some((&plan, returning)))
+                        .await;
                     let mut engine = self.inner.owner.lock().await;
                     let ro = engine.ro();
                     match result {
@@ -364,9 +440,11 @@ impl RuntimeHandle {
                                 .as_ref()
                                 .filter(|outcome| outcome.account_id == plan.target_id)
                             {
-                                let threshold = engine.saved.settings.threshold;
-                                let (title, body) =
-                                    codex_switched_text(ro, &plan, outcome, threshold);
+                                let (title, body) = if returning {
+                                    codex_returned_text(ro, &plan, outcome)
+                                } else {
+                                    codex_switched_text(ro, &plan, outcome, threshold)
+                                };
                                 engine.notify_with(title, body);
                             }
                         }
@@ -430,15 +508,37 @@ fn codex_switched_text(
         None if ro => format!("{previous} a atins limita"),
         None => format!("{previous} reached its limit"),
     };
-    let terminals = match (outcome.error.is_some(), outcome.daemon_restarted, ro) {
+    let terminals = codex_terminals_text(ro, outcome);
+    (title, format!("{reached} · {terminals}"))
+}
+fn codex_terminals_text(ro: bool, outcome: &CodexLastSwitchView) -> &'static str {
+    match (outcome.error.is_some(), outcome.daemon_restarted, ro) {
         (true, _, false) => "open terminals keep the previous account until you restart them.",
         (true, _, true) => "terminalele deschise păstrează contul anterior până le repornești.",
         (false, true, false) => "open terminals reconnect automatically.",
         (false, true, true) => "terminalele deschise se reconectează automat.",
         (false, false, false) => "the next Codex session uses it.",
         (false, false, true) => "următoarea sesiune Codex îl folosește.",
+    }
+}
+fn codex_returned_text(
+    ro: bool,
+    plan: &CodexAutoSwitch,
+    outcome: &CodexLastSwitchView,
+) -> (String, String) {
+    let target = safe_label(&plan.target_name);
+    let title = if ro {
+        format!("Codex a comutat pe {target}")
+    } else {
+        format!("Codex switched to {target}")
     };
-    (title, format!("{reached} · {terminals}"))
+    let terminals = codex_terminals_text(ro, outcome);
+    let recovered = if ro {
+        format!("Limita de 5 ore a contului preferat {target} s-a refăcut")
+    } else {
+        format!("Preferred account {target}'s 5-hour limit recovered")
+    };
+    (title, format!("{recovered} · {terminals}"))
 }
 /// Automatic switching wanted to switch, but every Codex account is at its limit.
 fn codex_exhausted_text(ro: bool, frees_first: Option<&(String, i64)>, now: i64) -> String {
@@ -495,6 +595,7 @@ mod tests {
     use crate::codex_engine::CodexAutoSwitch;
     fn plan(peak: Option<i32>) -> CodexAutoSwitch {
         CodexAutoSwitch {
+            previous_id: "a".into(),
             target_id: "b".into(),
             target_name: "b@example.invalid".into(),
             previous_name: "a@example.invalid".into(),

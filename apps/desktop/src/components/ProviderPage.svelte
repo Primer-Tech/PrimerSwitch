@@ -44,6 +44,7 @@
     ondetails,
     onrefresh,
     ondelete,
+    onresume,
   }: {
     view: PageView;
     now: number;
@@ -76,6 +77,7 @@
     ondetails: RowAction;
     onrefresh: RowAction;
     ondelete: RowAction;
+    onresume: () => void;
   } = $props();
 </script>
 
@@ -154,6 +156,11 @@
         {settingsDisabled}
         {onsettings}
         items={automationItems}
+        threshold={view.threshold}
+        returnHoldUntil={view.returnHoldUntil}
+        {now}
+        {locked}
+        {onresume}
       />
       {@render providerCard()}
     </aside>

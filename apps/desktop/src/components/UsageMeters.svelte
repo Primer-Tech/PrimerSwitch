@@ -3,15 +3,16 @@
   import { duration, percentage } from '../lib/format';
   import type { AccountRowView } from '../lib/provider-view';
   import QuotaBar from './QuotaBar.svelte';
+  import { exactPercent } from '../lib/automation';
   let {
     row,
     now,
-    threshold,
   }: {
     row: AccountRowView;
     now: number;
-    threshold: number;
+    threshold?: number;
   } = $props();
+  let threshold = $derived(row.effectiveThreshold);
   const clamp = (value: number) => Math.min(100, Math.max(0, value));
 </script>
 
@@ -55,8 +56,21 @@
         </li>{/each}
     </ul>{/if}
 </div>
+<p class="threshold-caption">
+  {t(
+    $language,
+    row.automation.enabled ? 'effectiveThresholdUsed' : 'excludedThresholdUsed',
+    { threshold: exactPercent(threshold, $language) },
+  )}
+</p>
 
 <style>
+  .threshold-caption {
+    margin: 7px 0 0;
+    color: var(--subtle);
+    font-size: 0.71rem;
+    line-height: 1.5;
+  }
   .usage-meters {
     background: var(--surface-raised);
     border: 1px solid var(--line);

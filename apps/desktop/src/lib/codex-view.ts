@@ -18,7 +18,7 @@ import {
 } from './codex-format';
 import type { CodexPending } from './codex-controller';
 import type { CodexAccount, CodexSnapshot, CodexWindow } from './codex-types';
-import type { Settings } from './types';
+import { defaultAutomation, providerThreshold, type Settings } from './types';
 import {
   alertText,
   allLimitedText,
@@ -47,7 +47,6 @@ export interface CodexViewOptions {
 
 const FIVE_HOURS = 300;
 const WEEK = 10080;
-const DEFAULT_THRESHOLD = 95;
 
 /** A primary meter: the shared label when the window is the usual one, else its real length. */
 function primaryMeter(
@@ -99,6 +98,8 @@ function row(
   switchingId: string | null,
 ): AccountRowView & { limitKind: LimitKind | null } {
   const { locale, now, pending = null, pendingId = null } = options;
+  threshold =
+    account.effectiveThreshold ?? account.automation?.threshold ?? threshold;
   const windows = codexWindows(codexMainLimit(account));
   const main = [windows.short, windows.long].filter(
     (window): window is CodexWindow => !!window,
@@ -115,13 +116,15 @@ function row(
       : atThreshold
         ? 'near'
         : null;
-  const limited = limitKind !== null;
+  const limited = account.exhausted ?? limitKind !== null;
   const blocking = main.filter((window) => window.usedPercent >= threshold);
   const freesAt = !limited
     ? null
-    : blocking.length && blocking.every((window) => window.resetsAt !== null)
-      ? Math.max(...blocking.map((window) => window.resetsAt!))
-      : provider.freesAt;
+    : account.freesAt !== undefined
+      ? account.freesAt
+      : blocking.length && blocking.every((window) => window.resetsAt !== null)
+        ? Math.max(...blocking.map((window) => window.resetsAt!))
+        : provider.freesAt;
   const chatgpt = account.authKind === 'chatgpt';
   const checking =
     (pending === 'codex_refresh_account' && pendingId === account.id) ||
@@ -191,6 +194,8 @@ function row(
     plan: codexAccountPlan(account, locale),
     active: account.selected,
     next: snapshot.nextId === account.id && !account.selected,
+    automation: account.automation ?? { ...defaultAutomation },
+    effectiveThreshold: threshold,
     switching: switchingId === account.id,
     fiveHour: primaryMeter(windows.short, 'short', account, locale),
     // Codex has one main weekly window: it is also the one automation uses.
@@ -265,7 +270,7 @@ export function codexView(
   options: CodexViewOptions,
 ): PageView {
   const { locale, now, settings, pending = null, pendingId = null } = options;
-  const threshold = settings?.threshold ?? DEFAULT_THRESHOLD;
+  const threshold = providerThreshold(settings, 'codex');
   if (!snapshot)
     return {
       provider: 'codex',
@@ -285,6 +290,7 @@ export function codexView(
       updatedAt: null,
       threshold,
       settings,
+      returnHoldUntil: null,
     };
   const switchingId =
     snapshot.switching?.targetId ??
@@ -313,22 +319,40 @@ export function codexView(
     active,
     // Exactly the account the native side ranks next.
     next: rows.find((r) => r.id === snapshot.nextId && !r.active) ?? null,
-    nextReason: nextReason(settings, locale),
+    nextReason:
+      rows.find((r) => r.id === snapshot.nextId)?.automation.priority != null
+        ? t(locale, 'nextWhyPriority', {
+            priority: rows.find((r) => r.id === snapshot.nextId)!.automation
+              .priority!,
+          })
+        : nextReason(settings, locale),
     model: snapshot.activeModel,
     order: orderEntries(snapshot.order, rows),
     orderEmpty: orderEmptyText(rows, locale),
     alert:
       activeBuilt && activeLimit
-        ? alertText(activeLimit, activeBuilt.freesAt, threshold, now, locale)
+        ? alertText(
+            activeLimit,
+            activeBuilt.freesAt,
+            activeBuilt.effectiveThreshold,
+            now,
+            locale,
+          )
         : null,
     alertLimit: activeLimit,
     allLimited:
-      built.length && built.every((r) => r.limited)
-        ? allLimitedText(rows, now, locale)
+      built.some((r) => r.automation.enabled) &&
+      built.filter((r) => r.automation.enabled).every((r) => r.limited)
+        ? allLimitedText(
+            rows.filter((account) => account.automation.enabled),
+            now,
+            locale,
+          )
         : null,
     signIn: rows.filter((r) => r.status.kind === 'signIn'),
     updatedAt: codexLastRead(snapshot),
     threshold,
     settings,
+    returnHoldUntil: snapshot.returnHoldUntil ?? null,
   };
 }

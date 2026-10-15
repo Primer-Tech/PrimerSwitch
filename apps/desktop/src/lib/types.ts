@@ -28,6 +28,8 @@ export const settingsSchema = z
       .max(900)
       .refine((v) => v % 30 === 0),
     threshold: z.number().finite().min(50).max(100),
+    claudeThreshold: z.number().finite().min(50).max(100).nullable().optional(),
+    codexThreshold: z.number().finite().min(50).max(100).nullable().optional(),
     autoSwitchEnabled: z.boolean(),
     autoStartWindowEnabled: z.boolean(),
     autoUseResetsEnabled: z.boolean(),
@@ -37,12 +39,42 @@ export const settingsSchema = z
     preferSoonestWeeklyReset: z.boolean(),
   })
   .strict();
+export const accountAutomationSchema = z
+  .object({
+    enabled: z.boolean(),
+    threshold: z.number().finite().min(50).max(100).nullable(),
+    priority: z.number().int().min(1).max(99).nullable(),
+    returnOnFiveHourReset: z.boolean(),
+  })
+  .strict();
+export type AccountAutomation = z.infer<typeof accountAutomationSchema>;
+export const defaultAutomation: AccountAutomation = {
+  enabled: true,
+  threshold: null,
+  priority: null,
+  returnOnFiveHourReset: false,
+};
+/** Optional provider values preserve older installations' single saved default. */
+export function providerThreshold(
+  settings: Settings | null,
+  provider: 'claude' | 'codex',
+): number {
+  return (
+    (provider === 'claude'
+      ? settings?.claudeThreshold
+      : settings?.codexThreshold) ??
+    settings?.threshold ??
+    95
+  );
+}
 export const accountSchema = z
   .object({
     id: z.string(),
     name: z.string(),
     email: z.string(),
     provider: z.literal('claude'),
+    automation: accountAutomationSchema.optional(),
+    effectiveThreshold: z.number().finite().min(50).max(100).optional(),
     active: z.boolean(),
     isNext: z.boolean(),
     exhausted: z.boolean(),
@@ -101,6 +133,7 @@ export const snapshotSchema = z
     notice: errorViewSchema.nullable().optional(),
     demo: z.boolean(),
     consumptionPlan: z.array(z.string()).optional(),
+    returnHoldUntil: timestamp.optional(),
   })
   .strict();
 export type Snapshot = z.infer<typeof snapshotSchema>;

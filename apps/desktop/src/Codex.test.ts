@@ -511,7 +511,9 @@ describe('Codex accounts page', () => {
     });
     const next = section('Next up');
     expect(next.getByText(t('en', 'nextWhyMostLeft'))).toBeVisible();
-    expect(next.getByText('Switches automatically at 90%.')).toBeVisible();
+    expect(
+      next.getByText('Switches when studio@example.invalid reaches 90% used.'),
+    ).toBeVisible();
     expect(section('Automation').getByText('Most left first')).toBeVisible();
   });
   it('uses the soonest-reset wording by default and none about automation when it is off', async () => {

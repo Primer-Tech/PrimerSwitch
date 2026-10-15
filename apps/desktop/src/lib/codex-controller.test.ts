@@ -77,6 +77,45 @@ function switched(
   return raw;
 }
 describe('Codex contract and redacted IPC', () => {
+  it('saves automation through the native snapshot and preserves busy/demo/unsupported gates', async () => {
+    const { c, call, event } = setup();
+    await c.start();
+    const preference = {
+      enabled: false,
+      threshold: 81.125,
+      priority: 1,
+      returnOnFiveHourReset: true,
+    };
+    const saved = codexSnapshot({ revision: 2, returnHoldUntil: 900 });
+    saved.accounts[2].automation = preference;
+    saved.accounts[2].effectiveThreshold = 81.125;
+    call.mockResolvedValueOnce(saved);
+    expect(await c.updateAutomation(saved.accounts[2].id, preference)).toEqual(
+      preference,
+    );
+    expect(call).toHaveBeenLastCalledWith('codex_update_account_automation', {
+      id: saved.accounts[2].id,
+      automation: preference,
+    });
+    const before = call.mock.calls.length;
+    expect(
+      await c.updateAutomation(saved.accounts[2].id, {
+        ...preference,
+        priority: 100,
+      }),
+    ).toBeNull();
+    event(codexSnapshot({ revision: 3, busy: true }));
+    expect(await c.resumeAutomaticReturns()).toBe(false);
+    event(codexSnapshot({ revision: 4, demo: true }));
+    expect(
+      await c.updateAutomation(saved.accounts[2].id, preference),
+    ).toBeNull();
+    event(codexSnapshot({ revision: 5, availability: 'unsupported' }));
+    expect(
+      await c.updateAutomation(saved.accounts[2].id, preference),
+    ).toBeNull();
+    expect(call.mock.calls.length).toBe(before);
+  });
   it('accepts older quotas and date-only details but rejects IDs and invalid expiry timestamps', () => {
     const raw = codexSnapshot();
     expect(codexSnapshotSchema.safeParse(raw).success).toBe(true);

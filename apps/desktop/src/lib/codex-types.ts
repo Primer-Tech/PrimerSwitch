@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { accountAutomationSchema } from './types';
 const text = z.string().max(512);
 const id = z.string().min(1).max(256);
 const timestamp = z.number().int().nullable();
@@ -26,6 +27,7 @@ export const codexReasonSchema = z.enum([
   'resetUnavailable',
   'noResetCredits',
   'resetUnconfirmed',
+  'invalidAutomation',
 ]);
 export type CodexReason = z.infer<typeof codexReasonSchema>;
 export const codexResetOutcomeSchema = z.enum([
@@ -70,6 +72,10 @@ export const codexAccountSchema = z
   .object({
     id,
     provider: z.literal('codex'),
+    automation: accountAutomationSchema.optional(),
+    effectiveThreshold: z.number().finite().min(50).max(100).optional(),
+    exhausted: z.boolean().optional(),
+    freesAt: timestamp.optional(),
     name: text,
     email: text.nullable(),
     workspaceId: text.nullable(),
@@ -189,6 +195,7 @@ export const codexSnapshotSchema = z
     lastSwitch: lastSwitchSchema.nullable(),
     environment: environmentSchema,
     warnings: z.array(codexReasonSchema),
+    returnHoldUntil: timestamp.optional(),
   })
   .strict();
 export type CodexSnapshot = z.infer<typeof codexSnapshotSchema>;

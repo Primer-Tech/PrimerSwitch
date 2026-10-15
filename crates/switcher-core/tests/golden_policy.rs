@@ -9,6 +9,151 @@ use switcher_core::*;
 const SOONEST: CandidateOrder = CandidateOrder::SoonestWeeklyReset;
 const MOST_LEFT: CandidateOrder = CandidateOrder::MostWeeklyLeft;
 
+#[test]
+fn provider_thresholds_are_independent_and_historical_defaults_stay_omitted() {
+    let mut settings: Settings = serde_json::from_value(json!({"threshold":71.5})).unwrap();
+    assert_eq!(settings.threshold_for(ProviderId::Claude), 71.5);
+    assert_eq!(settings.threshold_for(ProviderId::Codex), 71.5);
+    let encoded = serde_json::to_value(&settings).unwrap();
+    assert!(encoded.get("claude_threshold").is_none());
+    assert!(encoded.get("codex_threshold").is_none());
+    settings.claude_threshold = Some(99.5);
+    settings.codex_threshold = Some(65.25);
+    settings.threshold = 80.0;
+    assert_eq!(settings.threshold_for(ProviderId::Claude), 99.5);
+    assert_eq!(settings.threshold_for(ProviderId::Codex), 65.25);
+    for bad in [f64::NAN, f64::INFINITY, 49.9, 100.01] {
+        assert!(
+            Settings {
+                claude_threshold: Some(bad),
+                ..settings.clone()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            Settings {
+                codex_threshold: Some(bad),
+                ..settings.clone()
+            }
+            .validate()
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn automation_defaults_preserve_account_shape_and_validate_overrides() {
+    let account = StoredAccount::default();
+    let encoded = serde_json::to_value(&account).unwrap();
+    for key in [
+        "automation",
+        "preferred_return_reset_at",
+        "preferred_return_handled_reset_at",
+    ] {
+        assert!(encoded.get(key).is_none(), "{key}");
+    }
+    assert_eq!(AccountAutomation::default().effective_threshold(95.0), 95.0);
+    for threshold in [50.0, 99.5, 100.0] {
+        let preferences = AccountAutomation {
+            threshold: Some(threshold),
+            ..AccountAutomation::default()
+        };
+        assert!(preferences.validate().is_ok());
+        assert_eq!(preferences.effective_threshold(95.0), threshold);
+    }
+    for priority in [0, 100, u16::MAX] {
+        assert!(
+            AccountAutomation {
+                priority: Some(priority),
+                ..AccountAutomation::default()
+            }
+            .validate()
+            .is_err()
+        );
+    }
+    for threshold in [f64::NAN, f64::NEG_INFINITY, 49.0, 101.0] {
+        assert!(
+            AccountAutomation {
+                threshold: Some(threshold),
+                ..AccountAutomation::default()
+            }
+            .validate()
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn every_account_uses_its_threshold_and_excluded_targets_cannot_be_selected() {
+    let mut standard = info("standard", 70.0, 40.0, Some(3600), false);
+    standard.account.automation.threshold = Some(65.0);
+    let mut expanded = info("expanded", 96.0, 40.0, Some(7200), false);
+    expanded.account.automation.threshold = Some(99.5);
+    assert!(!is_usable(&standard, 95.0, None));
+    assert!(is_usable(&expanded, 95.0, None));
+    let both = [standard.clone(), expanded.clone()];
+    assert_eq!(
+        best_candidate(&both, 95.0, None, SOONEST).as_deref(),
+        Some("expanded")
+    );
+    assert!(!has_headroom(&expanded, 95.0, None, 5.0));
+    expanded.account.automation.enabled = false;
+    assert!(best_candidate(&[standard, expanded.clone()], 95.0, None, SOONEST).is_none());
+    assert!(consumption_plan(&[expanded], 95.0, None, SOONEST).is_empty());
+}
+
+#[test]
+fn explicit_priority_follows_headroom_and_precedes_existing_weekly_order() {
+    let mut preferred = info("preferred", 20.0, 30.0, Some(10800), false);
+    preferred.account.automation.priority = Some(1);
+    let mut backup = info("backup", 20.0, 20.0, Some(3600), false);
+    backup.account.automation.priority = Some(2);
+    for order in [SOONEST, MOST_LEFT] {
+        assert_eq!(
+            best_candidate(&[backup.clone(), preferred.clone()], 95.0, None, order).as_deref(),
+            Some("preferred")
+        );
+        assert_eq!(
+            consumption_plan(&[backup.clone(), preferred.clone()], 95.0, None, order),
+            vec!["preferred", "backup"]
+        );
+    }
+    preferred.usage.as_mut().unwrap().five_hour.utilization = 93.0;
+    assert_eq!(
+        best_candidate(&[preferred, backup], 95.0, None, SOONEST).as_deref(),
+        Some("backup")
+    );
+}
+
+#[test]
+fn per_account_binding_thresholds_and_exclusion_apply_to_last_resort_resets() {
+    let active = info("active", 100.0, 0.0, None, true);
+    let mut excluded = with_grant(
+        info("excluded", 100.0, 0.0, None, false),
+        grant("g", Some(100000)),
+    );
+    excluded.account.automation.enabled = false;
+    assert!(decide_resets(&[active.clone(), excluded.clone()], 95.0, None, 0).is_empty());
+    excluded.account.automation.enabled = true;
+    assert_eq!(
+        decide_resets(&[active, excluded], 95.0, None, 0)[0].account_id,
+        "excluded"
+    );
+    let mut custom = with_grant(
+        info("custom", 75.0, 0.0, None, true),
+        ResetGrant {
+            use_requires_limit: false,
+            ..grant("g", Some(100000))
+        },
+    );
+    custom.account.automation.threshold = Some(70.0);
+    assert_eq!(
+        decide_resets(&[custom], 95.0, None, 0)[0].account_id,
+        "custom"
+    );
+}
+
 fn usage(five: f64, seven: f64, weekly_reset: Option<i64>) -> UsageResponse {
     UsageResponse {
         five_hour: UsageWindow {
@@ -186,6 +331,8 @@ fn settings_saved_before_the_reset_order_existed_keep_every_value_and_the_origin
         Settings {
             poll_interval: 900,
             threshold: 70.5,
+            claude_threshold: None,
+            codex_threshold: None,
             auto_switch_enabled: false,
             auto_start_window_enabled: false,
             auto_use_resets_enabled: false,
@@ -301,6 +448,7 @@ fn provider_neutral_ranks_follow_the_same_rules() {
     let rank = |id, headroom, weekly_used, weekly_reset_bucket, five_hour_used| CandidateRank {
         id,
         headroom,
+        priority: None,
         weekly_used,
         weekly_reset_bucket,
         five_hour_used,

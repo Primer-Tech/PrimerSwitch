@@ -1,6 +1,6 @@
 <script lang="ts">
   import { language, t } from '../lib/i18n';
-  import { percentage } from '../lib/format';
+  import { exactPercent } from '../lib/automation';
   import type { AccountRowView, PageView } from '../lib/provider-view';
   import Icon from './Icon.svelte';
   import QuotaBar from './QuotaBar.svelte';
@@ -39,19 +39,22 @@
         reset={false}
         meter={next.fiveHour}
         {now}
-        threshold={view.threshold}
+        threshold={next.effectiveThreshold}
       /><QuotaBar
         compact
         reset={false}
         meter={next.weeklyBinding}
         {now}
-        threshold={view.threshold}
+        threshold={next.effectiveThreshold}
       />
     </div>
     <p>{view.nextReason}</p>
-    {#if view.settings?.autoSwitchEnabled}<p class="next-automatic">
+    {#if view.settings?.autoSwitchEnabled && view.active}<p
+        class="next-automatic"
+      >
         {t($language, 'nextAutomatic', {
-          threshold: percentage(view.threshold, $language),
+          threshold: exactPercent(view.active.effectiveThreshold, $language),
+          name: view.active.name,
         })}
       </p>{/if}
     <button

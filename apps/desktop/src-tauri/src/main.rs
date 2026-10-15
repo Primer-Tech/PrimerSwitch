@@ -1,8 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use switcher_runtime::{
-    CodexLoginView, CodexReason, CodexSnapshot, ImportPreview, LoginSession, RuntimeError,
-    RuntimeHandle, SettingsView, Snapshot,
+    AccountAutomationView, CodexLoginView, CodexReason, CodexSnapshot, ImportPreview, LoginSession,
+    RuntimeError, RuntimeHandle, SettingsView, Snapshot,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
@@ -80,6 +80,24 @@ async fn update_settings(
 async fn import_current(runtime: State<'_, RuntimeHandle>) -> Reply<Snapshot> {
     runtime
         .import_current()
+        .await
+        .map_err(|e| local_error(&runtime, e))
+}
+#[tauri::command]
+async fn update_account_automation(
+    runtime: State<'_, RuntimeHandle>,
+    id: String,
+    automation: AccountAutomationView,
+) -> Reply<Snapshot> {
+    runtime
+        .update_account_automation(&id, automation)
+        .await
+        .map_err(|e| local_error(&runtime, e))
+}
+#[tauri::command]
+async fn resume_automatic_returns(runtime: State<'_, RuntimeHandle>) -> Reply<Snapshot> {
+    runtime
+        .resume_automatic_returns()
         .await
         .map_err(|e| local_error(&runtime, e))
 }
@@ -268,6 +286,25 @@ async fn codex_consume_reset(
         .await
         .map_err(|e| e.to_string())
 }
+#[tauri::command]
+async fn codex_update_account_automation(
+    runtime: State<'_, RuntimeHandle>,
+    id: String,
+    automation: AccountAutomationView,
+) -> Reply<CodexSnapshot> {
+    codex_id(&id)?;
+    runtime
+        .codex_update_account_automation(&id, automation)
+        .await
+        .map_err(|e| e.to_string())
+}
+#[tauri::command]
+async fn codex_resume_automatic_returns(runtime: State<'_, RuntimeHandle>) -> Reply<CodexSnapshot> {
+    runtime
+        .codex_resume_automatic_returns()
+        .await
+        .map_err(|e| e.to_string())
+}
 /// Writes the selected sign-in and restarts Codex's shared daemon so open terminals
 /// reconnect on it. Progress is published through `codex_snapshot_changed`.
 #[tauri::command]
@@ -311,6 +348,8 @@ fn main() {
             delete_account,
             set_renewal_day,
             update_settings,
+            update_account_automation,
+            resume_automatic_returns,
             import_current,
             begin_login,
             finish_login,
@@ -328,6 +367,8 @@ fn main() {
             codex_import_switcher,
             codex_refresh_all,
             codex_consume_reset,
+            codex_update_account_automation,
+            codex_resume_automatic_returns,
             codex_switch_account
         ])
         .setup(move |app| {

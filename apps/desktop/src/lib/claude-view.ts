@@ -2,7 +2,12 @@
 import { t, type Language } from './i18n';
 import { planLabel } from './format';
 import { codeMessage } from './controller';
-import type { AccountView, Snapshot } from './types';
+import {
+  defaultAutomation,
+  providerThreshold,
+  type AccountView,
+  type Snapshot,
+} from './types';
 import {
   alertText,
   allLimitedText,
@@ -70,6 +75,7 @@ function row(
   account: AccountView,
   model: string | null,
   { locale, now, switchingId = null }: ClaudeViewOptions,
+  threshold: number,
 ): AccountRowView {
   const usage = account.usage;
   const signIn = !!account.signInRequired;
@@ -122,6 +128,9 @@ function row(
     plan: planLabel(account.planTier),
     active: account.active,
     next: account.isNext,
+    automation: account.automation ?? { ...defaultAutomation },
+    effectiveThreshold:
+      account.effectiveThreshold ?? account.automation?.threshold ?? threshold,
     switching: switchingId === account.id,
     fiveHour: meter(
       'fiveHour',
@@ -231,11 +240,17 @@ export function claudeView(
       updatedAt: null,
       threshold: 95,
       settings: null,
+      returnHoldUntil: null,
     };
   const settings = snapshot.settings;
   const plan = snapshot.consumptionPlan ?? [];
   const unsorted = snapshot.accounts.map((account) =>
-    row(account, snapshot.activeModel, options),
+    row(
+      account,
+      snapshot.activeModel,
+      options,
+      providerThreshold(settings, 'claude'),
+    ),
   );
   const rows = rankRows(unsorted, plan);
   const active =
@@ -251,7 +266,13 @@ export function claudeView(
     rows,
     active,
     next: rows.find((r) => r.next && !r.active) ?? null,
-    nextReason: nextReason(settings, locale),
+    nextReason:
+      rows.find((r) => r.next && !r.active)?.automation.priority != null
+        ? t(locale, 'nextWhyPriority', {
+            priority: rows.find((r) => r.next && !r.active)!.automation
+              .priority!,
+          })
+        : nextReason(settings, locale),
     model: snapshot.activeModel ?? t(locale, 'defaultModel'),
     order: orderEntries(plan, rows),
     orderEmpty: orderEmptyText(rows, locale),
@@ -260,20 +281,27 @@ export function claudeView(
         ? alertText(
             activeLimit,
             activeAccount.freesAt ?? null,
-            settings.threshold,
+            active!.effectiveThreshold,
             now,
             locale,
           )
         : null,
     alertLimit: activeLimit,
     allLimited:
-      snapshot.accounts.length &&
-      snapshot.accounts.every((account) => account.exhausted)
-        ? allLimitedText(rows, now, locale)
+      rows.some((account) => account.automation.enabled) &&
+      rows
+        .filter((account) => account.automation.enabled)
+        .every((account) => account.limited)
+        ? allLimitedText(
+            rows.filter((account) => account.automation.enabled),
+            now,
+            locale,
+          )
         : null,
     signIn: rows.filter((r) => r.canSignIn),
     updatedAt: snapshot.lastRefreshAt,
-    threshold: settings.threshold,
+    threshold: providerThreshold(settings, 'claude'),
     settings,
+    returnHoldUntil: snapshot.returnHoldUntil ?? null,
   };
 }

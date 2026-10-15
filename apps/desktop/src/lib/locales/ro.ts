@@ -117,7 +117,9 @@ export const ro: Record<keyof typeof en, string> = {
   nextUp: 'Urmează',
   nextWhySoonest: 'Limita sa săptămânală se resetează cel mai curând.',
   nextWhyMostLeft: 'Are cea mai mare rezervă săptămânală.',
-  nextAutomatic: 'Comută automat la {threshold}%.',
+  nextAutomatic: 'Comută când {name} ajunge la {threshold}% utilizat.',
+  nextWhyPriority:
+    'Prioritate {priority} între conturile cu rezervă suficientă.',
   switchNow: 'Comută acum',
   switchNowLabel: 'Comută acum pe {name}',
   noNext: 'Niciun alt cont nu este pregătit de folosire.',
@@ -245,9 +247,67 @@ export const ro: Record<keyof typeof en, string> = {
     'Alege un interval între 2 și 15 minute și un prag între 50% și 100%.',
   globalPreferences: 'Aspect și limbă',
   settingsProviderScope:
-    'Comutarea automată, ordinea resetărilor săptămânale, intervalul de verificare și pragul de comutare se aplică pentru Claude și Codex. Pornirea ferestrelor de 5 ore și săptămânală și folosirea automată a resetărilor se aplică doar pentru Claude. Resetările Codex pot fi folosite manual din detaliile contului. Aspectul și limba se aplică ambilor furnizori.',
+    'Alege un prag implicit de comutare pentru fiecare furnizor. Din Detalii poți seta un prag propriu, o prioritate și revenirea după resetarea de 5 ore. Comutarea automată, intervalul, ordinea săptămânală, aspectul și limba sunt comune.',
   sharedAutomation: 'Automatizare pentru Claude și Codex',
   claudeOnlyAutomation: 'Doar pentru Claude',
+  providerDefaults: 'Praguri implicite pe furnizor',
+  providerDefaultsHelp:
+    'Procent din cotă utilizat. Fiecare cont moștenește pragul furnizorului dacă nu alegi unul propriu din Detalii.',
+  claudeThresholdUsed: 'Prag Claude · % utilizat',
+  codexThresholdUsed: 'Prag Codex · % utilizat',
+  percentHelp:
+    '50–100% utilizat. Sunt acceptate zecimale; derularea nu schimbă valoarea.',
+  invalidPercent:
+    'Introdu un număr între 50 și 100 cu punct sau virgulă zecimală. Folosește mai puține zecimale dacă este necesar.',
+  decreasePercent: 'Scade {label} cu 1 punct procentual',
+  increasePercent: 'Crește {label} cu 1 punct procentual',
+  providerDefault: 'Pragul furnizorului',
+  percentUsed: '{threshold}% utilizat',
+  providerDefaultsSaved:
+    'Praguri salvate: Claude {claude}% utilizat · Codex {codex}% utilizat.',
+  accountAutomation: 'Automatizarea contului',
+  accountAutomationHelp:
+    'Alege când se comută de pe acest cont și locul său în ordinea automată.',
+  includeAutomatic: 'Include în comutarea automată',
+  includeAutomaticHelp:
+    'Permite selectarea automată a acestui cont. Pe conturile excluse poți comuta în continuare manual.',
+  includedAutomatic: 'Inclus în comutarea automată',
+  excludedAutomatic: 'Doar manual',
+  switchThresholdUsed: 'Comută de pe cont la · % utilizat',
+  useProviderDefault: 'Folosește pragul furnizorului ({threshold}% utilizat)',
+  customThreshold: 'Prag propriu',
+  customThresholdUsed: 'Prag propriu · % utilizat',
+  effectiveThresholdUsed: 'Prag de comutare: {threshold}% utilizat.',
+  excludedThresholdUsed: 'Doar manual · prag de ieșire: {threshold}% utilizat.',
+  rowThresholdUsed: 'Comută la {threshold}% utilizat',
+  accountPriority: 'Prioritate (opțional)',
+  accountPriorityHelp:
+    '1 este cea mai mare; 99 cea mai mică. Lasă gol pentru ordinea săptămânală. Conturile cu rezervă suficientă vin primele; ordinea săptămânală departajează prioritățile egale.',
+  invalidPriority: 'Introdu un număr întreg între 1 și 99 sau lasă gol.',
+  priorityAutomatic: 'ordine săptămânală',
+  priorityBadge: 'Prioritate {priority}',
+  returnEnabled: 'revine după resetare',
+  returnPriorityRequired:
+    'Alege o prioritate pentru revenirile automate sau oprește revenirile.',
+  returnExcludedHelp:
+    'Preferința de revenire este păstrată. Revenirile sunt suspendate cât timp contul este exclus.',
+  returnAfterReset: 'Revino după resetarea de 5 ore',
+  returnAfterResetHelp:
+    'Necesită includere și o prioritate. După resetarea unei limite de 5 ore observate, revine pe acest cont dacă prioritatea sa este mai mare și verificări noi confirmă rezervă în toate ferestrele relevante. Comutarea automată trebuie să fie pornită.',
+  manualReturnHelp:
+    'Alegerea manuală a unui cont suspendă revenirile automate timp de 15 minute. Le poți relua mai devreme din cardul Automatizare.',
+  automationDetailsHelp:
+    'Alege pragurile, prioritățile și revenirile automate ale conturilor din Detalii.',
+  returnsPaused:
+    'Revenirile automate sunt suspendate încă {duration} după alegerea manuală.',
+  resumeReturns: 'Reia revenirile automate',
+  saveAutomation: 'Salvează automatizarea',
+  accountAutomationSaved:
+    'Salvat: {threshold}% utilizat ({source}) · {state} · prioritate: {priority} · reveniri: {returnState}.',
+  automationUnsupported:
+    'Automatizarea este disponibilă pentru conturi ChatGPT salvate cu o configurare acceptată.',
+  codexReason_invalidAutomation:
+    'Alege un prag între 50 și 100 și, opțional, o prioritate între 1 și 99. Revenirile automate necesită includere și o prioritate.',
 
   // Formatting.
   noReading: 'Nicio citire',

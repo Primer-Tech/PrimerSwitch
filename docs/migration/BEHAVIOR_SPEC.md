@@ -140,6 +140,14 @@ Show saved usage immediately after restart and retain it on a network error, wit
 
 ## 5. Switching policy and scheduling
 
+### Owner-approved account automation extension (2026-10-15)
+
+Version 0.2.4 retains the old threshold as a fallback and adds independent Claude/Codex defaults. Each account can inherit its provider default or set a finite 50..100 percent-used override. Eligibility, headroom, near-limit polling, binding-window checks, reset decisions and renderer status use that account's effective threshold. Existing records retain the previous behavior by default.
+
+Accounts can be excluded as automatic destinations, including last-resort Claude reset switching, while remaining manually selectable. An explicit priority from 1 (highest) to 99 ranks candidates after preferred headroom and before the existing weekly ordering. Equal or absent priorities use the original tie breakers.
+
+An account with inclusion, explicit priority and **Return after 5-hour reset** enabled can return automatically after a five-hour window observed at its effective threshold naturally recovers. Its remembered reset must have passed and fresh identity/usage evidence must confirm preferred headroom in every applicable binding window. Only a higher-priority inactive account can pull the user back; a healthy active account otherwise remains selected. Unknown windows or reset times never imply available quota. A fresh explicit zero-usage five-hour window with no new reset date can prove unused/unstarted recovery after the known old reset; an absent window cannot, and nonzero usage with no new reset remains ineligible. The observed/handled reset ledger persists, preventing repeated returns for one reset. A manual selection pauses returns for 15 minutes, with an explicit resume action. A ten-minute automatic-switch cooldown also gates returns, including across restart; provider switching/credential ownership guards remain authoritative. Natural recovery is separate from Claude window priming and banked resets.
+
 ### B13 — Candidate ordering
 
 For threshold `T`, an account is usable only when **both** five-hour and model-aware weekly usage are strictly below `T`. No usage means unusable. A target has preferred headroom when usable and both values are at most `T − 5`; exactly `T` is still unusable even if a test requests margin zero.

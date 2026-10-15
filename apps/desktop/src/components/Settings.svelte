@@ -1,10 +1,16 @@
 <script lang="ts">
   import { t } from '../lib/i18n';
   import { untrack } from 'svelte';
-  import { settingsSchema, type Settings } from '../lib/types';
+  import {
+    settingsSchema,
+    providerThreshold,
+    type Settings,
+  } from '../lib/types';
   import Modal from './Modal.svelte';
   import { safeError } from '../lib/controller';
   import { percentage } from '../lib/format';
+  import { exactPercent, parsePercent } from '../lib/automation';
+  import PercentField from './PercentField.svelte';
   let {
     settings,
     disabled,
@@ -22,9 +28,38 @@
   let saving = $state(false);
   let locale = $derived(draft.language);
   let validationError = $state<string | null>(null);
+  let claudePercent = $state(
+    exactPercent(
+      untrack(() => providerThreshold(settings, 'claude')),
+      untrack(() => settings.language),
+    ),
+  );
+  let codexPercent = $state(
+    exactPercent(
+      untrack(() => providerThreshold(settings, 'codex')),
+      untrack(() => settings.language),
+    ),
+  );
+  let attempted = $state(false);
   async function save() {
+    attempted = true;
     validationError = null;
-    const result = settingsSchema.safeParse(draft);
+    const claudeThreshold = parsePercent(claudePercent);
+    const codexThreshold = parsePercent(codexPercent);
+    if (claudeThreshold === null || codexThreshold === null) {
+      document
+        .getElementById(
+          claudeThreshold === null ? 'claude-threshold' : 'codex-threshold',
+        )
+        ?.focus();
+      return;
+    }
+    // Save both explicit defaults: changing one cannot mutate the other's fallback.
+    const result = settingsSchema.safeParse({
+      ...draft,
+      claudeThreshold,
+      codexThreshold,
+    });
     if (!result.success) {
       validationError = t(locale, 'invalidSettings');
       return;
@@ -93,22 +128,24 @@
         </div>
       </div>
       <p class="help">{t(locale, 'pollingHelp')}</p>
-      <div class="settings-control">
-        <label for="threshold"
-          >{t(locale, 'switchThreshold')}<strong
-            >{percentage(draft.threshold, locale)}%</strong
-          ></label
-        >
-        <input
-          id="threshold"
-          type="number"
-          min="50"
-          max="100"
-          step="1"
-          required
-          bind:value={draft.threshold}
-        />
-      </div>
+      <h3 class="settings-group">{t(locale, 'providerDefaults')}</h3>
+      <p class="help">{t(locale, 'providerDefaultsHelp')}</p>
+      <PercentField
+        id="claude-threshold"
+        label={t(locale, 'claudeThresholdUsed')}
+        bind:value={claudePercent}
+        {locale}
+        disabled={disabled || saving}
+        showError={attempted}
+      />
+      <PercentField
+        id="codex-threshold"
+        label={t(locale, 'codexThresholdUsed')}
+        bind:value={codexPercent}
+        {locale}
+        disabled={disabled || saving}
+        showError={attempted}
+      />
     </fieldset>
     <fieldset disabled={disabled || saving}>
       <legend class="settings-group">{t(locale, 'claudeOnlyAutomation')}</legend
@@ -159,7 +196,7 @@
     {#if validationError || error}<p class="warning-text" role="alert">
         {safeError(validationError ?? error, locale)}
       </p>{/if}
-    <div class="modal-actions">
+    <div class="modal-actions sticky-actions">
       <button type="button" onclick={onclose}>{t(locale, 'cancel')}</button
       ><button class="primary" type="submit" disabled={disabled || saving}
         >{saving ? t(locale, 'saving') : t(locale, 'save')}</button

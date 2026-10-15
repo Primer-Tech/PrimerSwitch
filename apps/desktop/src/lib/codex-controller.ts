@@ -1,4 +1,5 @@
 import { writable } from 'svelte/store';
+import { accountAutomationSchema, type AccountAutomation } from './types';
 import {
   codexNativeBridge,
   type CodexBridge,
@@ -50,7 +51,10 @@ export type CodexPending =
   | 'codex_delete_account'
   | 'codex_switch_account'
   | 'codex_begin_login'
-  | 'codex_cancel_login';
+  | 'codex_cancel_login'
+  | 'codex_update_account_automation'
+  | 'codex_resume_automatic_returns';
+// Preference edits are local, but still serialized and blocked by demo/login/switch state.
 export interface CodexState {
   snapshot: CodexSnapshot | null;
   pending: CodexPending | null;
@@ -73,7 +77,9 @@ type SnapshotCommand =
   | 'codex_import_switcher'
   | 'codex_refresh_account'
   | 'codex_refresh_all'
-  | 'codex_delete_account';
+  | 'codex_delete_account'
+  | 'codex_update_account_automation'
+  | 'codex_resume_automatic_returns';
 const capabilityFor = {
   codex_discover: null,
   codex_import_current: 'importCurrent',
@@ -81,6 +87,8 @@ const capabilityFor = {
   codex_refresh_account: 'refreshQuota',
   codex_refresh_all: 'refreshQuota',
   codex_delete_account: 'deleteSaved',
+  codex_update_account_automation: null,
+  codex_resume_automatic_returns: 'switchAccount',
 } as const satisfies Record<
   SnapshotCommand,
   keyof CodexSnapshot['capabilities'] | null
@@ -206,6 +214,14 @@ export function createCodexController(bridge: CodexBridge = codexNativeBridge) {
     if (blocked()) return false;
     const capability = capabilityFor[command];
     if (capability && !snapshot?.capabilities[capability].enabled) return false;
+    if (
+      command === 'codex_update_account_automation' &&
+      (snapshot?.availability !== 'supported' ||
+        !args ||
+        !('automation' in args) ||
+        !accountAutomationSchema.safeParse(args.automation).success)
+    )
+      return false;
     const target = args && 'id' in args ? args.id : null;
     if (target !== null) {
       const account = snapshot?.accounts.find((a) => a.id === target);
@@ -325,6 +341,17 @@ export function createCodexController(bridge: CodexBridge = codexNativeBridge) {
       set({ pending: null, pendingId: null });
     }
   }
+  async function updateAutomation(
+    id: string,
+    automation: AccountAutomation,
+  ): Promise<AccountAutomation | null> {
+    if (!(await action('codex_update_account_automation', { id, automation })))
+      return null;
+    return (
+      state.snapshot?.accounts.find((account) => account.id === id)
+        ?.automation ?? null
+    );
+  }
   async function pollLogin() {
     const session = state.login.session;
     if (disposed || !state.login.open || !session || pollingLogin) return;
@@ -437,6 +464,8 @@ export function createCodexController(bridge: CodexBridge = codexNativeBridge) {
     start,
     read,
     action,
+    updateAutomation,
+    resumeAutomaticReturns: () => action('codex_resume_automatic_returns'),
     discover: () => action('codex_discover'),
     importCurrent: () => action('codex_import_current'),
     importSwitcher: () => action('codex_import_switcher'),

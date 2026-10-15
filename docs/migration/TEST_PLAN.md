@@ -130,6 +130,15 @@ The [future provider plan](FUTURE_CODEX.md) defines C00–C04 gates. Add test gr
 
 ## 8. Commands and completion record
 
+### 0.2.4 account automation acceptance
+
+- Legacy threshold/default and encrypted-record shape remain compatible; editing either provider default does not change the other. Per-account overrides persist and determine candidate eligibility, headroom, cadence and displayed status.
+- Both providers expose the same inherited/custom percent-used field, inclusion, ascending priority and opt-in natural-reset return. Decimal entry, Romanian comma entry, deliberate stepping, wheel safety, save errors, exact saved confirmation and visible Save/Cancel controls are covered by renderer fixtures.
+- Excluded accounts never become automatic destinations, including Claude last-resort reset switches. Existing weekly ordering stays unchanged with default preferences.
+- Return requires previously observed spent five-hour usage, a passed reset and fresh target revalidation; weekly/model blockers, missing windows, failed quota reads, external identity changes and unsupported capabilities suspend it.
+- Manual selection holds returns for 15 minutes and resume clears the hold. Return markers, handled reset identity and cooldown survive restart; one reset cannot repeatedly pull the user back and failed reads do not create a polling loop.
+- Test only temporary homes, injected keys, synthetic accounts and fake provider transports. Local installation checks inspect registration, executable bytes and opaque encrypted-file hashes without decrypting account state or exercising authenticated endpoints.
+
 The public repository validation command is:
 
 ```sh

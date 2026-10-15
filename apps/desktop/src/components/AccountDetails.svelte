@@ -6,6 +6,8 @@
   import Icon from './Icon.svelte';
   import StatusLabel from './StatusLabel.svelte';
   import UsageMeters from './UsageMeters.svelte';
+  import AccountAutomationEditor from './AccountAutomation.svelte';
+  import type { AccountAutomation } from '../lib/types';
   let {
     row,
     now,
@@ -18,6 +20,9 @@
     onswitch,
     onsignin,
     ondelete,
+    onautomation,
+    automationSupported = true,
+    automationError = null,
   }: {
     row: AccountRowView;
     now: number;
@@ -31,6 +36,11 @@
     onswitch: (trigger: HTMLElement) => void;
     onsignin: (trigger: HTMLElement) => void;
     ondelete: (trigger: HTMLElement) => void;
+    onautomation: (
+      automation: AccountAutomation,
+    ) => Promise<AccountAutomation | null>;
+    automationSupported?: boolean;
+    automationError?: string | null;
   } = $props();
   const uid = $props.id();
 </script>
@@ -77,6 +87,14 @@
     </div>
   </dl>
   {@render extra?.()}
+  <AccountAutomationEditor
+    automation={row.automation}
+    providerDefault={threshold}
+    {locked}
+    supported={automationSupported}
+    error={automationError}
+    onsave={onautomation}
+  />
   <div class="actions">
     <button
       class="delete"

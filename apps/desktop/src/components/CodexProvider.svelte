@@ -516,6 +516,7 @@
   }}
   onrefresh={(row) => void controller.refreshAccount(row.id)}
   ondelete={askDelete}
+  onresume={() => void controller.resumeAutomaticReturns()}
 >
   {#snippet providerCard()}
     {#if activeRaw?.authKind === 'chatgpt'}
@@ -610,6 +611,13 @@
       onswitch={() => void switchTo(details!, returnFocus)}
       onsignin={() => signIn(details, returnFocus)}
       ondelete={() => askDelete(details!, returnFocus)}
+      onautomation={(automation) =>
+        controller.updateAutomation(details!.id, automation)}
+      automationSupported={snapshot?.availability === 'supported' &&
+        saved?.authKind === 'chatgpt'}
+      automationError={$controller.error
+        ? codexMessage($controller.error, $language)
+        : null}
     >
       {#snippet extra()}
         {#if saved?.authKind === 'chatgpt'}

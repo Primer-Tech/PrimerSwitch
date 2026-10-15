@@ -254,6 +254,15 @@ dialog::backdrop {
   margin-top: 24px;
   flex-wrap: wrap;
 }
+.sticky-actions {
+  position: sticky;
+  bottom: -22px;
+  z-index: 2;
+  background: var(--surface);
+  border-top: 1px solid var(--line);
+  padding: 12px 0 4px;
+  box-shadow: 0 -8px 12px var(--surface);
+}
 fieldset {
   border: 0;
   padding: 0;
@@ -295,7 +304,8 @@ fieldset {
   font-weight: 500;
 }
 .settings-control select,
-.settings-control input[type='number'] {
+.settings-control input[type='number'],
+.settings-control input[type='text'] {
   width: 100%;
 }
 .range-labels {

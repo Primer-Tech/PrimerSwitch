@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum CodexReason {
+    InvalidAutomation,
     NotInstalled,
     UnsupportedVersion,
     UnsupportedStore,
@@ -172,6 +173,10 @@ pub struct CodexAccountView {
     pub quota_state: CodexQuotaState,
     pub error: Option<CodexReason>,
     pub needs_sign_in: bool,
+    pub automation: crate::AccountAutomationView,
+    pub effective_threshold: f64,
+    pub exhausted: bool,
+    pub frees_at: Option<i64>,
     pub reset: CodexResetView,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -220,6 +225,7 @@ pub struct CodexSnapshot {
     pub demo: bool,
     pub switching: Option<CodexSwitchView>,
     pub last_switch: Option<CodexLastSwitchView>,
+    pub return_hold_until: Option<i64>,
     pub environment: CodexEnvironmentView,
     pub warnings: Vec<CodexReason>,
 }
@@ -275,6 +281,7 @@ impl CodexSnapshot {
             demo,
             switching: None,
             last_switch: None,
+            return_hold_until: None,
             environment: CodexEnvironmentView::default(),
             warnings: Vec::new(),
         }

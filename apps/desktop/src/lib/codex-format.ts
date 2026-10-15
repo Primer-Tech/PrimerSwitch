@@ -10,6 +10,7 @@ import type {
 } from './codex-types';
 
 const reasonKeys: Record<CodexReason, MessageKey> = {
+  invalidAutomation: 'codexReason_invalidAutomation',
   notInstalled: 'codexReason_notInstalled',
   unsupportedVersion: 'codexReason_unsupportedVersion',
   unsupportedStore: 'codexReason_unsupportedStore',

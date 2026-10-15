@@ -38,6 +38,34 @@ function deferred<T>() {
 }
 
 describe('redacted IPC and runtime reconciliation', () => {
+  it('saves local automation using a stable account ID, accepts authoritative preferences, and blocks invalid/demo edits', async () => {
+    const { c, call, event } = setup();
+    await c.start();
+    const preference = {
+      enabled: true,
+      threshold: 81.125,
+      priority: 1,
+      returnOnFiveHourReset: true,
+    };
+    const saved = snapshot({ revision: 2, returnHoldUntil: 900 });
+    saved.accounts[1].automation = preference;
+    saved.accounts[1].effectiveThreshold = 81.125;
+    call.mockResolvedValueOnce(saved);
+    expect(await c.updateAutomation('b', preference)).toEqual(preference);
+    expect(call).toHaveBeenLastCalledWith('update_account_automation', {
+      id: 'b',
+      automation: preference,
+    });
+    const before = call.mock.calls.length;
+    expect(
+      await c.updateAutomation('b', { ...preference, threshold: 49 }),
+    ).toBeNull();
+    expect(await c.updateAutomation('missing', preference)).toBeNull();
+    event(snapshot({ revision: 3, demo: true }));
+    expect(await c.updateAutomation('b', preference)).toBeNull();
+    expect(await c.resumeAutomaticReturns()).toBe(false);
+    expect(call.mock.calls.length).toBe(before);
+  });
   it('keeps the latest revision when an old command response arrives', async () => {
     const { c, call, event } = setup();
     await c.start();

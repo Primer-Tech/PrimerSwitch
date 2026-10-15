@@ -34,6 +34,9 @@ const SIGN_IN_RETRY: i64 = 86_400;
 /// A repeated automatic-switch failure for the same target and cause notifies at most
 /// this often; every failure still updates the in-app status.
 const SWITCH_FAILURE_NOTICE: i64 = 1800;
+const MANUAL_RETURN_HOLD: i64 = 900;
+const AUTOMATIC_RETURN_COOLDOWN: i64 = 600;
+const RETURN_RETRY_FLOOR: i64 = 120;
 
 pub trait Clock: Send + Sync {
     fn now(&self) -> i64;
@@ -297,6 +300,8 @@ struct Reading {
     /// `SIGN_IN_RETRY` until a new sign-in or an explicit refresh succeeds.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     sign_in_required: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    return_attempt_at: Option<i64>,
 }
 #[derive(Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -305,6 +310,10 @@ struct Persisted {
     settings: Settings,
     readings: BTreeMap<String, Reading>,
     last_refresh_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    return_hold_until: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_auto_switch_at: Option<i64>,
 }
 struct PreviewFile {
     account: StoredAccount,
@@ -383,6 +392,8 @@ enum Command {
     Switch(String),
     Delete(String),
     Renewal(String, Option<u8>),
+    Automation(String, AccountAutomation),
+    ResumeReturns,
     Settings(Settings),
     ImportCurrent,
     BeginLogin(u64),
@@ -452,6 +463,10 @@ impl RuntimeHandle {
             .map_err(|_| RuntimeError::Settings)?;
         // A cached owner assertion from another process is not a runtime proof.
         for account in &mut saved.accounts {
+            account
+                .automation
+                .validate()
+                .map_err(|_| RuntimeError::Settings)?;
             account.identity_verified = false;
         }
         let login_intent = Arc::new(AtomicU64::new(0));
@@ -655,25 +670,15 @@ impl RuntimeHandle {
                 let ordinary = {
                     let engine = handle.inner.owner.lock().await;
                     let now = engine.clock.now();
-                    engine.last_full_at.is_none_or(|last| {
-                        now < last || now - last >= engine.saved.settings.poll_interval as i64
-                    })
+                    engine.return_check_due(now)
+                        || engine.last_full_at.is_none_or(|last| {
+                            now < last || now - last >= engine.saved.settings.poll_interval as i64
+                        })
                 };
                 let _ = handle.run(Command::Tick(ordinary), None).await;
                 let delay = {
                     let engine = handle.inner.owner.lock().await;
-                    let active = engine
-                        .active_id
-                        .as_ref()
-                        .and_then(|id| engine.saved.accounts.iter().find(|a| &a.id == id))
-                        .and_then(|a| a.last_usage.as_ref());
-                    next_poll_delay(
-                        engine.saved.settings.poll_interval,
-                        active,
-                        engine.saved.settings.threshold,
-                        engine.active_model.as_deref(),
-                        engine.exhausted,
-                    )
+                    engine.poll_delay()
                 };
                 drop(handle);
                 tokio::time::sleep(Duration::from_secs(delay)).await;
@@ -836,6 +841,17 @@ impl RuntimeHandle {
         self.snapshot_command(Command::Settings(settings.into()))
             .await
     }
+    pub async fn update_account_automation(
+        &self,
+        id: &str,
+        automation: AccountAutomationView,
+    ) -> Result<Snapshot, RuntimeError> {
+        self.snapshot_command(Command::Automation(id.into(), automation.into()))
+            .await
+    }
+    pub async fn resume_automatic_returns(&self) -> Result<Snapshot, RuntimeError> {
+        self.snapshot_command(Command::ResumeReturns).await
+    }
     pub async fn import_current(&self) -> Result<Snapshot, RuntimeError> {
         self.snapshot_command(Command::ImportCurrent).await
     }
@@ -893,6 +909,160 @@ impl RuntimeHandle {
 }
 
 impl Engine {
+    fn threshold(&self) -> f64 {
+        self.saved.settings.threshold_for(ProviderId::Claude)
+    }
+    /// Remember a window spent up to this account's switch threshold, with an
+    /// observed reset. The handled ledger prevents recapturing the same reset.
+    fn record_return_window(&mut self, id: &str) -> Result<(), RuntimeError> {
+        let now = self.clock.now();
+        let default = self.threshold();
+        let i = self.index(id)?;
+        let a = &mut self.saved.accounts[i];
+        if a.automation.return_on_five_hour_reset
+            && let Some(usage) = &a.last_usage
+            && usage.five_hour.utilization >= a.automation.effective_threshold(default)
+            && let Some(observed) = a.last_usage_at.filter(|at| *at <= now)
+            && let Some(reset) = usage.five_hour.resets_at.filter(|reset| *reset > observed)
+            && a.preferred_return_handled_reset_at
+                .is_none_or(|handled| reset > handled)
+        {
+            a.preferred_return_reset_at = Some(reset);
+        }
+        Ok(())
+    }
+    fn active_account(&self) -> Option<&StoredAccount> {
+        self.active_id
+            .as_deref()
+            .and_then(|id| self.saved.accounts.iter().find(|a| a.id == id))
+    }
+    fn returns_paused(&self, now: i64) -> bool {
+        !self.saved.settings.auto_switch_enabled
+            || self
+                .saved
+                .return_hold_until
+                .is_some_and(|until| until > now)
+            || self
+                .saved
+                .last_auto_switch_at
+                .is_some_and(|at| now < at.saturating_add(AUTOMATIC_RETURN_COOLDOWN))
+    }
+    fn is_return_candidate(&self, a: &StoredAccount) -> bool {
+        self.saved.settings.auto_switch_enabled
+            && a.provider == ProviderId::Claude
+            && a.automation.enabled
+            && a.automation.return_on_five_hour_reset
+            && a.pending_reset_claim.is_none()
+            && self.active_id.as_deref() != Some(&a.id)
+            && a.preferred_return_reset_at.is_some_and(|reset| {
+                a.preferred_return_handled_reset_at
+                    .is_none_or(|handled| reset > handled)
+            })
+            && self
+                .active_account()
+                .is_some_and(|active| a.automation.is_higher_priority_than(&active.automation))
+    }
+    fn recovery_headroom(&self, a: &StoredAccount, reset: i64, now: i64) -> bool {
+        let Some(usage) = &a.last_usage else {
+            return false;
+        };
+        let info = AccountUsageInfo {
+            account: a.clone(),
+            usage: Some(usage.clone()),
+            is_active: false,
+        };
+        // A known date must identify a later period. Explicit zero with no new
+        // date is an unused recovered window, so no inference is needed to start it.
+        usage
+            .five_hour
+            .resets_at
+            .map_or(usage.five_hour.utilization == 0.0, |at| {
+                at > now && at > reset
+            })
+            && has_headroom(
+                &info,
+                self.threshold(),
+                self.active_model.as_deref(),
+                HEADROOM_MARGIN,
+            )
+    }
+    fn return_due_at(&self, a: &StoredAccount) -> Option<i64> {
+        if !self.is_return_candidate(a) {
+            return None;
+        }
+        let now = self.clock.now();
+        let reset = a.preferred_return_reset_at?;
+        let mut due = reset;
+        for at in [
+            self.saved.return_hold_until,
+            self.saved
+                .last_auto_switch_at
+                .map(|at| at.saturating_add(AUTOMATIC_RETURN_COOLDOWN)),
+            a.rate_limited_until,
+            a.last_endpoint_attempt_at
+                .map(|at| at.saturating_add(RETURN_RETRY_FLOOR)),
+            a.refresh_fail_at.map(|at| {
+                at.saturating_add(if self.sign_in_backoff(a, now) {
+                    SIGN_IN_RETRY
+                } else {
+                    900
+                })
+            }),
+            self.saved.readings.get(&a.id).and_then(|r| {
+                r.return_attempt_at.map(|at| {
+                    at.saturating_add(if r.error.is_some() {
+                        900
+                    } else {
+                        RETURN_RETRY_FLOOR
+                    })
+                })
+            }),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            due = due.max(at);
+        }
+        // A fresh post-reset refusal or weekly blockage is evidence to wait for the
+        // ordinary cadence, not a reason to spin on an already elapsed reset.
+        if let Some(at) = a.last_usage_at.filter(|at| *at >= reset)
+            && (!self.recovery_headroom(a, reset, now)
+                || self
+                    .saved
+                    .readings
+                    .get(&a.id)
+                    .is_some_and(|r| r.error.is_some()))
+        {
+            due = due.max(at.saturating_add(self.saved.settings.poll_interval as i64));
+        }
+        Some(due)
+    }
+    fn return_check_due(&self, now: i64) -> bool {
+        self.saved
+            .accounts
+            .iter()
+            .any(|a| self.return_due_at(a).is_some_and(|at| at <= now))
+    }
+    fn poll_delay(&self) -> u64 {
+        let active = self.active_account();
+        let ordinary = next_poll_delay(
+            self.saved.settings.poll_interval,
+            active.and_then(|a| a.last_usage.as_ref()),
+            active.map_or(self.threshold(), |a| {
+                a.automation.effective_threshold(self.threshold())
+            }),
+            self.active_model.as_deref(),
+            self.exhausted,
+        );
+        let now = self.clock.now();
+        self.saved
+            .accounts
+            .iter()
+            .filter_map(|a| self.return_due_at(a))
+            .map(|at| at.saturating_sub(now).max(1) as u64)
+            .min()
+            .map_or(ordinary, |delay| ordinary.min(delay))
+    }
     fn persist(&self) -> Result<(), RuntimeError> {
         self.vault
             .as_ref()
@@ -939,6 +1109,8 @@ impl Engine {
             .as_ref()
             .is_some_and(|fp| fp != &live.identity_fingerprint)
         {
+            self.saved.return_hold_until =
+                Some(self.clock.now().saturating_add(MANUAL_RETURN_HOLD));
             // Another account's login or a logout. Only the previous active account (the
             // CLI may have rotated its tokens unseen) and the new one (the CLI owns its
             // token now) lose their proofs; every other account's reading stays valid.
@@ -993,13 +1165,13 @@ impl Engine {
         let order = self.saved.settings.candidate_order();
         let next = best_candidate(
             &infos,
-            self.saved.settings.threshold,
+            self.threshold(),
             self.active_model.as_deref(),
             order,
         );
         let plan = consumption_plan(
             &infos,
-            self.saved.settings.threshold,
+            self.threshold(),
             self.active_model.as_deref(),
             order,
         );
@@ -1009,6 +1181,7 @@ impl Engine {
             .iter()
             .filter(|a| a.provider == ProviderId::Claude)
             .map(|a| {
+                let threshold = a.automation.effective_threshold(self.threshold());
                 let usage = a.last_usage.as_ref();
                 let offers = a.reset_status.as_ref().map(|s| s.available(now));
                 let available = offers.as_ref().map(|gs| {
@@ -1016,9 +1189,8 @@ impl Engine {
                         .fold(0_u32, |sum, g| sum.saturating_add(g.resets_left))
                 });
                 let exhausted = usage.is_some_and(|u| {
-                    u.five_hour.utilization >= self.saved.settings.threshold
-                        || u.weekly_utilization_for_model(self.active_model.as_deref())
-                            >= self.saved.settings.threshold
+                    u.five_hour.utilization >= threshold
+                        || u.weekly_utilization_for_model(self.active_model.as_deref()) >= threshold
                 });
                 let reading = self.saved.readings.get(&a.id);
                 AccountView {
@@ -1026,6 +1198,8 @@ impl Engine {
                     name: safe_label(&a.name),
                     email: safe_label(a.email().unwrap_or(&a.name)),
                     provider: a.provider,
+                    automation: (&a.automation).into(),
+                    effective_threshold: threshold,
                     active: self.active_id.as_deref() == Some(&a.id),
                     is_next: next.as_deref() == Some(&a.id),
                     exhausted,
@@ -1038,13 +1212,9 @@ impl Engine {
                         .and_then(|r| r.error.as_deref())
                         .map(|text| error_code(text).to_owned()),
                     sign_in_required: reading.is_some_and(|r| r.sign_in_required),
-                    frees_at: usage.filter(|_| exhausted).and_then(|u| {
-                        frees_at(
-                            u,
-                            self.saved.settings.threshold,
-                            self.active_model.as_deref(),
-                        )
-                    }),
+                    frees_at: usage
+                        .filter(|_| exhausted)
+                        .and_then(|u| frees_at(u, threshold, self.active_model.as_deref())),
                     subscription_status: a.subscription_status.as_deref().map(safe_label),
                     plan_tier: a.plan_tier.as_deref().map(safe_label),
                     renewal_day: a.renewal_day,
@@ -1072,6 +1242,7 @@ impl Engine {
             accounts,
             active_id: self.active_id.clone(),
             active_model: self.active_model.clone(),
+            return_hold_until: self.saved.return_hold_until.filter(|until| *until > now),
             settings: SettingsView::from(&self.saved.settings),
             last_refresh_at: self.saved.last_refresh_at,
             busy,
@@ -1091,6 +1262,10 @@ impl Engine {
                 self.saved.last_refresh_at = Some(self.clock.now());
             }
             Command::Switch(id) => {
+                self.index(&id)?;
+                self.saved.return_hold_until =
+                    Some(self.clock.now().saturating_add(MANUAL_RETURN_HOLD));
+                self.persist()?;
                 self.switch_to(&id, false, false).await?;
             }
             Command::Delete(id) => {
@@ -1111,6 +1286,15 @@ impl Engine {
             Command::Settings(settings) => {
                 settings.validate().map_err(|_| RuntimeError::Settings)?;
                 self.saved.settings = settings;
+            }
+            Command::Automation(id, automation) => {
+                automation.validate().map_err(|_| RuntimeError::Settings)?;
+                let i = self.index(&id)?;
+                self.saved.accounts[i].automation = automation;
+                self.record_return_window(&id)?;
+            }
+            Command::ResumeReturns => {
+                self.saved.return_hold_until = None;
             }
             Command::ImportCurrent => self.import_current().await?,
             Command::BeginLogin(epoch) => {
@@ -1619,6 +1803,15 @@ impl Engine {
         force: bool,
         fast: bool,
     ) -> Result<(), RuntimeError> {
+        self.poll_account_with_priming(id, force, fast, true).await
+    }
+    async fn poll_account_with_priming(
+        &mut self,
+        id: &str,
+        force: bool,
+        fast: bool,
+        allow_priming: bool,
+    ) -> Result<(), RuntimeError> {
         let expected = self.live()?.identity_fingerprint;
         let active = self.active_id.as_deref() == Some(id);
         let i = self.index(id)?;
@@ -1668,6 +1861,7 @@ impl Engine {
                         self.saved.accounts[i].last_usage = Some(usage.clone());
                         self.saved.accounts[i].last_usage_at = Some(self.clock.now());
                         self.saved.readings.entry(id.into()).or_default().complete = read.complete;
+                        self.record_return_window(id)?;
                         if read.accepted {
                             self.resolve_priming_by_inference(id)?;
                         }
@@ -1708,6 +1902,7 @@ impl Engine {
                         self.saved.accounts[i].last_usage = Some(usage);
                         self.saved.accounts[i].last_usage_at = Some(self.clock.now());
                         self.saved.readings.entry(id.into()).or_default().complete = true;
+                        self.record_return_window(id)?;
                     }
                     Err(error) => {
                         if live_usage.is_none() {
@@ -1723,7 +1918,7 @@ impl Engine {
                 return Err(RuntimeError::Provider);
             }
             self.saved.readings.entry(id.into()).or_default().error = None;
-            if !fast {
+            if !fast && allow_priming {
                 self.prime(id, &expected).await?;
             }
             Ok(())
@@ -1750,6 +1945,7 @@ impl Engine {
                     && (force
                         || !a.identity_verified
                         || !recent(a.last_usage_at, now, 900)
+                        || self.return_due_at(a).is_some_and(|at| at <= now)
                         || (self.saved.settings.auto_start_window_enabled
                             && (Self::window_priming_due(
                                 a.expected_five_hour_reset_at,
@@ -1773,7 +1969,23 @@ impl Engine {
                 tokio::time::sleep(Duration::from_secs(8)).await;
             }
             let was_active = self.active_id.as_deref() == Some(id);
-            if let Err(error) = self.poll_account(id, force, !ordinary).await
+            let recovery = !was_active
+                && self
+                    .return_due_at(&self.saved.accounts[self.index(id)?])
+                    .is_some_and(|at| at <= now);
+            if recovery {
+                let i = self.index(id)?;
+                self.saved.accounts[i].identity_verified = false;
+                self.saved
+                    .readings
+                    .entry(id.clone())
+                    .or_default()
+                    .return_attempt_at = Some(now);
+                self.persist()?;
+            }
+            if let Err(error) = self
+                .poll_account_with_priming(id, force || recovery, !ordinary, !recovery)
+                .await
                 && was_active
             {
                 active_error = Some((id.clone(), error));
@@ -1796,13 +2008,40 @@ impl Engine {
         fast: bool,
         require_usable: bool,
     ) -> Result<(), RuntimeError> {
+        self.switch_to_preflight(id, fast, require_usable, None)
+            .await
+    }
+    async fn switch_to_preflight(
+        &mut self,
+        id: &str,
+        fast: bool,
+        require_usable: bool,
+        return_reset: Option<i64>,
+    ) -> Result<(), RuntimeError> {
         self.observe_active()?;
         let expected = self.live()?.identity_fingerprint;
         self.index(id)?;
         if self.active_id.as_deref() == Some(id) {
             return Ok(());
         }
-        self.poll_account(id, true, fast).await?;
+        if return_reset.is_some() && self.returns_paused(self.clock.now()) {
+            return Err(RuntimeError::Provider);
+        }
+        if let Some(reset) = return_reset {
+            let i = self.index(id)?;
+            if !recent(
+                self.saved.accounts[i].profile_checked_at,
+                self.clock.now(),
+                120,
+            ) || self.saved.accounts[i]
+                .profile_checked_at
+                .is_none_or(|at| at < reset)
+            {
+                self.saved.accounts[i].identity_verified = false;
+            }
+        }
+        self.poll_account_with_priming(id, true, fast, return_reset.is_none())
+            .await?;
         self.ensure_context(&expected)?;
         let i = self.index(id)?;
         if !self.saved.accounts[i].identity_verified {
@@ -1822,16 +2061,37 @@ impl Engine {
             // inference; it never sends metadata), so model rows keep the normal
             // freshness rule instead of a 120-second one no fast tick can meet.
             if !self.fresh(&target)
+                || !target.automation.enabled
                 || !recent(target.last_usage_at, now, 120)
                 || (!fast && self.active_model.is_some() && !recent(reading.scoped_at, now, 120))
-                || !is_usable(
-                    &info,
-                    self.saved.settings.threshold,
-                    self.active_model.as_deref(),
-                )
+                || !is_usable(&info, self.threshold(), self.active_model.as_deref())
             {
                 return Err(RuntimeError::Provider);
             }
+        }
+        if let Some(reset) = return_reset {
+            let now = self.clock.now();
+            if reset > now
+                || self.returns_paused(now)
+                || self
+                    .active_account()
+                    .is_none_or(|active| active.last_usage.is_none() || !self.fresh(active))
+                || !self.is_return_candidate(&target)
+                || !self.recovery_headroom(&target, reset, now)
+                || target.last_usage_at.is_none_or(|at| at < reset)
+                || target
+                    .last_endpoint_read_at
+                    .is_none_or(|at| at < reset || !recent(Some(at), now, 120))
+                || target
+                    .profile_checked_at
+                    .is_none_or(|at| at < reset || !recent(Some(at), now, 120))
+            {
+                return Err(RuntimeError::Provider);
+            }
+            // Only an actual credential mutation starts the shared cooldown. A
+            // blocked quota or failed read on one target must not starve another.
+            self.saved.last_auto_switch_at = Some(now);
+            self.persist()?;
         }
         self.capture_and_switch(&target, &expected).await?;
         let live = self.live()?;
@@ -1840,6 +2100,10 @@ impl Engine {
         self.exhausted = false;
         let i = self.index(id)?;
         self.saved.accounts[i].identity_verified = true;
+        if let Some(reset) = return_reset {
+            self.saved.accounts[i].preferred_return_handled_reset_at = Some(reset);
+            self.saved.accounts[i].preferred_return_reset_at = None;
+        }
         self.persist()?;
         self.notify(format!(
             "{} {}",
@@ -2091,6 +2355,7 @@ impl Engine {
                 self.saved.accounts[i].last_usage = Some(usage);
                 self.saved.accounts[i].last_usage_at = Some(self.clock.now());
                 self.saved.readings.entry(id.into()).or_default().complete = read.complete;
+                self.record_return_window(id)?;
                 let a = &mut self.saved.accounts[i];
                 if let Some(old) = five {
                     a.five_hour_primed_for_reset_at = Some(old);
@@ -2162,7 +2427,10 @@ impl Engine {
     /// not let last-resort exhaustion be assumed).
     fn decision_infos(&self, now: i64, offers_any_age: bool) -> Vec<AccountUsageInfo> {
         let mut infos = self.infos(true);
-        let all_fresh = infos.iter().all(|i| i.usage.is_some());
+        let all_fresh = infos
+            .iter()
+            .filter(|i| i.is_active || i.account.automation.enabled)
+            .all(|i| i.usage.is_some());
         for info in &mut infos {
             if !offers_any_age && !recent(info.account.reset_status_at, now, 120) {
                 info.account.reset_status = None;
@@ -2189,7 +2457,7 @@ impl Engine {
             .collect();
         for action in decide_resets(
             &self.decision_infos(now, true),
-            self.saved.settings.threshold,
+            self.threshold(),
             self.active_model.as_deref(),
             now,
         ) {
@@ -2226,6 +2494,9 @@ impl Engine {
     }
     async fn automate(&mut self, fast: bool) -> Result<(), RuntimeError> {
         let now = self.clock.now();
+        if self.automatic_return(fast).await? {
+            return Ok(());
+        }
         if self.saved.settings.auto_use_resets_enabled {
             if !fast {
                 for id in self.reset_revalidation_targets(now) {
@@ -2284,7 +2555,7 @@ impl Engine {
             }
             for action in decide_resets(
                 &self.decision_infos(now, false),
-                self.saved.settings.threshold,
+                self.threshold(),
                 self.active_model.as_deref(),
                 now,
             ) {
@@ -2294,11 +2565,16 @@ impl Engine {
                 }
                 // Last resort: an enabled reset may switch to the account holding it
                 // even when ordinary automatic switching is off (B17).
-                if action.switch_first
-                    && let Err(error) = self.switch_to(&action.account_id, fast, false).await
-                {
-                    self.switch_failed(&action.account_id, &error, now);
-                    return Err(error);
+                if action.switch_first {
+                    if !self.saved.accounts[i].automation.enabled {
+                        continue;
+                    }
+                    self.saved.last_auto_switch_at = Some(now);
+                    self.persist()?;
+                    if let Err(error) = self.switch_to(&action.account_id, fast, false).await {
+                        self.switch_failed(&action.account_id, &error, now);
+                        return Err(error);
+                    }
                 }
                 let reset = match self.claim(&action.account_id, &action.grant_id, fast).await {
                     Ok(reset) => reset,
@@ -2321,27 +2597,29 @@ impl Engine {
         let Some(active) = infos.iter().find(|i| i.is_active && i.usage.is_some()) else {
             return Ok(());
         };
-        if is_usable(
-            active,
-            self.saved.settings.threshold,
-            self.active_model.as_deref(),
-        ) {
+        if is_usable(active, self.threshold(), self.active_model.as_deref()) {
             self.exhausted = false;
             return Ok(());
         }
         if let Some(candidate) = best_candidate(
             &infos,
-            self.saved.settings.threshold,
+            self.threshold(),
             self.active_model.as_deref(),
             self.saved.settings.candidate_order(),
         ) {
-            if self.saved.settings.auto_switch_enabled
-                && let Err(error) = self.switch_to(&candidate, fast, true).await
-            {
-                self.switch_failed(&candidate, &error, now);
-                return Err(error);
+            if self.saved.settings.auto_switch_enabled {
+                self.saved.last_auto_switch_at = Some(now);
+                self.persist()?;
+                if let Err(error) = self.switch_to(&candidate, fast, true).await {
+                    self.switch_failed(&candidate, &error, now);
+                    return Err(error);
+                }
             }
-        } else if infos.iter().all(|i| i.usage.is_some()) {
+        } else if infos
+            .iter()
+            .filter(|i| i.is_active || i.account.automation.enabled)
+            .all(|i| i.usage.is_some())
+        {
             self.exhausted = true;
             if self
                 .last_exhausted_notice
@@ -2350,11 +2628,12 @@ impl Engine {
                 self.last_exhausted_notice = Some(now);
                 let earliest = infos
                     .iter()
+                    .filter(|i| i.is_active || i.account.automation.enabled)
                     .filter_map(|i| {
                         let usage = i.usage.as_ref()?;
                         let at = frees_at(
                             usage,
-                            self.saved.settings.threshold,
+                            i.account.automation.effective_threshold(self.threshold()),
                             self.active_model.as_deref(),
                         )?;
                         Some((at, i.account.id.clone()))
@@ -2384,6 +2663,107 @@ impl Engine {
             }
         }
         Ok(())
+    }
+    /// Return after a natural five-hour recovery. This path never primes a window
+    /// or consumes a reset credit, and reuses the normal transactional switch.
+    async fn automatic_return(&mut self, fast: bool) -> Result<bool, RuntimeError> {
+        let now = self.clock.now();
+        if let Some(active) = self.active_account().cloned()
+            && let Some(reset) = active
+                .preferred_return_reset_at
+                .filter(|reset| *reset <= now)
+            && self.fresh(&active)
+            && active.last_usage_at.is_some_and(|at| at >= reset)
+            && self.recovery_headroom(&active, reset, now)
+        {
+            let i = self.index(&active.id)?;
+            self.saved.accounts[i].preferred_return_reset_at = None;
+            self.saved.accounts[i].preferred_return_handled_reset_at = Some(reset);
+            self.persist()?;
+        }
+        // Like exhaustion switching (B14), returns need a current proof for the
+        // active account as well as the target; a failed active check suspends them.
+        if fast
+            || self.returns_paused(now)
+            || self
+                .active_account()
+                .is_none_or(|active| active.last_usage.is_none() || !self.fresh(active))
+        {
+            return Ok(false);
+        }
+        let mut candidates: Vec<_> = self
+            .saved
+            .accounts
+            .iter()
+            .filter(|a| {
+                self.is_return_candidate(a)
+                    && a.preferred_return_reset_at
+                        .is_some_and(|reset| reset <= now)
+                    && !(self.fresh(a)
+                        && a.last_usage_at
+                            .is_some_and(|at| at >= a.preferred_return_reset_at.unwrap())
+                        && !self.recovery_headroom(a, a.preferred_return_reset_at.unwrap(), now))
+                    && (self.return_due_at(a).is_some_and(|due| due <= now)
+                        || (self.fresh(a)
+                            && self.recovery_headroom(
+                                a,
+                                a.preferred_return_reset_at.unwrap(),
+                                now,
+                            )
+                            && a.last_endpoint_read_at.is_some_and(|at| {
+                                at >= a.preferred_return_reset_at.unwrap()
+                                    && recent(Some(at), now, 120)
+                            })))
+            })
+            .map(|a| {
+                (
+                    a.automation.priority,
+                    a.id.clone(),
+                    a.preferred_return_reset_at.unwrap(),
+                )
+            })
+            .collect();
+        candidates.sort();
+        // Revalidate at most three targets per cycle. Each attempted target has a
+        // durable retry floor, so subsequent checks can reach remaining accounts.
+        for (_, id, reset) in candidates.into_iter().take(3) {
+            self.saved
+                .readings
+                .entry(id.clone())
+                .or_default()
+                .return_attempt_at = Some(now);
+            self.persist()?;
+            match self
+                .switch_to_preflight(&id, false, true, Some(reset))
+                .await
+            {
+                Ok(()) => return Ok(true),
+                Err(error) => {
+                    if error == RuntimeError::ExternalChange {
+                        self.observe_active()?;
+                        self.persist()?;
+                        return Err(error);
+                    }
+                    if self.saved.last_auto_switch_at == Some(now) {
+                        self.switch_failed(&id, &error, now);
+                        return Err(error);
+                    }
+                    if self.returns_paused(self.clock.now()) {
+                        self.persist()?;
+                        return Ok(false);
+                    }
+                    if !matches!(
+                        error,
+                        RuntimeError::Provider
+                            | RuntimeError::Identity
+                            | RuntimeError::SignInRequired
+                    ) {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        Ok(false)
     }
     async fn claim(&mut self, id: &str, grant: &str, fast: bool) -> Result<bool, RuntimeError> {
         let expected = self.live()?.identity_fingerprint;
@@ -2432,14 +2812,9 @@ impl Engine {
             return Err(RuntimeError::PendingReset);
         }
         if !replay
-            && !decide_resets(
-                &infos,
-                self.saved.settings.threshold,
-                self.active_model.as_deref(),
-                now,
-            )
-            .iter()
-            .any(|action| action.account_id == id && action.grant_id == grant)
+            && !decide_resets(&infos, self.threshold(), self.active_model.as_deref(), now)
+                .iter()
+                .any(|action| action.account_id == id && action.grant_id == grant)
         {
             return Err(RuntimeError::Provider);
         }
@@ -2472,6 +2847,13 @@ impl Engine {
             a.pending_reset_claim = None;
         }
         let success = matches!(outcome, ResetOutcome::Reset { .. });
+        if matches!(
+            outcome,
+            ResetOutcome::Reset { .. } | ResetOutcome::AlreadyUsed
+        ) && let Some(reset) = self.saved.accounts[i].preferred_return_reset_at.take()
+        {
+            self.saved.accounts[i].preferred_return_handled_reset_at = Some(reset);
+        }
         if success {
             self.saved.readings.entry(id.into()).or_default().complete = false;
             self.saved.accounts[i].last_usage_at = None;
@@ -2921,6 +3303,7 @@ mod tests {
                 ..Settings::default()
             },
             last_refresh_at: None,
+            ..Persisted::default()
         };
         vault.save(RECORD, &saved).unwrap();
         let clock = Arc::new(FakeClock(AtomicI64::new(now)));
@@ -3491,9 +3874,15 @@ mod tests {
             ..ResetStatus::default()
         });
         engine.saved.accounts[0].reset_status_at = Some(1000);
+        engine.saved.accounts[0].preferred_return_reset_at = Some(10000);
         engine.automate(true).await.unwrap();
         assert_eq!(engine.active_id.as_deref(), Some("a"));
         assert!(!engine.saved.readings["a"].complete);
+        assert_eq!(engine.saved.accounts[0].preferred_return_reset_at, None);
+        assert_eq!(
+            engine.saved.accounts[0].preferred_return_handled_reset_at,
+            Some(10000)
+        );
         assert_eq!(
             fake.calls
                 .lock()
@@ -5088,6 +5477,645 @@ mod tests {
         // Switching works, and a completed switch clears the notice.
         reopened.switch_account("b").await.unwrap();
         assert!(reopened.get_snapshot().notice.is_none());
+    }
+    #[tokio::test]
+    async fn automation_edits_and_provider_defaults_are_exact_local_and_independent() {
+        let fake = Arc::new(Fake::default());
+        let (temp, handle, _clock, _paths) = fixture(
+            vec![account("a", 1000), account("b", 1000)],
+            Some("a"),
+            1000,
+            fake.clone(),
+        );
+        let mut settings: Settings = handle.get_snapshot().settings.into();
+        settings.claude_threshold = Some(99.5);
+        settings.codex_threshold = Some(65.25);
+        handle.update_settings(settings.clone()).await.unwrap();
+        let preferences = AccountAutomationView {
+            enabled: false,
+            threshold: Some(72.75),
+            priority: Some(1),
+            return_on_five_hour_reset: true,
+        };
+        let snapshot = handle
+            .update_account_automation("b", preferences.clone())
+            .await
+            .unwrap();
+        let b = snapshot.accounts.iter().find(|a| a.id == "b").unwrap();
+        assert_eq!(b.automation, preferences);
+        assert_eq!(b.effective_threshold, 72.75);
+        assert_eq!(
+            snapshot
+                .accounts
+                .iter()
+                .find(|a| a.id == "a")
+                .unwrap()
+                .effective_threshold,
+            99.5
+        );
+        assert_eq!(snapshot.settings.codex_threshold, Some(65.25));
+        settings.claude_threshold = Some(88.25);
+        handle.update_settings(settings).await.unwrap();
+        assert_eq!(handle.get_snapshot().settings.codex_threshold, Some(65.25));
+        assert!(fake.calls.lock().unwrap().is_empty());
+        let saved = saved_record(&temp);
+        assert_eq!(
+            saved.accounts[1].credentials,
+            account("b", 1000).credentials
+        );
+        assert_eq!(saved.accounts[1].automation.threshold, Some(72.75));
+        let invalid = AccountAutomationView {
+            threshold: Some(100.5),
+            ..preferences.clone()
+        };
+        assert_eq!(
+            handle
+                .update_account_automation("b", invalid)
+                .await
+                .unwrap_err(),
+            RuntimeError::Settings
+        );
+        assert_eq!(view(&handle, "b").automation, preferences);
+        let json = serde_json::to_string(&handle.get_snapshot()).unwrap();
+        assert!(!json.contains("SENTINEL") && !json.contains("preferred_return"));
+        assert!(serde_json::from_value::<AccountAutomationView>(json!({"enabled":true,"threshold":null,"priority":null,"returnOnFiveHourReset":false,"accessToken":"secret"})).is_err());
+    }
+    #[tokio::test]
+    async fn threshold_rotation_returns_after_natural_reset_without_priming_or_reset_credits() {
+        let fake = Arc::new(Fake::default());
+        let mut preferred = account("a", 1000);
+        preferred.last_usage.as_mut().unwrap().five_hour = UsageWindow {
+            utilization: 80.0,
+            resets_at: Some(1100),
+        };
+        let (temp, handle, clock, paths) = fixture(
+            vec![preferred, account("b", 1000)],
+            Some("a"),
+            1000,
+            fake.clone(),
+        );
+        handle
+            .update_account_automation(
+                "a",
+                AccountAutomationView {
+                    threshold: Some(80.0),
+                    priority: Some(1),
+                    return_on_five_hour_reset: true,
+                    ..AccountAutomationView::default()
+                },
+            )
+            .await
+            .unwrap();
+        handle
+            .update_account_automation(
+                "b",
+                AccountAutomationView {
+                    priority: Some(2),
+                    ..AccountAutomationView::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mut settings: Settings = handle.get_snapshot().settings.into();
+        settings.auto_switch_enabled = true;
+        settings.auto_start_window_enabled = true;
+        settings.auto_use_resets_enabled = true;
+        handle.update_settings(settings).await.unwrap();
+        let mut spent = infer("0.80", "0.20");
+        spent
+            .headers
+            .insert("anthropic-ratelimit-unified-5h-reset".into(), "1100".into());
+        fake.replies
+            .lock()
+            .unwrap()
+            .push_back((INFERENCE_URL, Ok(spent)));
+        handle.tick(true).await.unwrap();
+        assert_eq!(handle.get_snapshot().active_id.as_deref(), Some("b"));
+        assert_eq!(
+            saved_record(&temp).accounts[0].preferred_return_reset_at,
+            Some(1100)
+        );
+        clock.0.store(1100, Ordering::SeqCst);
+        assert!(!handle.inner.owner.lock().await.return_check_due(1100));
+        clock.0.store(1600, Ordering::SeqCst);
+        *fake.usage.lock().unwrap() = json!({"five_hour":{"utilization":0,"resets_at":null},"seven_day":{"utilization":20,"resets_at":null},"limits":[],"cedar_ember":{"grants":[]}});
+        handle.tick(true).await.unwrap();
+        assert_eq!(handle.get_snapshot().active_id.as_deref(), Some("a"));
+        assert_eq!(
+            count(&fake, INFERENCE_URL),
+            2,
+            "only the two ordinary active checks may infer"
+        );
+        assert!(
+            !fake
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.url.ends_with("/reset_rate_limits"))
+        );
+        let saved = saved_record(&temp);
+        assert_eq!(saved.accounts[0].preferred_return_reset_at, None);
+        assert_eq!(
+            saved.accounts[0].preferred_return_handled_reset_at,
+            Some(1100)
+        );
+        assert_eq!(saved.last_auto_switch_at, Some(1600));
+        assert_eq!(read_json(&paths.global_config_file)["keep"], true);
+        drop(handle);
+        let reopened = RuntimeHandle::from_parts(
+            Vault::with_key(temp.path().join("vault"), [7; 32]).unwrap(),
+            ActiveStore::file(paths),
+            ClaudeClient::with_transport("2.1.287", fake.clone()).unwrap(),
+            clock,
+        )
+        .unwrap();
+        let mut engine = reopened.inner.owner.lock().await;
+        let i = engine.index("a").unwrap();
+        engine.saved.accounts[i]
+            .last_usage
+            .as_mut()
+            .unwrap()
+            .five_hour = UsageWindow {
+            utilization: 80.0,
+            resets_at: Some(1100),
+        };
+        engine.saved.accounts[i].last_usage_at = Some(1000);
+        engine.record_return_window("a").unwrap();
+        assert!(
+            engine.saved.accounts[i].preferred_return_reset_at.is_none(),
+            "handled cycle cannot rearm after restart"
+        );
+    }
+    #[tokio::test]
+    async fn natural_return_waits_for_weekly_headroom_and_rejects_nonzero_unknown_new_window() {
+        let fake = Arc::new(Fake::default());
+        let mut b = account("b", 1000);
+        b.last_usage.as_mut().unwrap().five_hour = UsageWindow {
+            utilization: 95.0,
+            resets_at: Some(1100),
+        };
+        let (temp, handle, clock, _paths) =
+            fixture(vec![account("a", 1000), b], Some("a"), 1000, fake.clone());
+        handle
+            .update_account_automation(
+                "b",
+                AccountAutomationView {
+                    priority: Some(1),
+                    return_on_five_hour_reset: true,
+                    ..AccountAutomationView::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mut settings: Settings = handle.get_snapshot().settings.into();
+        settings.auto_switch_enabled = true;
+        handle.update_settings(settings).await.unwrap();
+        for (now, five, seven, reset) in [
+            (1100, 20, 96, Some(10000)),
+            (1400, 20, 20, None),
+            (1700, 20, 20, Some(10000)),
+        ] {
+            clock.0.store(now, Ordering::SeqCst);
+            *fake.usage.lock().unwrap() = json!({"five_hour":{"utilization":five,"resets_at":reset},"seven_day":{"utilization":seven,"resets_at":90000},"limits":[]});
+            handle.tick(true).await.unwrap();
+            assert_eq!(
+                handle.get_snapshot().active_id.as_deref(),
+                Some(if now == 1700 { "b" } else { "a" })
+            );
+            if now < 1700 {
+                assert_eq!(
+                    saved_record(&temp).accounts[1].preferred_return_reset_at,
+                    Some(1100)
+                );
+                assert!(
+                    handle.inner.owner.lock().await.poll_delay() >= 120,
+                    "blocked quota must not spin on elapsed reset"
+                );
+            }
+        }
+    }
+    #[tokio::test]
+    async fn manual_return_hold_survives_restart_and_resume_is_a_local_command() {
+        let fake = Arc::new(Fake::default());
+        let mut b = account("b", 1000);
+        b.last_usage.as_mut().unwrap().five_hour = UsageWindow {
+            utilization: 100.0,
+            resets_at: Some(1100),
+        };
+        let (temp, handle, clock, paths) =
+            fixture(vec![account("a", 1000), b], Some("a"), 1000, fake.clone());
+        handle
+            .update_account_automation(
+                "b",
+                AccountAutomationView {
+                    priority: Some(1),
+                    return_on_five_hour_reset: true,
+                    ..AccountAutomationView::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mut settings: Settings = handle.get_snapshot().settings.into();
+        settings.auto_switch_enabled = true;
+        handle.update_settings(settings).await.unwrap();
+        handle.switch_account("a").await.unwrap();
+        assert!(fake.calls.lock().unwrap().is_empty());
+        assert_eq!(handle.get_snapshot().return_hold_until, Some(1900));
+        clock.0.store(1100, Ordering::SeqCst);
+        handle.tick(true).await.unwrap();
+        assert_eq!(handle.get_snapshot().active_id.as_deref(), Some("a"));
+        drop(handle);
+        let reopened = RuntimeHandle::from_parts(
+            Vault::with_key(temp.path().join("vault"), [7; 32]).unwrap(),
+            ActiveStore::file(paths),
+            ClaudeClient::with_transport("2.1.287", fake.clone()).unwrap(),
+            clock,
+        )
+        .unwrap();
+        assert_eq!(reopened.get_snapshot().return_hold_until, Some(1900));
+        let before = fake.calls.lock().unwrap().len();
+        assert_eq!(
+            reopened
+                .resume_automatic_returns()
+                .await
+                .unwrap()
+                .return_hold_until,
+            None
+        );
+        assert_eq!(fake.calls.lock().unwrap().len(), before);
+        reopened.tick(true).await.unwrap();
+        assert_eq!(reopened.get_snapshot().active_id.as_deref(), Some("b"));
+        assert_eq!(saved_record(&temp).return_hold_until, None);
+    }
+    #[tokio::test]
+    async fn failed_natural_return_keeps_marker_and_retries_with_persisted_backoff() {
+        let fake = Arc::new(Fake::default());
+        let mut b = account("b", 1000);
+        b.last_usage.as_mut().unwrap().five_hour = UsageWindow {
+            utilization: 95.0,
+            resets_at: Some(1100),
+        };
+        let (temp, handle, clock, paths) =
+            fixture(vec![account("a", 1000), b], Some("a"), 1000, fake.clone());
+        handle
+            .update_account_automation(
+                "b",
+                AccountAutomationView {
+                    priority: Some(1),
+                    return_on_five_hour_reset: true,
+                    ..AccountAutomationView::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mut settings: Settings = handle.get_snapshot().settings.into();
+        settings.auto_switch_enabled = true;
+        handle.update_settings(settings).await.unwrap();
+        fake.failing_usage
+            .lock()
+            .unwrap()
+            .push(("token-b", ClientError::InvalidResponse));
+        clock.0.store(1100, Ordering::SeqCst);
+        handle.tick(true).await.unwrap();
+        assert_eq!(handle.get_snapshot().active_id.as_deref(), Some("a"));
+        assert_eq!(view(&handle, "b").error.as_deref(), Some("providerError"));
+        let saved = saved_record(&temp);
+        assert_eq!(saved.accounts[1].preferred_return_reset_at, Some(1100));
+        assert_eq!(saved.readings["b"].return_attempt_at, Some(1100));
+        let profiles = count(&fake, PROFILE_URL);
+        clock.0.store(1220, Ordering::SeqCst);
+        handle.tick(true).await.unwrap();
+        assert_eq!(count(&fake, PROFILE_URL), profiles);
+        drop(handle);
+        fake.failing_usage.lock().unwrap().clear();
+        let reopened = RuntimeHandle::from_parts(
+            Vault::with_key(temp.path().join("vault"), [7; 32]).unwrap(),
+            ActiveStore::file(paths),
+            ClaudeClient::with_transport("2.1.287", fake.clone()).unwrap(),
+            clock.clone(),
+        )
+        .unwrap();
+        assert!(!reopened.inner.owner.lock().await.return_check_due(1220));
+        clock.0.store(2000, Ordering::SeqCst);
+        reopened.tick(true).await.unwrap();
+        assert_eq!(reopened.get_snapshot().active_id.as_deref(), Some("b"));
+    }
+    #[tokio::test]
+    async fn natural_return_skips_a_weekly_blocked_higher_priority_account() {
+        let fake = Arc::new(Fake::default());
+        let mut b = account("b", 1000);
+        let mut c = account("c", 1000);
+        for a in [&mut b, &mut c] {
+            a.automation = AccountAutomation {
+                priority: Some(if a.id == "b" { 1 } else { 2 }),
+                return_on_five_hour_reset: true,
+                ..AccountAutomation::default()
+            };
+            a.preferred_return_reset_at = Some(1100);
+        }
+        let (temp, handle, clock, _paths) = fixture(
+            vec![account("a", 1000), b, c],
+            Some("a"),
+            1000,
+            fake.clone(),
+        );
+        clock.0.store(1400, Ordering::SeqCst);
+        let mut engine = handle.inner.owner.lock().await;
+        engine.saved.settings.auto_switch_enabled = true;
+        for a in &mut engine.saved.accounts {
+            a.identity_verified = true;
+            a.last_usage_at = Some(1100);
+            a.last_endpoint_read_at = Some(1100);
+            a.last_endpoint_attempt_at = Some(1100);
+            a.profile_checked_at = Some(1100);
+        }
+        let b = engine.index("b").unwrap();
+        engine.saved.accounts[b]
+            .last_usage
+            .as_mut()
+            .unwrap()
+            .seven_day
+            .utilization = 98.0;
+        // Priority1's post-reset weekly blockage is known. Priority2 is fresh but
+        // requires a current identity/quota preflight before the transaction.
+        assert!(engine.automatic_return(false).await.unwrap());
+        assert_eq!(engine.active_id.as_deref(), Some("c"));
+        assert_eq!(
+            saved_record(&temp).accounts[b].preferred_return_reset_at,
+            Some(1100)
+        );
+        assert_eq!(saved_record(&temp).last_auto_switch_at, Some(1400));
+        assert!(!fake.calls.lock().unwrap().iter().any(|request| {
+            request
+                .headers
+                .get("authorization")
+                .is_some_and(|token| token.contains("token-b"))
+        }));
+    }
+    #[tokio::test]
+    async fn external_manual_selection_before_or_during_return_preflight_is_preserved() {
+        for during in [false, true] {
+            let fake = Arc::new(Fake::default());
+            let mut b = account("b", 1000);
+            b.automation = AccountAutomation {
+                priority: Some(1),
+                return_on_five_hour_reset: true,
+                ..AccountAutomation::default()
+            };
+            b.preferred_return_reset_at = Some(1100);
+            let (temp, handle, clock, paths) = fixture(
+                vec![account("a", 1000), b, account("c", 1000)],
+                Some("a"),
+                1000,
+                fake.clone(),
+            );
+            clock.0.store(1100, Ordering::SeqCst);
+            let select_c = move || {
+                let c = account("c", 1000);
+                std::fs::write(
+                    &paths.credentials_file,
+                    serde_json::to_vec(&c.credentials).unwrap(),
+                )
+                .unwrap();
+                std::fs::write(
+                    &paths.global_config_file,
+                    serde_json::to_vec(&json!({"oauthAccount":c.oauth_account,"keep":true}))
+                        .unwrap(),
+                )
+                .unwrap();
+            };
+            if during {
+                *fake.hook.lock().unwrap() = Some(Box::new(move |_| select_c()));
+            } else {
+                select_c();
+            }
+            let mut engine = handle.inner.owner.lock().await;
+            engine.saved.settings.auto_switch_enabled = true;
+            engine.saved.accounts[0].identity_verified = true;
+            let result = engine.automatic_return(false).await;
+            if during {
+                assert_eq!(result.unwrap_err(), RuntimeError::ExternalChange);
+            } else {
+                assert!(!result.unwrap());
+            }
+            assert_eq!(engine.active_id.as_deref(), Some("c"));
+            assert_eq!(engine.live().unwrap().identity["accountUuid"], "c");
+            assert_eq!(saved_record(&temp).return_hold_until, Some(2000));
+            assert_eq!(
+                saved_record(&temp).accounts[1].preferred_return_reset_at,
+                Some(1100)
+            );
+            assert!(saved_record(&temp).last_auto_switch_at.is_none());
+        }
+    }
+    #[tokio::test]
+    async fn return_mutation_failure_keeps_marker_and_persists_cooldown_across_restart() {
+        let fake = Arc::new(Fake::default());
+        let mut b = account("b", 1000);
+        b.automation = AccountAutomation {
+            priority: Some(1),
+            return_on_five_hour_reset: true,
+            ..AccountAutomation::default()
+        };
+        b.preferred_return_reset_at = Some(1100);
+        let (temp, handle, clock, paths) =
+            fixture(vec![account("a", 1000), b], Some("a"), 1000, fake.clone());
+        clock.0.store(1100, Ordering::SeqCst);
+        // The fixture's contextual switch lock is held by another local writer.
+        let lock_path = temp
+            .path()
+            .join("vault")
+            .join(format!(".context-{}.lock", paths.context_id));
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        lock.try_lock().unwrap();
+        let mut engine = handle.inner.owner.lock().await;
+        engine.saved.settings.auto_switch_enabled = true;
+        engine.saved.accounts[0].identity_verified = true;
+        let error = engine.automatic_return(false).await.unwrap_err();
+        assert!(matches!(
+            error,
+            RuntimeError::ExternalChange | RuntimeError::Storage
+        ));
+        assert_eq!(engine.live().unwrap().identity["accountUuid"], "a");
+        let saved = saved_record(&temp);
+        assert_eq!(saved.last_auto_switch_at, Some(1100));
+        assert_eq!(saved.accounts[1].preferred_return_reset_at, Some(1100));
+        drop(engine);
+        lock.unlock().unwrap();
+        drop(lock);
+        drop(handle);
+        let reopened = RuntimeHandle::from_parts(
+            Vault::with_key(temp.path().join("vault"), [7; 32]).unwrap(),
+            ActiveStore::file(paths),
+            ClaudeClient::with_transport("2.1.287", fake).unwrap(),
+            clock,
+        )
+        .unwrap();
+        assert!(reopened.inner.owner.lock().await.returns_paused(1100));
+        assert!(!reopened.inner.owner.lock().await.return_check_due(1100));
+    }
+    #[tokio::test]
+    async fn an_already_active_recovered_account_handles_its_marker_without_another_switch() {
+        let fake = Arc::new(Fake::default());
+        let mut a = account("a", 1000);
+        a.automation = AccountAutomation {
+            priority: Some(1),
+            return_on_five_hour_reset: true,
+            ..AccountAutomation::default()
+        };
+        a.preferred_return_reset_at = Some(1100);
+        let (temp, handle, clock, paths) =
+            fixture(vec![a, account("b", 1000)], Some("a"), 1000, fake.clone());
+        let auth = std::fs::read(&paths.credentials_file).unwrap();
+        clock.0.store(1100, Ordering::SeqCst);
+        handle.tick(true).await.unwrap();
+        assert_eq!(handle.get_snapshot().active_id.as_deref(), Some("a"));
+        assert_eq!(std::fs::read(&paths.credentials_file).unwrap(), auth);
+        let saved = saved_record(&temp);
+        assert_eq!(saved.accounts[0].preferred_return_reset_at, None);
+        assert_eq!(
+            saved.accounts[0].preferred_return_handled_reset_at,
+            Some(1100)
+        );
+        assert!(saved.last_auto_switch_at.is_none());
+    }
+    #[tokio::test]
+    async fn return_scheduling_uses_known_resets_and_respects_priority_inclusion_and_holds() {
+        let fake = Arc::new(Fake::default());
+        let mut b = account("b", 1000);
+        b.automation = AccountAutomation {
+            priority: Some(1),
+            return_on_five_hour_reset: true,
+            ..AccountAutomation::default()
+        };
+        b.preferred_return_reset_at = Some(1400);
+        let (_temp, handle, _clock, _paths) =
+            fixture(vec![account("a", 1000), b], Some("a"), 1000, fake);
+        let mut engine = handle.inner.owner.lock().await;
+        engine.saved.settings.auto_switch_enabled = true;
+        engine.saved.settings.poll_interval = 900;
+        assert_eq!(engine.poll_delay(), 400);
+        engine.saved.last_auto_switch_at = Some(1000);
+        assert_eq!(engine.poll_delay(), 600);
+        engine.saved.return_hold_until = Some(1800);
+        assert_eq!(engine.poll_delay(), 800);
+        let i = engine.index("b").unwrap();
+        engine.saved.accounts[i].automation.enabled = false;
+        assert_eq!(engine.poll_delay(), 900);
+        assert!(!engine.is_return_candidate(&engine.saved.accounts[i]));
+        engine.saved.accounts[i].automation.enabled = true;
+        engine.saved.accounts[i].automation.priority = None;
+        assert!(!engine.is_return_candidate(&engine.saved.accounts[i]));
+        engine.saved.accounts[i].automation.priority = Some(1);
+        engine.saved.accounts[0].automation.priority = Some(1);
+        assert!(!engine.is_return_candidate(&engine.saved.accounts[i]));
+        engine.saved.accounts[0].automation.priority = Some(2);
+        assert!(engine.is_return_candidate(&engine.saved.accounts[i]));
+        engine.saved.accounts[0].automation.threshold = Some(50.0);
+        engine.saved.accounts[0]
+            .last_usage
+            .as_mut()
+            .unwrap()
+            .five_hour
+            .utilization = 48.0;
+        assert_eq!(
+            engine.poll_delay(),
+            30,
+            "near-limit polling uses active account override"
+        );
+    }
+    #[tokio::test]
+    async fn natural_returns_require_fresh_verified_complete_active_usage() {
+        for state in ["failed", "unverified", "stale", "incomplete", "missing"] {
+            let fake = Arc::new(Fake::default());
+            let mut b = account("b", 1000);
+            b.automation = AccountAutomation {
+                priority: Some(1),
+                return_on_five_hour_reset: true,
+                ..AccountAutomation::default()
+            };
+            b.preferred_return_reset_at = Some(1100);
+            b.last_usage_at = Some(1100);
+            b.last_endpoint_read_at = Some(1100);
+            let (temp, handle, clock, paths) =
+                fixture(vec![account("a", 1000), b], Some("a"), 1000, fake.clone());
+            clock.0.store(1100, Ordering::SeqCst);
+            let before = std::fs::read(&paths.credentials_file).unwrap();
+            let mut engine = handle.inner.owner.lock().await;
+            engine.saved.settings.auto_switch_enabled = true;
+            for a in &mut engine.saved.accounts {
+                a.identity_verified = true;
+            }
+            match state {
+                "failed" => {
+                    engine.saved.readings.get_mut("a").unwrap().error = Some("providerError".into())
+                }
+                "unverified" => engine.saved.accounts[0].identity_verified = false,
+                "stale" => engine.saved.accounts[0].last_usage_at = Some(0),
+                "incomplete" => engine.saved.readings.get_mut("a").unwrap().complete = false,
+                "missing" => engine.saved.accounts[0].last_usage = None,
+                _ => unreachable!(),
+            }
+            assert!(!engine.automatic_return(false).await.unwrap(), "{state}");
+            assert_eq!(engine.active_id.as_deref(), Some("a"), "{state}");
+            assert_eq!(
+                std::fs::read(&paths.credentials_file).unwrap(),
+                before,
+                "{state}"
+            );
+            assert!(fake.calls.lock().unwrap().is_empty(), "{state}");
+            let saved = saved_record(&temp);
+            assert_eq!(
+                saved.accounts[1].preferred_return_reset_at,
+                Some(1100),
+                "{state}"
+            );
+            assert!(saved.last_auto_switch_at.is_none(), "{state}");
+            assert!(saved.readings["b"].return_attempt_at.is_none(), "{state}");
+        }
+    }
+    #[tokio::test]
+    async fn failed_active_check_cannot_return_to_an_otherwise_healthy_recovered_target() {
+        let fake = Arc::new(Fake::default());
+        let mut b = account("b", 1000);
+        b.automation = AccountAutomation {
+            priority: Some(1),
+            return_on_five_hour_reset: true,
+            ..AccountAutomation::default()
+        };
+        b.preferred_return_reset_at = Some(1100);
+        let (temp, handle, clock, paths) =
+            fixture(vec![account("a", 1000), b], Some("a"), 1000, fake.clone());
+        let mut settings: Settings = handle.get_snapshot().settings.into();
+        settings.auto_switch_enabled = true;
+        handle.update_settings(settings).await.unwrap();
+        clock.0.store(1100, Ordering::SeqCst);
+        fake.replies
+            .lock()
+            .unwrap()
+            .push_back((INFERENCE_URL, Err(ClientError::Transport)));
+        fake.failing_usage
+            .lock()
+            .unwrap()
+            .push(("token-a", ClientError::InvalidResponse));
+        let before = std::fs::read(&paths.credentials_file).unwrap();
+        assert_eq!(handle.tick(true).await.unwrap_err(), RuntimeError::Provider);
+        assert_eq!(handle.get_snapshot().active_id.as_deref(), Some("a"));
+        assert!(
+            view(&handle, "b").decision_fresh,
+            "the target is recovered and freshly proven"
+        );
+        assert_eq!(std::fs::read(&paths.credentials_file).unwrap(), before);
+        let saved = saved_record(&temp);
+        assert_eq!(saved.accounts[1].preferred_return_reset_at, Some(1100));
+        assert!(saved.last_auto_switch_at.is_none());
     }
     #[tokio::test]
     async fn an_unreadable_cli_file_at_startup_reports_an_error_instead_of_an_empty_window() {

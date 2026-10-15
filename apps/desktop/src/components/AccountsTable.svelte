@@ -4,6 +4,7 @@
   import Icon from './Icon.svelte';
   import QuotaBar from './QuotaBar.svelte';
   import StatusLabel from './StatusLabel.svelte';
+  import { exactPercent } from '../lib/automation';
   type RowAction = (row: AccountRowView, trigger: HTMLElement) => void;
   let {
     rows,
@@ -104,17 +105,38 @@
               </div>
             </div></td
           ><td class="cell-meter"
-            ><QuotaBar compact meter={row.fiveHour} {now} {threshold} /></td
+            ><QuotaBar
+              compact
+              meter={row.fiveHour}
+              {now}
+              threshold={row.effectiveThreshold}
+            /></td
           ><td class="cell-meter"
             ><QuotaBar
               compact
               meter={row.weeklyBinding}
               {now}
-              {threshold}
+              threshold={row.effectiveThreshold}
             /></td
           ><td class="cell-status"
-            ><StatusLabel status={row.status} id={status} /></td
-          ><td class="cell-actions"
+            ><StatusLabel status={row.status} id={status} />
+            <span class="automation-meta"
+              >{t(
+                $language,
+                row.automation.enabled
+                  ? 'rowThresholdUsed'
+                  : 'excludedAutomatic',
+                { threshold: exactPercent(row.effectiveThreshold, $language) },
+              )}</span
+            >
+            {#if row.automation.enabled && row.automation.priority !== null}<span
+                class="automation-meta"
+                >{t($language, 'priorityBadge', {
+                  priority: row.automation.priority,
+                })}{#if row.automation.returnOnFiveHourReset}
+                  · {t($language, 'returnEnabled')}{/if}</span
+              >{/if}
+          </td><td class="cell-actions"
             ><div class="row-actions">
               {#if row.primary === 'signIn'}<button
                   class="switch-button sign-in-button"
@@ -185,6 +207,13 @@
 </div>
 
 <style>
+  .automation-meta {
+    display: block;
+    margin-top: 4px;
+    color: var(--subtle);
+    font-size: 0.67rem;
+    line-height: 1.4;
+  }
   .table-wrap {
     border: 1px solid var(--line);
     border-radius: 9px;

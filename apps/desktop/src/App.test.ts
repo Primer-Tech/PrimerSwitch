@@ -252,7 +252,13 @@ describe('desktop workflows', () => {
     expect(screen.getByRole('slider')).toHaveAttribute('min', '120');
     expect(screen.getByRole('slider')).toHaveAttribute('max', '900');
     expect(screen.getByRole('slider')).toHaveAttribute('step', '30');
-    expect(screen.getByRole('spinbutton')).toHaveValue(99.5);
+    expect(screen.getByLabelText(t('en', 'claudeThresholdUsed'))).toHaveValue(
+      '99.5',
+    );
+    expect(screen.getByLabelText(t('en', 'codexThresholdUsed'))).toHaveValue(
+      '99.5',
+    );
+    expect(screen.queryByRole('spinbutton')).not.toBeInTheDocument();
     expect(screen.getByText(t('en', 'primeHelp'))).toBeVisible();
     // Resets may switch accounts even with automatic switching off (B17): say so.
     expect(
@@ -284,7 +290,12 @@ describe('desktop workflows', () => {
     await fireEvent.click(screen.getByRole('button', { name: 'Save' }));
     await waitFor(() =>
       expect(call).toHaveBeenCalledWith('update_settings', {
-        settings: { ...defaults, preferSoonestWeeklyReset: false },
+        settings: {
+          ...defaults,
+          claudeThreshold: 95,
+          codexThreshold: 95,
+          preferSoonestWeeklyReset: false,
+        },
       }),
     );
     await waitFor(() =>
@@ -329,7 +340,8 @@ describe('desktop workflows', () => {
         ),
     ).toEqual([t('en', 'automaticSwitch'), t('en', 'preferSoonestReset')]);
     expect(shared.getByRole('slider')).toBeVisible();
-    expect(shared.getByRole('spinbutton')).toBeVisible();
+    expect(shared.getByLabelText(t('en', 'claudeThresholdUsed'))).toBeVisible();
+    expect(shared.getByLabelText(t('en', 'codexThresholdUsed'))).toBeVisible();
     expect(shared.getByText(t('en', 'pollingHelp'))).toBeVisible();
     const claudeOnly = within(
       screen.getByRole('group', { name: 'Claude only' }),
@@ -462,9 +474,12 @@ describe('desktop workflows', () => {
     await fireEvent.click(
       screen.getByRole('button', { name: 'Open settings' }),
     );
-    await fireEvent.input(screen.getByRole('spinbutton'), {
-      target: { value: '92' },
-    });
+    await fireEvent.input(
+      screen.getByLabelText(t('en', 'claudeThresholdUsed')),
+      {
+        target: { value: '92' },
+      },
+    );
     await fireEvent.change(screen.getByLabelText('Appearance'), {
       target: { value: 'light' },
     });
@@ -474,13 +489,16 @@ describe('desktop workflows', () => {
     const updated = snapshot({ revision: 3 });
     updated.settings.language = 'ro';
     updated.settings.appearance = 'light';
-    updated.settings.threshold = 92;
+    updated.settings.claudeThreshold = 92;
+    updated.settings.codexThreshold = 95;
     call.mockResolvedValueOnce(updated);
     await fireEvent.click(screen.getByRole('button', { name: 'Salvează' }));
     await waitFor(() =>
       expect(call).toHaveBeenCalledWith('update_settings', {
         settings: expect.objectContaining({
-          threshold: 92,
+          threshold: 95,
+          claudeThreshold: 92,
+          codexThreshold: 95,
           appearance: 'light',
           language: 'ro',
           autoStartWindowEnabled: true,
@@ -493,7 +511,7 @@ describe('desktop workflows', () => {
       screen.getByRole('button', { name: 'Deschide setările' }),
     ).toBeVisible();
     expect(screen.getByText(t('ro', 'claudeSubtitle'))).toBeVisible();
-    expect(section('Automatizare').getByText('92%')).toBeVisible();
+    expect(section('Automatizare').getByText('92% utilizat')).toBeVisible();
   });
   it('names the account in background errors and keeps a dismissed one hidden', async () => {
     const failing = {

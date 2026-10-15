@@ -285,6 +285,7 @@
   }}
   onrefresh={(row) => void run('refresh', row)}
   ondelete={askDelete}
+  onresume={() => void controller.resumeAutomaticReturns()}
 >
   {#snippet providerCard()}
     <section
@@ -343,6 +344,11 @@
       }}
       onsignin={() => signIn(returnFocus)}
       ondelete={() => askDelete(details!, returnFocus)}
+      onautomation={(automation) =>
+        controller.updateAutomation(details!.id, automation)}
+      automationError={$controller.error
+        ? safeError($controller.error, $language)
+        : null}
     >
       {#snippet facts()}
         {#if account}

@@ -1,11 +1,49 @@
 use serde::{Deserialize, Serialize};
-use switcher_core::{ProviderId, Settings, UsageResponse};
+use switcher_core::{AccountAutomation, ProviderId, Settings, UsageResponse};
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AccountAutomationView {
+    pub enabled: bool,
+    pub threshold: Option<f64>,
+    pub priority: Option<u16>,
+    pub return_on_five_hour_reset: bool,
+}
+impl Default for AccountAutomationView {
+    fn default() -> Self {
+        Self::from(&AccountAutomation::default())
+    }
+}
+impl From<&AccountAutomation> for AccountAutomationView {
+    fn from(value: &AccountAutomation) -> Self {
+        Self {
+            enabled: value.enabled,
+            threshold: value.threshold,
+            priority: value.priority,
+            return_on_five_hour_reset: value.return_on_five_hour_reset,
+        }
+    }
+}
+impl From<AccountAutomationView> for AccountAutomation {
+    fn from(value: AccountAutomationView) -> Self {
+        Self {
+            enabled: value.enabled,
+            threshold: value.threshold,
+            priority: value.priority,
+            return_on_five_hour_reset: value.return_on_five_hour_reset,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct SettingsView {
     pub poll_interval: u64,
     pub threshold: f64,
+    #[serde(default)]
+    pub claude_threshold: Option<f64>,
+    #[serde(default)]
+    pub codex_threshold: Option<f64>,
     pub auto_switch_enabled: bool,
     pub auto_start_window_enabled: bool,
     pub auto_use_resets_enabled: bool,
@@ -19,6 +57,8 @@ impl From<&Settings> for SettingsView {
         Self {
             poll_interval: s.poll_interval,
             threshold: s.threshold,
+            claude_threshold: s.claude_threshold,
+            codex_threshold: s.codex_threshold,
             auto_switch_enabled: s.auto_switch_enabled,
             auto_start_window_enabled: s.auto_start_window_enabled,
             auto_use_resets_enabled: s.auto_use_resets_enabled,
@@ -33,6 +73,8 @@ impl From<SettingsView> for Settings {
         Self {
             poll_interval: s.poll_interval,
             threshold: s.threshold,
+            claude_threshold: s.claude_threshold,
+            codex_threshold: s.codex_threshold,
             auto_switch_enabled: s.auto_switch_enabled,
             auto_start_window_enabled: s.auto_start_window_enabled,
             auto_use_resets_enabled: s.auto_use_resets_enabled,
@@ -156,6 +198,8 @@ pub struct AccountView {
     pub name: String,
     pub email: String,
     pub provider: ProviderId,
+    pub automation: AccountAutomationView,
+    pub effective_threshold: f64,
     pub active: bool,
     pub is_next: bool,
     pub exhausted: bool,
@@ -186,6 +230,7 @@ pub struct Snapshot {
     pub accounts: Vec<AccountView>,
     pub active_id: Option<String>,
     pub active_model: Option<String>,
+    pub return_hold_until: Option<i64>,
     pub settings: SettingsView,
     pub last_refresh_at: Option<i64>,
     pub busy: bool,

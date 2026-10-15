@@ -1,6 +1,7 @@
 <script lang="ts">
   import { language, t } from '../lib/i18n';
-  import { percentage } from '../lib/format';
+  import { duration, percentage } from '../lib/format';
+  import { exactPercent } from '../lib/automation';
   import type { Settings } from '../lib/types';
   import type { AutomationItem } from '../lib/provider-view';
   import Icon from './Icon.svelte';
@@ -9,6 +10,11 @@
     settingsDisabled,
     onsettings,
     items = [],
+    threshold,
+    returnHoldUntil,
+    now,
+    locked,
+    onresume,
   }: {
     /** The automation settings both providers share; null until loaded. */
     settings: Settings | null;
@@ -16,6 +22,11 @@
     onsettings: () => void;
     /** Provider-specific lines inside the same card. */
     items?: AutomationItem[];
+    threshold: number;
+    returnHoldUntil: number | null;
+    now: number;
+    locked: boolean;
+    onresume: () => void;
   } = $props();
   let toggles = $derived(
     items.filter((item) => item.kind === 'toggle') as Extract<
@@ -55,8 +66,12 @@
   </p>
   <dl class="automation-list">
     <div>
-      <dt>{t($language, 'switchThreshold')}</dt>
-      <dd>{percentage(settings?.threshold ?? 95, $language)}%</dd>
+      <dt>{t($language, 'providerDefault')}</dt>
+      <dd>
+        {t($language, 'percentUsed', {
+          threshold: exactPercent(threshold, $language),
+        })}
+      </dd>
     </div>
     <div>
       <dt>{t($language, 'pollInterval')}</dt>
@@ -84,6 +99,21 @@
         </dd>
       </div>{/each}
   </dl>
+  <p class="automation-help">{t($language, 'automationDetailsHelp')}</p>
+  {#if returnHoldUntil !== null && returnHoldUntil > now}<div
+      class="return-hold"
+      role="status"
+    >
+      <p>
+        {t($language, 'returnsPaused', {
+          duration: duration(returnHoldUntil, now, $language),
+        })}
+      </p>
+      <button
+        disabled={locked || !settings?.autoSwitchEnabled}
+        onclick={onresume}>{t($language, 'resumeReturns')}</button
+      >
+    </div>{/if}
   {#if notes.length}<ul class="automation-notes">
       {#each notes as note (note.text)}<li data-tone={note.tone}>
           <span class="status-dot"></span>{note.text}
@@ -92,6 +122,27 @@
 </section>
 
 <style>
+  .automation-help {
+    margin: 10px 0 0;
+    color: var(--subtle);
+    font-size: 0.7rem;
+    line-height: 1.5;
+  }
+  .return-hold {
+    margin-top: 12px;
+    padding-top: 10px;
+    border-top: 1px solid var(--line);
+  }
+  .return-hold p {
+    color: var(--subtle);
+    font-size: 0.72rem;
+    line-height: 1.5;
+    margin: 0 0 8px;
+  }
+  .return-hold button {
+    font-size: 0.72rem;
+    min-height: 30px;
+  }
   .automation-state {
     display: flex;
     align-items: center;

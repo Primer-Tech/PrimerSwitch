@@ -112,7 +112,8 @@ export const en = {
   nextUp: 'Next up',
   nextWhySoonest: 'Its weekly limit resets soonest.',
   nextWhyMostLeft: 'It has the most weekly usage left.',
-  nextAutomatic: 'Switches automatically at {threshold}%.',
+  nextAutomatic: 'Switches when {name} reaches {threshold}% used.',
+  nextWhyPriority: 'Priority {priority} among accounts with enough headroom.',
   switchNow: 'Switch now',
   switchNowLabel: 'Switch now to {name}',
   noNext: 'No other account is ready to use.',
@@ -237,9 +238,67 @@ export const en = {
     'Choose an interval between 2 and 15 minutes and a threshold between 50% and 100%.',
   globalPreferences: 'Appearance and language',
   settingsProviderScope:
-    'Automatic switching, the weekly reset order, the check interval and the switch threshold apply to Claude and Codex. Starting the 5-hour and weekly windows and using resets automatically apply to Claude only. Codex resets can be used manually in its account details. Appearance and language apply to both.',
+    'Set a default switch threshold for each provider. Account Details can override it, set a priority and enable returns after the 5-hour reset. Automatic switching, the check interval, weekly order, appearance and language are shared.',
   sharedAutomation: 'Automation for Claude and Codex',
   claudeOnlyAutomation: 'Claude only',
+  providerDefaults: 'Provider defaults',
+  providerDefaultsHelp:
+    'Percent of quota used. Each account inherits its provider default unless you set a custom threshold in Details.',
+  claudeThresholdUsed: 'Claude default · % used',
+  codexThresholdUsed: 'Codex default · % used',
+  percentHelp:
+    '50–100% used. Decimals are accepted; scrolling does not change this value.',
+  invalidPercent:
+    'Enter a number from 50 to 100 using a decimal point or comma. Use fewer decimal places if needed.',
+  decreasePercent: 'Decrease {label} by 1 percentage point',
+  increasePercent: 'Increase {label} by 1 percentage point',
+  providerDefault: 'Provider default',
+  percentUsed: '{threshold}% used',
+  providerDefaultsSaved:
+    'Saved defaults: Claude {claude}% used · Codex {codex}% used.',
+  accountAutomation: 'Account automation',
+  accountAutomationHelp:
+    'Choose when this account switches away, and where it sits in the automatic order.',
+  includeAutomatic: 'Include in automatic switching',
+  includeAutomaticHelp:
+    'Allows PrimerSwitch to select this account automatically. You can still switch to excluded accounts manually.',
+  includedAutomatic: 'Included in automatic switching',
+  excludedAutomatic: 'Manual only',
+  switchThresholdUsed: 'Switch away at · % used',
+  useProviderDefault: 'Use provider default ({threshold}% used)',
+  customThreshold: 'Custom threshold',
+  customThresholdUsed: 'Custom threshold · % used',
+  effectiveThresholdUsed: 'Switch threshold: {threshold}% used.',
+  excludedThresholdUsed: 'Manual only · outgoing threshold: {threshold}% used.',
+  rowThresholdUsed: 'Switch at {threshold}% used',
+  accountPriority: 'Priority (optional)',
+  accountPriorityHelp:
+    '1 is highest; 99 is lowest. Leave empty to follow the weekly order. Accounts with enough headroom go first; weekly order breaks priority ties.',
+  invalidPriority: 'Enter a whole number from 1 to 99, or leave empty.',
+  priorityAutomatic: 'weekly order',
+  priorityBadge: 'Priority {priority}',
+  returnEnabled: 'returns after reset',
+  returnPriorityRequired:
+    'Choose a priority to enable automatic returns, or turn returns off.',
+  returnExcludedHelp:
+    'Your return preference is saved. Returns pause while this account is excluded.',
+  returnAfterReset: 'Return after 5-hour reset',
+  returnAfterResetHelp:
+    'Requires inclusion and a priority. After an observed 5-hour limit resets, return to this account if its priority is higher and fresh checks confirm headroom in all binding windows. Automatic switching must be on.',
+  manualReturnHelp:
+    'Choosing an account manually pauses automatic returns for 15 minutes. Resume them sooner from the Automation card.',
+  automationDetailsHelp:
+    'Set account thresholds, priorities and automatic returns in Details.',
+  returnsPaused:
+    'Automatic returns paused for {duration} after manual selection.',
+  resumeReturns: 'Resume automatic returns',
+  saveAutomation: 'Save automation',
+  accountAutomationSaved:
+    'Saved: {threshold}% used ({source}) · {state} · priority: {priority} · returns: {returnState}.',
+  automationUnsupported:
+    'Account automation is available for supported saved ChatGPT accounts.',
+  codexReason_invalidAutomation:
+    'Choose a threshold from 50 to 100 and an optional priority from 1 to 99. Automatic returns require inclusion and a priority.',
 
   // Formatting.
   noReading: 'No reading yet',

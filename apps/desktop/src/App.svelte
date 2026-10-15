@@ -2,7 +2,11 @@
   import { language, t } from './lib/i18n';
   import { onMount } from 'svelte';
   import { createController, type Controller } from './lib/controller';
-  import type { Settings as SettingsType } from './lib/types';
+  import {
+    providerThreshold,
+    type Settings as SettingsType,
+  } from './lib/types';
+  import { exactPercent } from './lib/automation';
   import type { ProviderKey } from './lib/provider-view';
   import {
     createCodexController,
@@ -19,6 +23,7 @@
   let provider = $state<ProviderKey>('claude');
   let now = $state(Math.floor(Date.now() / 1000));
   let settingsOpen = $state(false);
+  let savedSettings = $state<SettingsType | null>(null);
   let snapshot = $derived($controller.snapshot);
   /** Claude mutations wait while anything runs on either provider. */
   let locked = $derived(
@@ -56,7 +61,10 @@
       : 'PrimerSwitch';
   });
   async function saveSettings(settings: SettingsType) {
-    return controller.action('update_settings', { settings });
+    const success = await controller.action('update_settings', { settings });
+    if (success && $controller.snapshot)
+      savedSettings = { ...$controller.snapshot.settings };
+    return success;
   }
 </script>
 
@@ -84,6 +92,26 @@
       $controller.login.open}
   />{/if}
 
+{#if savedSettings}<div class="settings-confirmation" role="status">
+    <span
+      >{t($language, 'providerDefaultsSaved', {
+        claude: exactPercent(
+          providerThreshold(savedSettings, 'claude'),
+          $language,
+        ),
+        codex: exactPercent(
+          providerThreshold(savedSettings, 'codex'),
+          $language,
+        ),
+      })}</span
+    >
+    <button
+      class="icon-button"
+      aria-label={t($language, 'close')}
+      onclick={() => (savedSettings = null)}>×</button
+    >
+  </div>{/if}
+
 {#if settingsOpen && snapshot}<Settings
     settings={snapshot.settings}
     disabled={locked}
@@ -91,3 +119,24 @@
     onsave={saveSettings}
     onclose={() => (settingsOpen = false)}
   />{/if}
+
+<style>
+  .settings-confirmation {
+    position: fixed;
+    bottom: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 20;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    max-width: calc(100% - 32px);
+    padding: 10px 12px 10px 16px;
+    border: 1px solid var(--green);
+    border-radius: 9px;
+    background: var(--surface-raised);
+    box-shadow: var(--shadow);
+    font-size: 0.78rem;
+    line-height: 1.5;
+  }
+</style>

@@ -18,6 +18,8 @@ import {
   loginSchema,
   previewSchema,
   snapshotSchema,
+  accountAutomationSchema,
+  type AccountAutomation,
   type AccountView,
   type ErrorView,
   type Snapshot,
@@ -252,6 +254,28 @@ export function createController(bridge: Bridge = nativeBridge) {
         });
     }
   }
+  async function updateAutomation(
+    id: string,
+    automation: AccountAutomation,
+  ): Promise<AccountAutomation | null> {
+    const parsed = accountAutomationSchema.safeParse(automation);
+    if (
+      !parsed.success ||
+      !state.snapshot?.accounts.some((account) => account.id === id)
+    )
+      return null;
+    if (
+      !(await action('update_account_automation', {
+        id,
+        automation: parsed.data,
+      }))
+    )
+      return null;
+    return (
+      state.snapshot?.accounts.find((account) => account.id === id)
+        ?.automation ?? null
+    );
+  }
   async function cancelLogin() {
     const session = state.login.session;
     generation++;
@@ -317,6 +341,8 @@ export function createController(bridge: Bridge = nativeBridge) {
     start,
     read,
     action,
+    updateAutomation,
+    resumeAutomaticReturns: () => action('resume_automatic_returns'),
     beginLogin,
     cancelLogin,
     finishLogin,

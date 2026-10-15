@@ -36,6 +36,8 @@ pub struct CandidateRank<'a> {
     pub id: &'a str,
     /// Both binding windows are at most `threshold - HEADROOM_MARGIN`.
     pub headroom: bool,
+    /// Explicit ascending priority, with unranked accounts last.
+    pub priority: Option<u16>,
     /// Binding weekly usage in percent.
     pub weekly_used: f64,
     /// Weekly reset hour bucket; an unknown reset sorts last.
@@ -56,6 +58,11 @@ pub fn compare_candidates(
     };
     b.headroom
         .cmp(&a.headroom)
+        .then_with(|| {
+            a.priority
+                .unwrap_or(u16::MAX)
+                .cmp(&b.priority.unwrap_or(u16::MAX))
+        })
         .then_with(|| match order {
             CandidateOrder::SoonestWeeklyReset => reset(),
             CandidateOrder::MostWeeklyLeft => {
@@ -67,6 +74,7 @@ pub fn compare_candidates(
 }
 
 pub fn is_usable(info: &AccountUsageInfo, threshold: f64, model: Option<&str>) -> bool {
+    let threshold = info.account.automation.effective_threshold(threshold);
     info.usage.as_ref().is_some_and(|u| {
         threshold.is_finite()
             && crate::models::valid_percent(u.five_hour.utilization)
@@ -85,6 +93,7 @@ pub fn has_headroom(
         && margin.is_finite()
         && margin >= 0.0
         && info.usage.as_ref().is_some_and(|u| {
+            let threshold = info.account.automation.effective_threshold(threshold);
             u.five_hour.utilization <= threshold - margin
                 && u.weekly_utilization_for_model(model) <= threshold - margin
         })
@@ -94,6 +103,7 @@ fn rank<'a>(info: &'a AccountUsageInfo, threshold: f64, model: Option<&str>) -> 
     CandidateRank {
         id: &info.account.id,
         headroom: has_headroom(info, threshold, model, HEADROOM_MARGIN),
+        priority: info.account.automation.priority,
         weekly_used: usage.weekly_utilization_for_model(model),
         weekly_reset_bucket: usage.weekly_reset_bucket(),
         five_hour_used: usage.five_hour.utilization,
@@ -120,7 +130,7 @@ pub fn best_candidate(
 ) -> Option<String> {
     infos
         .iter()
-        .filter(|i| !i.is_active && is_usable(i, threshold, model))
+        .filter(|i| !i.is_active && i.account.automation.enabled && is_usable(i, threshold, model))
         .min_by(|a, b| compare(a, b, threshold, model, order))
         .map(|i| i.account.id.clone())
 }
@@ -132,7 +142,7 @@ pub fn consumption_plan(
 ) -> Vec<String> {
     let mut sorted: Vec<_> = infos
         .iter()
-        .filter(|i| is_usable(i, threshold, model))
+        .filter(|i| i.account.automation.enabled && is_usable(i, threshold, model))
         .collect();
     sorted.sort_by(|a, b| compare(a, b, threshold, model, order));
     sorted.into_iter().map(|i| i.account.id.clone()).collect()
@@ -255,10 +265,15 @@ pub fn decide_resets(
     {
         let pick = infos
             .iter()
+            .filter(|i| i.is_active || i.account.automation.enabled)
             .filter_map(|i| {
                 let g = offer(i, now)?;
                 let u = i.usage.as_ref()?;
-                let binding = binding_windows(u, threshold, model);
+                let binding = binding_windows(
+                    u,
+                    i.account.automation.effective_threshold(threshold),
+                    model,
+                );
                 if binding.is_empty()
                     || !binding.keys().all(|w| clears(g, w))
                     || (g.use_requires_limit && !at_limit(Some(u), g, model))

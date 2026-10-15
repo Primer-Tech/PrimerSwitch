@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import type { AccountAutomation } from './types';
 export interface CodexCommandArgs {
   get_codex_snapshot: undefined;
   codex_discover: undefined;
@@ -13,6 +14,11 @@ export interface CodexCommandArgs {
   codex_refresh_all: undefined;
   codex_switch_account: { id: string };
   codex_delete_account: { id: string };
+  codex_update_account_automation: {
+    id: string;
+    automation: AccountAutomation;
+  };
+  codex_resume_automatic_returns: undefined;
 }
 export type CodexCommand = keyof CodexCommandArgs;
 export interface CodexBridge {
@@ -35,6 +41,8 @@ const commands: readonly CodexCommand[] = [
   'codex_refresh_all',
   'codex_switch_account',
   'codex_delete_account',
+  'codex_update_account_automation',
+  'codex_resume_automatic_returns',
 ];
 export const codexNativeBridge: CodexBridge = {
   call(command, args) {

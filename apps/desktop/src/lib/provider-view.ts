@@ -2,8 +2,9 @@
 // these shapes by pure adapters (claude-view.ts, codex-view.ts), so both tabs render
 // through the same components with the same vocabulary.
 import { t, type Language, type MessageKey } from './i18n';
-import { age, duration, percentage } from './format';
-import type { Settings } from './types';
+import { age, duration } from './format';
+import { exactPercent } from './automation';
+import type { AccountAutomation, Settings } from './types';
 
 export type ProviderKey = 'claude' | 'codex';
 
@@ -212,6 +213,8 @@ export interface AccountRowView {
   plan: string | null;
   active: boolean;
   next: boolean;
+  automation: AccountAutomation;
+  effectiveThreshold: number;
   /** A switch to this account is running. */
   switching: boolean;
   fiveHour: MeterView;
@@ -282,6 +285,7 @@ export interface PageView {
   updatedAt: number | null;
   threshold: number;
   settings: Settings | null;
+  returnHoldUntil: number | null;
 }
 
 /** A provider-specific line inside the shared Automation card. */
@@ -428,7 +432,7 @@ export function alertText(
   const text =
     limit === 'near'
       ? t(locale, 'alertThreshold', {
-          threshold: percentage(threshold, locale),
+          threshold: exactPercent(threshold, locale),
         })
       : t(locale, limitLabels[limit]);
   return limitWithTime(text, limit, freesAt, now, locale);

@@ -198,9 +198,9 @@ describe('Claude adapter: statuses in the shared words', () => {
     expect(row(raw, 'd').switchReason).toBe(t('en', 'switchUnverified'));
     // A failed latest reading keeps the previous one and says so.
     expect(row(raw, 'e').status).toEqual({
-      kind: 'ready',
-      label: 'Ready',
-      detail: 'Last check failed',
+      kind: 'failed',
+      label: 'Check failed',
+      detail: 'Refresh to try again',
       title: codeMessage('providerError', 'en'),
     });
     expect(row(raw, 'e').notes[0]).toEqual({
@@ -224,6 +224,44 @@ describe('Claude adapter: statuses in the shared words', () => {
     expect(status(raw, 'a').detail).toBe(
       'Limit reached · frees in 2h 10m · Resets available: 2',
     );
+  });
+  it('offers targeted repair for an explicitly expired active session without converting ordinary provider failures to sign-in requests', () => {
+    const expired = withAccounts(
+      account('a', { error: 'activeSessionExpired', signInRequired: false }),
+      account('b'),
+    );
+    expect(row(expired, 'a')).toMatchObject({
+      active: true,
+      primary: 'signIn',
+      canSignIn: true,
+      canSwitch: false,
+      status: { kind: 'signIn' },
+    });
+    expect(view(expired).signIn.map((account) => account.id)).toEqual(['a']);
+    expect(
+      row(expired, 'a').notes.some((note) =>
+        note.text.includes(t('en', 'activeSessionExpired')),
+      ),
+    ).toBe(true);
+    expect(row(expired, 'a').identity).toBe(t('en', 'activeSessionExpired'));
+    const explicit = withAccounts(
+      account('a', { signInRequired: true }),
+      account('b'),
+    );
+    expect(row(explicit, 'a')).toMatchObject({
+      primary: 'signIn',
+      canSignIn: true,
+    });
+    for (const error of [null, 'providerError']) {
+      const raw = withAccounts(account('a', { error }), account('b'));
+      expect(row(raw, 'a')).toMatchObject({
+        active: true,
+        primary: null,
+        canSignIn: false,
+        status: { kind: 'active' },
+      });
+      expect(view(raw).signIn).toHaveLength(0);
+    }
   });
 });
 

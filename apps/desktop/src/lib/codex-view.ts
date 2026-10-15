@@ -11,7 +11,6 @@ import {
   codexLimitState,
   codexMainLimit,
   codexMessage,
-  codexSecondaryLine,
   codexUsingCredits,
   codexWindowLabel,
   codexWindows,
@@ -27,6 +26,8 @@ import {
   orderEmptyText,
   orderEntries,
   rankRows,
+  reconcileRecommendations,
+  automaticReturnNotes,
   statusView,
   type AccountRowView,
   type LimitKind,
@@ -141,11 +142,17 @@ function row(
             ? 'unsupported'
             : !account.quota
               ? 'unread'
-              : limitKind
-                ? limitKind
-                : snapshot.nextId === account.id
-                  ? 'next'
-                  : 'ready';
+              : account.error
+                ? 'failed'
+                : !account.identityVerified
+                  ? 'checking'
+                  : limitKind
+                    ? limitKind
+                    : account.quotaState !== 'fresh'
+                      ? 'stale'
+                      : snapshot.nextId === account.id
+                        ? 'next'
+                        : 'ready';
   const capability = snapshot.capabilities.switchAccount;
   const blocked =
     capability.enabled &&
@@ -181,16 +188,32 @@ function row(
         available: account.quota?.resetCreditsAvailable ?? null,
         usableAt: null,
       },
+      savedAt:
+        !account.needsSignIn && account.quotaState !== 'fresh' && account.quota
+          ? account.quotaReadAt
+          : null,
     },
     now,
     locale,
   );
   const weekly = primaryMeter(windows.long, 'long', account, locale);
+  const workspaceLabel =
+    account.workspaceName ??
+    (account.workspaceId
+      ? t(locale, 'workspaceIdentifier', { id: account.workspaceId.slice(-8) })
+      : null);
   return {
     id: account.id,
     name: account.name,
     initial: codexInitial(account),
-    secondary: codexSecondaryLine(account) || null,
+    secondary:
+      [
+        account.email && account.email !== account.name ? account.email : null,
+        workspaceLabel,
+      ]
+        .filter(Boolean)
+        .join(' · ') || null,
+    workspaceLabel,
     plan: codexAccountPlan(account, locale),
     active: account.selected,
     next: snapshot.nextId === account.id && !account.selected,
@@ -218,7 +241,9 @@ function row(
     notes,
     readAt: account.quotaReadAt,
     savedReading:
-      account.quotaState === 'cached' || account.quotaState === 'unavailable',
+      !!account.error ||
+      account.quotaState === 'cached' ||
+      account.quotaState === 'unavailable',
     credits: codexCredits(account, locale),
     identity: t(
       locale,
@@ -291,6 +316,7 @@ export function codexView(
       threshold,
       settings,
       returnHoldUntil: null,
+      returnNotes: [],
     };
   const switchingId =
     snapshot.switching?.targetId ??
@@ -298,10 +324,14 @@ export function codexView(
   const built = snapshot.accounts.map((account) =>
     row(account, snapshot, options, threshold, switchingId),
   );
-  const rows = rankRows(
+  const recommendations = reconcileRecommendations(
     built.map(({ limitKind: _limit, ...rest }) => rest),
     snapshot.order,
+    snapshot.nextId,
+    snapshot.demo,
+    locale,
   );
+  const rows = rankRows(recommendations.rows, recommendations.order);
   const activeBuilt =
     built.find((r) => r.id === snapshot.selectedId) ??
     built.find((r) => r.active) ??
@@ -318,16 +348,15 @@ export function codexView(
     rows,
     active,
     // Exactly the account the native side ranks next.
-    next: rows.find((r) => r.id === snapshot.nextId && !r.active) ?? null,
+    next: recommendations.next,
     nextReason:
-      rows.find((r) => r.id === snapshot.nextId)?.automation.priority != null
+      recommendations.next?.automation.priority != null
         ? t(locale, 'nextWhyPriority', {
-            priority: rows.find((r) => r.id === snapshot.nextId)!.automation
-              .priority!,
+            priority: recommendations.next.automation.priority,
           })
         : nextReason(settings, locale),
     model: snapshot.activeModel,
-    order: orderEntries(snapshot.order, rows),
+    order: orderEntries(recommendations.order, rows),
     orderEmpty: orderEmptyText(rows, locale),
     alert:
       activeBuilt && activeLimit
@@ -354,5 +383,6 @@ export function codexView(
     threshold,
     settings,
     returnHoldUntil: snapshot.returnHoldUntil ?? null,
+    returnNotes: automaticReturnNotes(rows, settings, locale),
   };
 }

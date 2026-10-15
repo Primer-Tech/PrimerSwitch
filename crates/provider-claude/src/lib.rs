@@ -14,7 +14,8 @@ use thiserror::Error;
 use zeroize::Zeroizing;
 
 pub const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
-pub const AUTHORIZE_URL: &str = "https://platform.claude.com/oauth/authorize";
+/// Subscription login route from the public Claude Code2.1.300 binary.
+pub const AUTHORIZE_URL: &str = "https://claude.com/cai/oauth/authorize";
 pub const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 pub const REDIRECT_URI: &str = "https://platform.claude.com/oauth/code/callback";
 pub const PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
@@ -244,12 +245,10 @@ impl ClaudeClient {
             .transport
             .send(self.request("POST", TOKEN_URL, None, Some(body), 30, false))
             .await?;
-        // OAuth reports a revoked or consumed grant as `invalid_grant`; this public
-        // client has no secret, so a 401 here also means the grant was refused. Only
-        // the fixed error code is inspected, never other response text.
-        if response.status == 401
-            || (response.status == 400 && response.body["error"] == "invalid_grant")
-        {
+        // Only an explicit grant rejection proves this saved sign-in is unusable.
+        // A generic401 may be a client/configuration failure; it must not mark
+        // the account revoked. Only the fixed OAuth code is inspected.
+        if matches!(response.status, 400 | 401) && response.body["error"] == "invalid_grant" {
             return Err(ClientError::InvalidGrant);
         }
         check_status(&response)?;
@@ -284,6 +283,12 @@ impl ClaudeClient {
             .get("accountUuid")
             .and_then(Value::as_str)
             .is_none()
+            || profile
+                .identity
+                .get("organizationUuid")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .is_none()
         {
             return Err(ClientError::InvalidResponse);
         }
@@ -428,6 +433,19 @@ impl PendingLogin {
         }
     }
 }
+impl PendingLogin {
+    /// Browser hints match the CLI; the runtime still verifies the returned owner.
+    pub fn with_account_hint(mut self, organization_uuid: &str, email: Option<&str>) -> Self {
+        let mut url = reqwest::Url::parse(&self.url).expect("constructed authorization URL");
+        url.query_pairs_mut()
+            .append_pair("orgUUID", organization_uuid);
+        if let Some(email) = email {
+            url.query_pairs_mut().append_pair("login_hint", email);
+        }
+        self.url = url.into();
+        self
+    }
+}
 pub struct TokenResponse {
     pub access_token: Zeroizing<String>,
     pub refresh_token: Option<Zeroizing<String>>,
@@ -550,7 +568,7 @@ pub struct InferenceResult {
 fn check_status(response: &HttpResponse) -> Result<(), ClientError> {
     match response.status {
         200 => Ok(()),
-        401 | 403 => Err(ClientError::Unauthorized),
+        401 => Err(ClientError::Unauthorized),
         429 => Err(rate_limit(response)),
         status => Err(ClientError::Http(status)),
     }
@@ -834,12 +852,14 @@ mod tests {
                 json!({"error":"invalid_grant","error_description":"secret-response-sentinel"}),
             ),
             reply(401, Value::Null),
+            reply(401, json!({"error":"invalid_grant"})),
             reply(400, json!({"error":"invalid_request"})),
             reply(503, Value::Null),
             reply(429, Value::Null),
         ]);
         for expected in [
             ClientError::InvalidGrant,
+            ClientError::Unauthorized,
             ClientError::InvalidGrant,
             ClientError::Http(400),
             ClientError::Http(503),
@@ -849,6 +869,28 @@ mod tests {
             assert_eq!(error, expected);
             assert!(!error.to_string().contains("sentinel"));
         }
+    }
+    #[tokio::test]
+    async fn subscription_login_uses_cli_route_and_workspace_hints_without_changing_exchange() {
+        let login =
+            PendingLogin::new(100).with_account_hint("fixture-org", Some("a@example.invalid"));
+        let url = reqwest::Url::parse(&login.url).unwrap();
+        assert_eq!(url.origin().ascii_serialization(), "https://claude.com");
+        assert_eq!(url.path(), "/cai/oauth/authorize");
+        let query: BTreeMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(query["orgUUID"], "fixture-org");
+        assert_eq!(query["login_hint"], "a@example.invalid");
+        assert_eq!(
+            query["redirect_uri"],
+            "https://platform.claude.com/oauth/code/callback"
+        );
+        assert_eq!(query["scope"], LOGIN_SCOPES);
+        assert_eq!(TOKEN_URL, "https://platform.claude.com/v1/oauth/token");
+        let (client, _) = fake(vec![reply(403, Value::Null)]);
+        assert!(matches!(
+            client.profile("fixture-access").await,
+            Err(ClientError::Http(403))
+        ));
     }
     #[tokio::test]
     async fn generic_429_is_not_budget_reading() {

@@ -18,6 +18,7 @@
     NoticeView,
     ProviderKey,
   } from '../lib/provider-view';
+  import { identityLabel } from '../lib/provider-view';
   import ProviderPage from './ProviderPage.svelte';
   import AccountDetails from './AccountDetails.svelte';
   import DeleteDialog from './DeleteDialog.svelte';
@@ -326,7 +327,7 @@
         tone: 'warn',
         role: 'note',
         text: t($language, 'signInNeeded', {
-          names: view.signIn.map((r) => r.name).join(', '),
+          names: view.signIn.map((r) => identityLabel(r, view.rows)).join(', '),
         }),
         action:
           only && only.canSignIn
@@ -649,10 +650,6 @@
               )}
             </dd>
           </div>
-          {#if saved.workspaceName}<div>
-              <dt>{t($language, 'detailsWorkspace')}</dt>
-              <dd>{saved.workspaceName}</dd>
-            </div>{/if}
           {#if details?.credits}<div>
               <dt>{t($language, 'credits')}</dt>
               <dd>{details.credits}</dd>

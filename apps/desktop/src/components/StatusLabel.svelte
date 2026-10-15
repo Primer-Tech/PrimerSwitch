@@ -77,10 +77,12 @@
     color: var(--danger);
   }
   [data-kind='credits'] .dot,
+  [data-kind='stale'] .dot,
   [data-kind='near'] .dot {
     background: var(--warn);
   }
   [data-kind='credits'] .label,
+  [data-kind='stale'] .label,
   [data-kind='near'] .label {
     color: var(--warn);
   }

@@ -669,6 +669,9 @@ pub(crate) struct CodexEngine {
     /// Current provider default supplied by the serialized runtime owner. The
     /// authoritative value lives only in shared Settings, not this Codex record.
     policy_threshold: f64,
+    /// Alternate background slots when both the active account and an inactive
+    /// account are due. Frequent active checks must not starve reset recovery.
+    last_background_active: Option<bool>,
     #[cfg(test)]
     before_automatic_replace: Option<Box<dyn FnOnce() + Send>>,
 }
@@ -725,6 +728,7 @@ impl CodexEngine {
             last_exhausted_notice_at: None,
             last_auto_failure: None,
             policy_threshold: CodexPolicy::default().threshold,
+            last_background_active: None,
             #[cfg(test)]
             before_automatic_replace: None,
         }
@@ -955,9 +959,9 @@ impl CodexEngine {
         ranked.into_iter().map(|(account, _)| account).collect()
     }
     /// Decide automatic switching. A switch needs automatic switching on, no switch,
-    /// sign-in or cooldown in progress, a fresh reading of the active account at the
-    /// threshold (or limited), and a fresh reading of the best target; an older
-    /// target reading is refreshed first. Without any target nothing switches.
+    /// sign-in or cooldown in progress and a fresh target reading. Exhaustion
+    /// switching also needs fresh active usage; a natural return instead validates
+    /// the current active owner through the guarded credential transaction.
     pub(crate) fn automation(&self, now: i64, policy: &CodexPolicy) -> CodexAutomation {
         let cooling = self
             .saved
@@ -971,12 +975,12 @@ impl CodexEngine {
         {
             return CodexAutomation::Idle;
         }
-        let Some(active) = self
-            .selected()
-            .filter(|a| self.quota_state(a, now) == CodexQuotaState::Fresh)
-        else {
+        let Some(active) = self.selected() else {
             return CodexAutomation::Idle;
         };
+        if self.quota_state(active, now) != CodexQuotaState::Fresh {
+            return self.automatic_return(active, now, policy);
+        }
         let threshold = active.automation.effective_threshold(policy.threshold);
         let Some(quota) = active.quota.as_ref().filter(|q| reaches(q, threshold)) else {
             return self.automatic_return(active, now, policy);
@@ -1021,10 +1025,12 @@ impl CodexEngine {
         now: i64,
         policy: &CodexPolicy,
     ) -> CodexAutomation {
-        if self
-            .saved
-            .return_hold_until
-            .is_some_and(|until| until > now)
+        if active.auth_kind != AuthKind::ManagedChatgpt
+            || !active.binding.complete()
+            || self
+                .saved
+                .return_hold_until
+                .is_some_and(|until| until > now)
         {
             return CodexAutomation::Idle;
         }
@@ -1977,8 +1983,8 @@ impl CodexEngine {
             policy.poll_interval
         }
     }
-    /// Choose the next background reading: the active account first, then the inactive
-    /// account with the oldest reading or a window that has reset since it was read.
+    /// Service known reset deadlines and overdue inactive readings fairly alongside
+    /// the active account, which can be due on every scheduler tick near a limit.
     pub(crate) fn due_quota(&self, now: i64, policy: &CodexPolicy) -> Option<String> {
         if self.common_block().is_some() || self.switching.is_some() {
             return None;
@@ -1989,12 +1995,11 @@ impl CodexEngine {
                 && (!a.needs_sign_in
                     || a.last_attempt_at
                         .is_none_or(|t| now < t || now - t >= SIGN_IN_RETRY))
-                && a.last_attempt_at
-                    .is_none_or(|t| now < t || now - t >= ERROR_RETRY.min(interval))
         };
-        // A preferred reset gets a revalidation around its known reset time before
-        // an ordinary active reading. Failed recovery reads retain their backoff.
-        if policy.auto_switch
+        // An opted-in preferred account gets the short recovery retry floor around
+        // its observed reset. Other known resets use that floor too once successful
+        // reads prove a newly elapsed window; failures retain their longer backoff.
+        let preferred_due = if policy.auto_switch
             && self.pending_login.is_none()
             && self
                 .saved
@@ -2022,30 +2027,59 @@ impl CodexEngine {
                 })
                 .min_by_key(|a| (a.automation.priority, &a.id))
         {
-            return Some(target.id.clone());
-        }
-        if let Some(active) = self.selected().filter(eligible)
-            && active
-                .quota_read_at
-                .is_none_or(|t| now < t || now - t >= interval)
-        {
-            return Some(active.id.clone());
-        }
-        self.saved
-            .accounts
-            .iter()
-            .filter(|a| self.selected_id.as_ref() != Some(&a.id))
-            .filter(eligible)
-            .filter(|a| {
-                a.last_attempt_at
-                    .is_none_or(|t| now < t || now - t >= ERROR_RETRY)
-                    && (a
+            Some(target)
+        } else {
+            None
+        };
+        let active_due = self.selected().filter(eligible).filter(|active| {
+            active
+                .last_attempt_at
+                .is_none_or(|t| now < t || now - t >= ERROR_RETRY.min(interval))
+                && active
+                    .quota_read_at
+                    .is_none_or(|t| now < t || now - t >= interval)
+        });
+        let inactive_due = preferred_due.or_else(|| {
+            self.saved
+                .accounts
+                .iter()
+                .filter(|a| self.selected_id.as_ref() != Some(&a.id))
+                .filter(eligible)
+                .filter(|a| {
+                    (if reset_passed(a, now) {
+                        self.recovery_read_due(a, now)
+                    } else {
+                        a.last_attempt_at
+                            .is_none_or(|t| now < t || now - t >= ERROR_RETRY)
+                    }) && (a
                         .quota_read_at
                         .is_none_or(|t| now < t || now - t >= INACTIVE_QUOTA_INTERVAL)
                         || reset_passed(a, now))
-            })
-            .min_by_key(|a| a.quota_read_at.unwrap_or(i64::MIN))
-            .map(|a| a.id.clone())
+                })
+                .min_by_key(|a| {
+                    (
+                        !reset_passed(a, now),
+                        a.quota_read_at.unwrap_or(i64::MIN),
+                        &a.id,
+                    )
+                })
+        });
+        let next = match (active_due, inactive_due) {
+            (Some(active), Some(inactive)) => {
+                let urgent = preferred_due.is_some() || reset_passed(inactive, now);
+                if self.last_background_active == Some(true)
+                    || (self.last_background_active.is_none() && urgent)
+                {
+                    inactive
+                } else {
+                    active
+                }
+            }
+            (Some(active), None) => active,
+            (None, Some(inactive)) => inactive,
+            (None, None) => return None,
+        };
+        Some(next.id.clone())
     }
     /// Prepare a quota reading. `manual` readings ignore back-off and token-expiry margins.
     pub(crate) fn plan_quota(
@@ -2061,6 +2095,9 @@ impl CodexEngine {
         let index = self.account_index(id)?;
         if self.saved.accounts[index].auth_kind != AuthKind::ManagedChatgpt {
             return Err(CodexReason::UnsupportedAuth);
+        }
+        if !manual {
+            self.last_background_active = Some(self.selected_id.as_deref() == Some(id));
         }
         // System and managed layers apply to owned readers too.
         self.requalify()?;
@@ -2289,9 +2326,7 @@ impl CodexEngine {
         policy: &CodexPolicy,
         now: i64,
     ) -> bool {
-        let Some(active) = self.selected().filter(|a| {
-            a.id == plan.previous_id && self.quota_state(a, now) == CodexQuotaState::Fresh
-        }) else {
+        let Some(active) = self.selected().filter(|a| a.id == plan.previous_id) else {
             return false;
         };
         if !policy.auto_switch {
@@ -2300,15 +2335,17 @@ impl CodexEngine {
         if returning {
             matches!(self.automatic_return(active, now, policy), CodexAutomation::Return(current) if current.target_id == plan.target_id)
         } else {
-            active.quota.as_ref().is_some_and(|quota| {
-                reaches(
-                    quota,
-                    active.automation.effective_threshold(policy.threshold),
-                )
-            }) && self.next_candidate(policy).is_some_and(|target| {
-                target.id == plan.target_id
-                    && self.quota_state(target, now) == CodexQuotaState::Fresh
-            })
+            self.quota_state(active, now) == CodexQuotaState::Fresh
+                && active.quota.as_ref().is_some_and(|quota| {
+                    reaches(
+                        quota,
+                        active.automation.effective_threshold(policy.threshold),
+                    )
+                })
+                && self.next_candidate(policy).is_some_and(|target| {
+                    target.id == plan.target_id
+                        && self.quota_state(target, now) == CodexQuotaState::Fresh
+                })
         }
     }
     fn begin_switch_guarded(
@@ -2553,23 +2590,28 @@ impl CodexEngine {
         let active = self.selected_id.as_deref() == Some(&self.saved.accounts[index].id);
         let verified = self.verified_now.contains(&self.saved.accounts[index].id);
         let account = &mut self.saved.accounts[index];
-        if !verified || !account.automation.return_on_five_hour_reset {
-            return;
-        }
+        // Capturing history is separate from authorizing a switch. Keep an actual
+        // attributed near-limit observation across restarts and preference changes; a
+        // return still needs a fresh workspace-verified target read after reset.
         if active
+            && verified
             && let Some(reset) = account.preferred_return_reset_at
             && natural_five_hour_recovery(account, reset, now)
         {
             handle_return_marker(account);
         }
-        if let (Some(quota), Some(read)) = (&account.quota, account.quota_read_at)
+        if account.auth_kind == AuthKind::ManagedChatgpt
+            && account.binding.complete()
+            && let (Some(quota), Some(read)) = (&account.quota, account.quota_read_at)
+            && read <= now
             && let Some(reset) = main_windows(quota)
                 .filter(|w| {
                     w.window_duration_mins == Some(300)
                         && f64::from(w.used_percent)
-                            >= account
+                            > account
                                 .automation
                                 .effective_threshold(self.policy_threshold)
+                                - HEADROOM_MARGIN
                 })
                 .filter_map(|w| w.resets_at)
                 .filter(|reset| *reset > read)

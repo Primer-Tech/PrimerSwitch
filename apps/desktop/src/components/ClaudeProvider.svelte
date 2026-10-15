@@ -1,7 +1,12 @@
 <script lang="ts">
   import { language, t, plural, subscriptionLabel } from '../lib/i18n';
   import { date, duration } from '../lib/format';
-  import { errorText, safeError, type Controller } from '../lib/controller';
+  import {
+    codeMessage,
+    errorText,
+    safeError,
+    type Controller,
+  } from '../lib/controller';
   import type { AccountView, ErrorView } from '../lib/types';
   import { claudeView } from '../lib/claude-view';
   import type {
@@ -11,6 +16,7 @@
     NoticeView,
     ProviderKey,
   } from '../lib/provider-view';
+  import { identityLabel } from '../lib/provider-view';
   import ProviderPage from './ProviderPage.svelte';
   import AccountDetails from './AccountDetails.svelte';
   import DeleteDialog from './DeleteDialog.svelte';
@@ -55,6 +61,11 @@
   let deleteTarget = $state<AccountRowView | null>(null);
   let returnFocus = $state<HTMLElement | null>(null);
   let details = $derived(view.rows.find((r) => r.id === detailsId) ?? null);
+  let loginFor = $derived(
+    snapshot?.accounts.find(
+      (account) => account.id === $controller.login.accountId,
+    ) ?? null,
+  );
   const raw = (id: string | undefined): AccountView | null =>
     snapshot?.accounts.find((account) => account.id === id) ?? null;
   // A background error repeats on every tick while it lasts: once dismissed it stays
@@ -110,10 +121,10 @@
     );
     operation = null;
   }
-  function signIn(trigger: HTMLElement | null) {
+  function signIn(accountId: string | null, trigger: HTMLElement | null) {
     detailsId = null;
     returnFocus = trigger;
-    void controller.beginLogin();
+    void controller.beginLogin(accountId);
   }
   function askDelete(row: AccountRowView, trigger: HTMLElement | null) {
     returnFocus = trigger;
@@ -169,20 +180,40 @@
         text: view.allLimited,
       });
     const signInKey = view.signIn.map((r) => r.id).join(',');
+    const renewal = view.signIn.filter(
+      (row) => row.active && raw(row.id)?.error === 'activeSessionExpired',
+    );
+    const requiredSignIn = view.signIn.filter(
+      (row) => !renewal.some((account) => account.id === row.id),
+    );
     if (view.signIn.length && signInKey !== dismissedSignIn)
       list.push({
         key: 'sign-in',
         tone: 'warn',
         role: 'note',
-        text: t($language, 'signInNeeded', {
-          names: view.signIn.map((r) => r.name).join(', '),
-        }),
+        text: [
+          ...renewal.map((row) =>
+            t($language, 'accountError', {
+              name: identityLabel(row, view.rows),
+              reason: codeMessage('activeSessionExpired', $language),
+            }),
+          ),
+          ...(requiredSignIn.length
+            ? [
+                t($language, 'signInNeeded', {
+                  names: requiredSignIn
+                    .map((row) => identityLabel(row, view.rows))
+                    .join(', '),
+                }),
+              ]
+            : []),
+        ].join(' '),
         action:
           view.signIn.length === 1
             ? {
                 label: t($language, 'signInAgain'),
                 disabled: locked,
-                run: (trigger) => signIn(trigger),
+                run: (trigger) => signIn(view.signIn[0].id, trigger),
               }
             : undefined,
         dismiss: () => (dismissedSignIn = signInKey),
@@ -204,7 +235,7 @@
       label: t($language, 'claudeAddSignIn'),
       icon: 'plus',
       disabled: locked,
-      run: (trigger) => signIn(trigger),
+      run: (trigger) => signIn(null, trigger),
     },
     {
       key: 'current',
@@ -278,7 +309,7 @@
   emptyActions={!blocked}
   {automationItems}
   onswitch={(row) => void run('switch', row)}
-  onsignin={(_row, trigger) => signIn(trigger)}
+  onsignin={(row, trigger) => signIn(row.id, trigger)}
   ondetails={(row, trigger) => {
     returnFocus = trigger;
     detailsId = row.id;
@@ -342,7 +373,7 @@
         detailsId = null;
         void run('switch', row);
       }}
-      onsignin={() => signIn(returnFocus)}
+      onsignin={() => signIn(details!.id, returnFocus)}
       ondelete={() => askDelete(details!, returnFocus)}
       onautomation={(automation) =>
         controller.updateAutomation(details!.id, automation)}
@@ -452,7 +483,10 @@
 
 {#if $controller.login.open}
   <Modal
-    title={t($language, 'claudeLoginTitle')}
+    title={t(
+      $language,
+      loginFor ? 'claudeLoginAgainTitle' : 'claudeLoginTitle',
+    )}
     {returnFocus}
     onclose={() => {
       void controller.cancelLogin();
@@ -464,7 +498,18 @@
         void controller.finishLogin(loginCode);
       }}
     >
-      <p class="modal-intro">{t($language, 'loginDescription')}</p>
+      <p class="modal-intro">
+        {loginFor
+          ? t($language, 'claudeLoginAgainDescription', {
+              name: loginFor.email || loginFor.name,
+            })
+          : t($language, 'loginDescription')}
+      </p>
+      {#if loginFor?.workspaceLabel}<p class="help">
+          {t($language, 'claudeLoginOriginalWorkspace', {
+            workspace: loginFor.workspaceLabel,
+          })}
+        </p>{/if}
       <ol class="login-steps">
         <li><span>1</span>{t($language, 'loginStepOne')}</li>
         <li>
@@ -475,7 +520,7 @@
       {#if $controller.login.working}<p class="working-message" role="status">
           <span class="spinner" aria-hidden="true"></span>{$controller.login
             .session
-            ? t($language, 'addingAccount')
+            ? t($language, loginFor ? 'updatingSignIn' : 'addingAccount')
             : t($language, 'openingBrowser')}
         </p>{/if}
       <label class="field-label" for="login-code"
@@ -491,8 +536,25 @@
       />
       {#if $controller.login.error}<p class="warning-text" role="alert">
           {safeError($controller.login.error, $language)}
-        </p>{/if}
-      <p class="help">{t($language, 'loginNoActivate')}</p>
+        </p>
+        <button
+          type="button"
+          disabled={$controller.login.working}
+          onclick={() => {
+            loginCode = '';
+            void controller.restartLogin();
+          }}>{t($language, 'openBrowserAgain')}</button
+        >{/if}
+      <p class="help">
+        {t(
+          $language,
+          loginFor?.active
+            ? 'claudeLoginAgainActive'
+            : loginFor
+              ? 'claudeLoginAgainNoActivate'
+              : 'loginNoActivate',
+        )}
+      </p>
       <div class="modal-actions">
         <button type="button" onclick={() => controller.cancelLogin()}
           >{t($language, 'cancel')}</button
@@ -501,7 +563,8 @@
           type="submit"
           disabled={!$controller.login.session ||
             $controller.login.working ||
-            !loginCode.trim()}>{t($language, 'addAccount')}</button
+            !loginCode.trim()}
+          >{t($language, loginFor ? 'saveSignIn' : 'addAccount')}</button
         >
       </div>
     </form>

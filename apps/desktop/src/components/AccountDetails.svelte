@@ -72,6 +72,10 @@
     >
   </p>
   <dl class="facts">
+    {#if row.workspaceLabel}<div>
+        <dt>{t($language, 'detailsWorkspace')}</dt>
+        <dd>{row.workspaceLabel}</dd>
+      </div>{/if}
     {@render facts?.()}
     <div>
       <dt>{t($language, 'detailsChecked')}</dt>

@@ -105,7 +105,8 @@ export const en = {
 
   // Usage order.
   usageOrder: 'Next in order',
-  orderEmpty: 'No other account has usage left below the switch threshold.',
+  orderEmpty:
+    'No other account is ready for automatic switching. Check its status in the account list.',
   orderAfterFirstRead: 'Shown after the first reading.',
 
   // Next up.
@@ -278,13 +279,53 @@ export const en = {
   priorityAutomatic: 'weekly order',
   priorityBadge: 'Priority {priority}',
   returnEnabled: 'returns after reset',
+  statusNeedsRefresh: 'Needs refresh',
+  claudeLoginAgainTitle: 'Sign in to Claude again',
+  claudeLoginOriginalWorkspace:
+    'Original workspace: {workspace}. Choose this workspace in the browser.',
+  workspaceIdentifier: 'Workspace …{id}',
+  claudeLoginAgainDescription:
+    'Sign in as {name} in the same Claude workspace to update this saved account. A different account or workspace will be rejected; your name, priority and automation preferences are kept.',
+  claudeLoginAgainNoActivate:
+    'Updates this saved sign-in without selecting it as the active account.',
+  claudeLoginAgainActive:
+    'Updates this saved sign-in and repairs the current Claude session only if it still belongs to the same account and workspace.',
+  loginIdentityMismatch:
+    "Sign-in returned a different Claude account or workspace. Choose the saved account's original workspace, or use Add account.",
+  saveSignIn: 'Save sign-in',
+  updatingSignIn: 'Updating saved sign-in…',
+  openBrowserAgain: 'Open browser again',
+  automaticReturns: 'Automatic returns',
+  returnsNotConfigured:
+    'No accounts are set to return after reset. In Details, choose a priority and enable Return after 5-hour reset.',
+  returnsSwitchingOff:
+    'Automatic switching is off; automatic returns are paused.',
+  returnsAccountExcluded:
+    '{name}: return preference saved; paused while this account is excluded.',
+  returnsAccountNoPriority:
+    '{name}: choose a priority in Details to enable returns.',
+  returnsAccountSignIn:
+    '{name}: sign in again before automatic returns can use it.',
+  returnsAccountUnverified:
+    '{name}: identity must be verified before automatic returns can use it.',
+  returnsAccountUnconfirmed:
+    '{name}: the saved reading is unconfirmed. Fresh checks are required before any return.',
+  returnsAccountWeeklyBlocked:
+    '{name}: last reported weekly usage exceeds {headroom}% used required for return ({threshold}% threshold minus 5 points). A 5-hour reset does not restore weekly quota.',
+  returnsAccountActive: '{name}: preferred account is already active.',
+  returnsAccountLowerPriority:
+    '{name}: priority {priority} is not higher than active priority {activePriority}. Equal priorities do not trigger returns.',
+  returnsAccountFiveHourBlocked:
+    '{name}: last reported 5-hour usage exceeds {headroom}% used required for return. Waiting for its observed 5-hour reset, then fresh headroom checks.',
+  returnsAccountWatching:
+    '{name}: returns when its observed 5-hour window recovers enough headroom. Requires strictly higher priority and fresh usage at most {headroom}% in all binding windows.',
   returnPriorityRequired:
     'Choose a priority to enable automatic returns, or turn returns off.',
   returnExcludedHelp:
     'Your return preference is saved. Returns pause while this account is excluded.',
   returnAfterReset: 'Return after 5-hour reset',
   returnAfterResetHelp:
-    'Requires inclusion and a priority. After an observed 5-hour limit resets, return to this account if its priority is higher and fresh checks confirm headroom in all binding windows. Automatic switching must be on.',
+    'Requires inclusion and a priority. After an observed 5-hour window with insufficient headroom resets, return if its priority is strictly higher. Fresh usage must be at least 5 percentage points below its threshold in all binding windows. Automatic switching must be on.',
   manualReturnHelp:
     'Choosing an account manually pauses automatic returns for 15 minutes. Resume them sooner from the Automation card.',
   automationDetailsHelp:
@@ -331,7 +372,7 @@ export const en = {
   signInRequired:
     "Claude no longer accepts this account's saved sign-in. Sign in again to keep using it.",
   activeSessionExpired:
-    "Claude Code's session for this account has expired. Use Claude Code once to renew it, or sign in again there.",
+    "Claude Code's session needs renewal or repair. You can use Claude Code once to let it renew, or choose Sign in again here.",
   settingsError: 'The settings are not valid.',
   readOnlyError: 'This view is read-only.',
   loginExpired: 'The login expired or was canceled.',

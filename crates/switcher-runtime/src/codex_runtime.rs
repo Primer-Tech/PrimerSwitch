@@ -379,8 +379,9 @@ impl RuntimeHandle {
         self.codex_automate().await;
     }
     /// Automatic switching, after the tick's readings; the caller holds `codex_job`.
-    /// It reuses the window's seamless switch, at most once per cooldown, and only on
-    /// fresh readings of the active account and of the target.
+    /// It reuses the window's seamless switch, at most once per cooldown. Exhaustion
+    /// needs fresh active usage; natural returns only need a fresh target and the
+    /// live outgoing owner/generation checks in the guarded transaction.
     async fn codex_automate(&self) {
         let mut read: Vec<String> = Vec::new();
         loop {

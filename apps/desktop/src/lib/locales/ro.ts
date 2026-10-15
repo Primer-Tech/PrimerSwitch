@@ -110,7 +110,7 @@ export const ro: Record<keyof typeof en, string> = {
   // Usage order.
   usageOrder: 'Urmează, în ordine',
   orderEmpty:
-    'Niciun alt cont nu mai are utilizare disponibilă sub pragul de comutare.',
+    'Niciun alt cont nu este pregătit pentru comutarea automată. Verifică starea sa în lista de conturi.',
   orderAfterFirstRead: 'Apare după prima citire.',
 
   // Next up.
@@ -287,13 +287,53 @@ export const ro: Record<keyof typeof en, string> = {
   priorityAutomatic: 'ordine săptămânală',
   priorityBadge: 'Prioritate {priority}',
   returnEnabled: 'revine după resetare',
+  statusNeedsRefresh: 'Necesită actualizare',
+  claudeLoginAgainTitle: 'Autentifică-te din nou în Claude',
+  claudeLoginOriginalWorkspace:
+    'Spațiul de lucru inițial: {workspace}. Alege acest spațiu în browser.',
+  workspaceIdentifier: 'Spațiu de lucru …{id}',
+  claudeLoginAgainDescription:
+    'Autentifică-te ca {name} în același spațiu Claude pentru a actualiza acest cont salvat. Un alt cont sau spațiu va fi refuzat; numele, prioritatea și preferințele de automatizare sunt păstrate.',
+  claudeLoginAgainNoActivate:
+    'Actualizează autentificarea salvată fără a selecta contul ca activ.',
+  claudeLoginAgainActive:
+    'Actualizează autentificarea salvată și repară sesiunea Claude curentă doar dacă aparține în continuare aceluiași cont și aceluiași spațiu de lucru.',
+  loginIdentityMismatch:
+    'Autentificarea a returnat alt cont Claude sau alt spațiu de lucru. Alege spațiul de lucru inițial al contului salvat sau folosește Adaugă un cont.',
+  saveSignIn: 'Salvează autentificarea',
+  updatingSignIn: 'Se actualizează autentificarea salvată…',
+  openBrowserAgain: 'Deschide din nou browserul',
+  automaticReturns: 'Reveniri automate',
+  returnsNotConfigured:
+    'Niciun cont nu este setat să revină după resetare. Din Detalii, alege o prioritate și activează revenirea după resetarea de 5 ore.',
+  returnsSwitchingOff:
+    'Comutarea automată este oprită; revenirile automate sunt suspendate.',
+  returnsAccountExcluded:
+    '{name}: preferința de revenire este păstrată; revenirile sunt suspendate cât timp contul este exclus.',
+  returnsAccountNoPriority:
+    '{name}: alege o prioritate din Detalii pentru a activa revenirile.',
+  returnsAccountSignIn:
+    '{name}: autentifică-te din nou înainte ca revenirile automate să-l poată folosi.',
+  returnsAccountUnverified:
+    '{name}: identitatea trebuie verificată înainte ca revenirile automate să-l poată folosi.',
+  returnsAccountUnconfirmed:
+    '{name}: citirea salvată este neconfirmată. Sunt necesare verificări noi înainte de revenire.',
+  returnsAccountWeeklyBlocked:
+    '{name}: ultima utilizare săptămânală raportată depășește {headroom}% utilizat, necesar pentru revenire (pragul de {threshold}% minus 5 puncte). Resetarea de 5 ore nu reface cota săptămânală.',
+  returnsAccountActive: '{name}: contul preferat este deja activ.',
+  returnsAccountLowerPriority:
+    '{name}: prioritatea {priority} nu este mai mare decât prioritatea activă {activePriority}. Prioritățile egale nu declanșează reveniri.',
+  returnsAccountFiveHourBlocked:
+    '{name}: ultima utilizare de 5 ore raportată depășește {headroom}% utilizat, necesar pentru revenire. Așteaptă resetarea de 5 ore observată, apoi verificări noi ale rezervei.',
+  returnsAccountWatching:
+    '{name}: revine când fereastra sa de 5 ore observată recuperează suficientă rezervă. Necesită prioritate strict mai mare și utilizare nou verificată de cel mult {headroom}% în toate ferestrele relevante.',
   returnPriorityRequired:
     'Alege o prioritate pentru revenirile automate sau oprește revenirile.',
   returnExcludedHelp:
     'Preferința de revenire este păstrată. Revenirile sunt suspendate cât timp contul este exclus.',
   returnAfterReset: 'Revino după resetarea de 5 ore',
   returnAfterResetHelp:
-    'Necesită includere și o prioritate. După resetarea unei limite de 5 ore observate, revine pe acest cont dacă prioritatea sa este mai mare și verificări noi confirmă rezervă în toate ferestrele relevante. Comutarea automată trebuie să fie pornită.',
+    'Necesită includere și o prioritate. După resetarea unei ferestre de 5 ore observate cu rezervă insuficientă, revine dacă prioritatea sa este strict mai mare. Utilizarea nou verificată trebuie să fie cu cel puțin 5 puncte procentuale sub prag în toate ferestrele relevante. Comutarea automată trebuie să fie pornită.',
   manualReturnHelp:
     'Alegerea manuală a unui cont suspendă revenirile automate timp de 15 minute. Le poți relua mai devreme din cardul Automatizare.',
   automationDetailsHelp:
@@ -342,7 +382,7 @@ export const ro: Record<keyof typeof en, string> = {
   signInRequired:
     'Claude nu mai acceptă autentificarea salvată a acestui cont. Autentifică-te din nou pentru a-l folosi în continuare.',
   activeSessionExpired:
-    'Sesiunea Claude Code pentru acest cont a expirat. Folosește Claude Code o dată pentru a o reînnoi sau autentifică-te din nou acolo.',
+    'Sesiunea Claude Code necesită reînnoire sau reparare. Poți folosi Claude Code o dată pentru a permite reînnoirea sau poți alege Autentifică-te din nou aici.',
   settingsError: 'Setările introduse nu sunt valide.',
   readOnlyError: 'Această vizualizare este doar pentru citire.',
   loginExpired: 'Autentificarea a expirat sau a fost anulată.',

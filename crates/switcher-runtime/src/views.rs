@@ -197,6 +197,8 @@ pub struct AccountView {
     pub id: String,
     pub name: String,
     pub email: String,
+    /// Display-only workspace name and short identity suffix; never used for matching.
+    pub workspace_label: Option<String>,
     pub provider: ProviderId,
     pub automation: AccountAutomationView,
     pub effective_threshold: f64,
@@ -210,7 +212,7 @@ pub struct AccountView {
     pub decision_fresh: bool,
     /// Stable catalog key of the last reading failure for this account.
     pub error: Option<String>,
-    /// Claude rejected the saved sign-in; only a new browser sign-in restores it.
+    /// Saved sign-in needs repair; explicit retry may recover a refreshable session.
     pub sign_in_required: bool,
     /// When an exhausted account's blocking windows reopen (see `frees_at`).
     pub frees_at: Option<i64>,

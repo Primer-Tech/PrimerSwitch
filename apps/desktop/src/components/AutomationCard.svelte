@@ -3,7 +3,7 @@
   import { duration, percentage } from '../lib/format';
   import { exactPercent } from '../lib/automation';
   import type { Settings } from '../lib/types';
-  import type { AutomationItem } from '../lib/provider-view';
+  import type { AutomationItem, NoteView } from '../lib/provider-view';
   import Icon from './Icon.svelte';
   let {
     settings,
@@ -15,6 +15,7 @@
     now,
     locked,
     onresume,
+    returnNotes,
   }: {
     /** The automation settings both providers share; null until loaded. */
     settings: Settings | null;
@@ -27,6 +28,7 @@
     now: number;
     locked: boolean;
     onresume: () => void;
+    returnNotes: NoteView[];
   } = $props();
   let toggles = $derived(
     items.filter((item) => item.kind === 'toggle') as Extract<
@@ -100,6 +102,14 @@
       </div>{/each}
   </dl>
   <p class="automation-help">{t($language, 'automationDetailsHelp')}</p>
+  <div class="returns-status">
+    <h3>{t($language, 'automaticReturns')}</h3>
+    {#each returnNotes as note (note.text)}<p
+        class:warning-text={note.tone === 'warn'}
+      >
+        {note.text}
+      </p>{/each}
+  </div>
   {#if returnHoldUntil !== null && returnHoldUntil > now}<div
       class="return-hold"
       role="status"
@@ -122,6 +132,24 @@
 </section>
 
 <style>
+  .returns-status {
+    border-top: 1px solid var(--line);
+    margin-top: 12px;
+    padding-top: 10px;
+  }
+  .returns-status h3 {
+    font-size: 0.73rem;
+    margin: 0 0 7px;
+  }
+  .returns-status p {
+    font-size: 0.7rem;
+    line-height: 1.55;
+    color: var(--subtle);
+    margin: 5px 0 0;
+  }
+  .returns-status p.warning-text {
+    color: var(--warn);
+  }
   .automation-help {
     margin: 10px 0 0;
     color: var(--subtle);

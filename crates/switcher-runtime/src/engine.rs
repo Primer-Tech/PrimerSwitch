@@ -23,7 +23,7 @@ use switcher_core::*;
 use switcher_platform::{
     ActiveSnapshot, ActiveStore, CliPaths, PlatformError, Recovery, Vault, app_data_dir,
 };
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Mutex, Notify, broadcast};
 
 const RECORD: &str = "runtime-state";
 const USAGE_MAX_AGE: i64 = 900;
@@ -92,7 +92,7 @@ pub enum RuntimeError {
     /// The active account's own Claude Code token was refused. The CLI owns it and
     /// renews it; PrimerSwitch never refreshes the active account.
     #[error(
-        "Claude Code's session for this account has expired. Use Claude Code once to renew it, or sign in again there."
+        "Claude Code's session needs renewal or repair. You can use Claude Code once to let it renew, or choose Sign in again here."
     )]
     ActiveSessionExpired,
     #[error("The settings are not valid.")]
@@ -101,6 +101,10 @@ pub enum RuntimeError {
     ReadOnly,
     #[error("The login expired or was canceled.")]
     Login,
+    #[error(
+        "Sign-in returned a different Claude account or workspace. Choose the saved account's original workspace, or use Add account."
+    )]
+    LoginIdentityMismatch,
     #[error("The import is no longer valid. Select the folder again.")]
     Import,
     #[error("The previous reset request must be confirmed before another attempt.")]
@@ -126,10 +130,11 @@ impl RuntimeError {
             Self::Identity=>"Identitatea contului nu a putut fi verificată.".into(),
             Self::Provider=>"Claude nu a furnizat o citire proaspătă. Reîncearcă mai târziu.".into(),
             Self::SignInRequired=>"Claude nu mai acceptă autentificarea salvată a acestui cont. Autentifică-te din nou pentru a-l folosi în continuare.".into(),
-            Self::ActiveSessionExpired=>"Sesiunea Claude Code pentru acest cont a expirat. Folosește Claude Code o dată pentru a o reînnoi sau autentifică-te din nou acolo.".into(),
+            Self::ActiveSessionExpired=>"Sesiunea Claude Code necesită reînnoire sau reparare. Poți folosi Claude Code o dată pentru a permite reînnoirea sau poți alege Autentifică-te din nou aici.".into(),
             Self::Settings=>"Setările introduse nu sunt valide.".into(),
             Self::ReadOnly=>"Această vizualizare este doar pentru citire.".into(),
             Self::Login=>"Autentificarea a expirat sau a fost anulată.".into(),
+            Self::LoginIdentityMismatch=>"Autentificarea a returnat alt cont Claude sau alt spațiu de lucru. Alege spațiul de lucru inițial al contului salvat sau folosește Adaugă un cont.".into(),
             Self::Import=>"Importul nu mai este valid. Selectează din nou dosarul.".into(),
             Self::PendingReset=>"Cererea anterioară de resetare trebuie confirmată înainte de o nouă încercare.".into(),
             Self::CliVersion=>"Versiunea Claude Code nu a putut fi detectată. Instalează o versiune recunoscută.".into(),
@@ -153,6 +158,7 @@ impl RuntimeError {
             Self::Settings => "settingsError",
             Self::ReadOnly => "readOnlyError",
             Self::Login => "loginExpired",
+            Self::LoginIdentityMismatch => "loginIdentityMismatch",
             Self::Import => "importExpired",
             Self::PendingReset => "pendingResetError",
             Self::CliVersion => "cliVersionError",
@@ -177,7 +183,7 @@ impl RuntimeError {
 }
 
 /// Every parameterless error, for mapping persisted text back to a stable code.
-const KNOWN_ERRORS: [RuntimeError; 16] = [
+const KNOWN_ERRORS: [RuntimeError; 17] = [
     RuntimeError::Storage,
     RuntimeError::UnavailableStorage,
     RuntimeError::UnsupportedContext,
@@ -191,6 +197,7 @@ const KNOWN_ERRORS: [RuntimeError; 16] = [
     RuntimeError::Settings,
     RuntimeError::ReadOnly,
     RuntimeError::Login,
+    RuntimeError::LoginIdentityMismatch,
     RuntimeError::Import,
     RuntimeError::PendingReset,
     RuntimeError::CliVersion,
@@ -296,10 +303,22 @@ struct Reading {
     /// proven, never sent over IPC.
     #[serde(skip_serializing_if = "Option::is_none")]
     unverified_oauth: Option<Value>,
+    /// A browser sign-in is authoritative; a concurrently captured CLI blob is
+    /// retained only as recovery evidence if that sign-in proves unusable.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    unverified_oauth_fallback_only: bool,
     /// Claude rejected the saved refresh token. Background refreshes back off to
     /// `SIGN_IN_RETRY` until a new sign-in or an explicit refresh succeeds.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     sign_in_required: bool,
+    /// Only a refused refresh grant or a missing refresh token establishes this.
+    /// Older releases' unconfirmed flags are revalidated once after upgrade.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    auth_failure_confirmed: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    active_reauth_pending: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile_retry_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     return_attempt_at: Option<i64>,
 }
@@ -349,6 +368,7 @@ struct Engine {
     /// by the CLI do not.
     identity_fingerprint: Option<String>,
     pending_login: Option<PendingLogin>,
+    pending_login_target: Option<LoginTarget>,
     login_intent: Arc<AtomicU64>,
     preview: Option<Preview>,
     revision: u64,
@@ -363,6 +383,19 @@ struct Engine {
     last_exhausted_notice: Option<i64>,
     last_full_at: Option<i64>,
     notifications: broadcast::Sender<Notification>,
+}
+struct LoginTarget {
+    id: String,
+    account_uuid: String,
+    organization_uuid: String,
+    active_fingerprint: Option<String>,
+}
+impl LoginTarget {
+    fn matches(&self, identity: &Value) -> bool {
+        identity.get("accountUuid").and_then(Value::as_str) == Some(&self.account_uuid)
+            && identity.get("organizationUuid").and_then(Value::as_str)
+                == Some(&self.organization_uuid)
+    }
 }
 struct Inner {
     owner: Mutex<Engine>,
@@ -381,6 +414,7 @@ struct Inner {
     login_intent: Arc<AtomicU64>,
     login_id: RwLock<Option<String>>,
     scheduler_started: AtomicBool,
+    claude_wake: Arc<Notify>,
 }
 #[derive(Clone)]
 pub struct RuntimeHandle {
@@ -396,7 +430,7 @@ enum Command {
     ResumeReturns,
     Settings(Settings),
     ImportCurrent,
-    BeginLogin(u64),
+    BeginLogin(u64, Option<String>),
     FinishLogin(String, String, u64),
     CancelLogin(String),
     Preview(PathBuf),
@@ -468,6 +502,13 @@ impl RuntimeHandle {
                 .validate()
                 .map_err(|_| RuntimeError::Settings)?;
             account.identity_verified = false;
+            if saved
+                .readings
+                .get(&account.id)
+                .is_some_and(|r| r.sign_in_required && !r.auth_failure_confirmed)
+            {
+                account.refresh_fail_at = None;
+            }
         }
         let login_intent = Arc::new(AtomicU64::new(0));
         let (notifications, _) = broadcast::channel(64);
@@ -488,6 +529,7 @@ impl RuntimeHandle {
             active_model: None,
             identity_fingerprint: None,
             pending_login: None,
+            pending_login_target: None,
             login_intent: login_intent.clone(),
             preview: None,
             revision: 0,
@@ -502,6 +544,16 @@ impl RuntimeHandle {
             last_full_at: None,
             notifications: notifications.clone(),
         };
+        for id in engine
+            .saved
+            .accounts
+            .iter()
+            .filter(|a| a.provider == ProviderId::Claude)
+            .map(|a| a.id.clone())
+            .collect::<Vec<_>>()
+        {
+            engine.record_return_window(&id)?;
+        }
         // An unreadable CLI file (for example mid-write) is a reading failure the next
         // cycle retries, not a reason to open an empty window.
         if let Err(error) = engine.observe_active() {
@@ -528,6 +580,7 @@ impl RuntimeHandle {
                 login_intent,
                 login_id: RwLock::new(None),
                 scheduler_started: AtomicBool::new(false),
+                claude_wake: Arc::new(Notify::new()),
             }),
         })
     }
@@ -587,6 +640,7 @@ impl RuntimeHandle {
             active_model: Some("sonnet".into()),
             identity_fingerprint: None,
             pending_login: None,
+            pending_login_target: None,
             login_intent: login_intent.clone(),
             preview: None,
             revision: 0,
@@ -618,6 +672,7 @@ impl RuntimeHandle {
                 login_intent,
                 login_id: RwLock::new(None),
                 scheduler_started: AtomicBool::new(false),
+                claude_wake: Arc::new(Notify::new()),
             }),
         }
     }
@@ -662,6 +717,7 @@ impl RuntimeHandle {
         }
         let weak = Arc::downgrade(&self.inner);
         tokio::spawn(async move {
+            let mut wake_ordinary = false;
             loop {
                 let Some(inner) = weak.upgrade() else {
                     break;
@@ -670,7 +726,8 @@ impl RuntimeHandle {
                 let ordinary = {
                     let engine = handle.inner.owner.lock().await;
                     let now = engine.clock.now();
-                    engine.return_check_due(now)
+                    wake_ordinary
+                        || engine.return_check_due(now)
                         || engine.last_full_at.is_none_or(|last| {
                             now < last || now - last >= engine.saved.settings.poll_interval as i64
                         })
@@ -680,8 +737,12 @@ impl RuntimeHandle {
                     let engine = handle.inner.owner.lock().await;
                     engine.poll_delay()
                 };
+                let wake = handle.inner.claude_wake.clone();
                 drop(handle);
-                tokio::time::sleep(Duration::from_secs(delay)).await;
+                wake_ordinary = tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(delay)) => false,
+                    _ = wake.notified() => true,
+                };
             }
         });
     }
@@ -742,6 +803,10 @@ impl RuntimeHandle {
             None
         };
         let full = matches!(command, Command::RefreshAll | Command::Tick(true));
+        let wake = matches!(
+            command,
+            Command::Settings(_) | Command::Automation(_, _) | Command::ResumeReturns
+        );
         // The previous outcome stays visible while busy and is replaced at the end, so
         // a persistent background failure does not flicker on every tick.
         engine.failed_account = None;
@@ -768,6 +833,9 @@ impl RuntimeHandle {
             Ok(_) => None,
         };
         self.publish(&mut engine, false);
+        if wake {
+            self.inner.claude_wake.notify_one();
+        }
         if full {
             self.inner
                 .refresh_generation
@@ -858,12 +926,30 @@ impl RuntimeHandle {
     pub async fn begin_login(&self) -> Result<LoginSession, RuntimeError> {
         match self
             .run(
-                Command::BeginLogin(self.inner.login_intent.fetch_add(1, Ordering::AcqRel) + 1),
+                Command::BeginLogin(
+                    self.inner.login_intent.fetch_add(1, Ordering::AcqRel) + 1,
+                    None,
+                ),
                 None,
             )
             .await?
         {
             Output::Login(s) => Ok(s),
+            _ => unreachable!(),
+        }
+    }
+    pub async fn begin_login_for_account(&self, id: &str) -> Result<LoginSession, RuntimeError> {
+        match self
+            .run(
+                Command::BeginLogin(
+                    self.inner.login_intent.fetch_add(1, Ordering::AcqRel) + 1,
+                    Some(id.into()),
+                ),
+                None,
+            )
+            .await?
+        {
+            Output::Login(session) => Ok(session),
             _ => unreachable!(),
         }
     }
@@ -912,16 +998,16 @@ impl Engine {
     fn threshold(&self) -> f64 {
         self.saved.settings.threshold_for(ProviderId::Claude)
     }
-    /// Remember a window spent up to this account's switch threshold, with an
-    /// observed reset. The handled ledger prevents recapturing the same reset.
+    /// Remember a five-hour window without preferred headroom and its observed
+    /// reset. Healthy windows never arm, and handled cycles cannot rearm.
     fn record_return_window(&mut self, id: &str) -> Result<(), RuntimeError> {
         let now = self.clock.now();
         let default = self.threshold();
         let i = self.index(id)?;
         let a = &mut self.saved.accounts[i];
-        if a.automation.return_on_five_hour_reset
-            && let Some(usage) = &a.last_usage
-            && usage.five_hour.utilization >= a.automation.effective_threshold(default)
+        if let Some(usage) = &a.last_usage
+            && usage.five_hour.utilization
+                > a.automation.effective_threshold(default) - HEADROOM_MARGIN
             && let Some(observed) = a.last_usage_at.filter(|at| *at <= now)
             && let Some(reset) = usage.five_hour.resets_at.filter(|reset| *reset > observed)
             && a.preferred_return_handled_reset_at
@@ -1138,6 +1224,7 @@ impl Engine {
             return false;
         };
         a.identity_verified
+            && !r.sign_in_required
             && r.complete
             && r.error.is_none()
             && recent(a.last_usage_at, now, USAGE_MAX_AGE)
@@ -1161,7 +1248,7 @@ impl Engine {
     }
     fn snapshot(&self, busy: bool) -> Snapshot {
         let now = self.clock.now();
-        let infos = self.infos(false);
+        let infos = self.infos(true);
         let order = self.saved.settings.candidate_order();
         let next = best_candidate(
             &infos,
@@ -1197,6 +1284,7 @@ impl Engine {
                     id: a.id.clone(),
                     name: safe_label(&a.name),
                     email: safe_label(a.email().unwrap_or(&a.name)),
+                    workspace_label: workspace_label(&a.oauth_account),
                     provider: a.provider,
                     automation: (&a.automation).into(),
                     effective_threshold: threshold,
@@ -1286,6 +1374,16 @@ impl Engine {
             Command::Settings(settings) => {
                 settings.validate().map_err(|_| RuntimeError::Settings)?;
                 self.saved.settings = settings;
+                for id in self
+                    .saved
+                    .accounts
+                    .iter()
+                    .filter(|a| a.provider == ProviderId::Claude)
+                    .map(|a| a.id.clone())
+                    .collect::<Vec<_>>()
+                {
+                    self.record_return_window(&id)?;
+                }
             }
             Command::Automation(id, automation) => {
                 automation.validate().map_err(|_| RuntimeError::Settings)?;
@@ -1297,16 +1395,46 @@ impl Engine {
                 self.saved.return_hold_until = None;
             }
             Command::ImportCurrent => self.import_current().await?,
-            Command::BeginLogin(epoch) => {
+            Command::BeginLogin(epoch, account_id) => {
                 if epoch != self.login_intent.load(Ordering::Acquire) {
                     return Err(RuntimeError::Login);
                 }
-                let login = PendingLogin::new(self.clock.now());
+                self.observe_active()?;
+                let target = account_id
+                    .map(|id| {
+                        let i = self.index(&id)?;
+                        let a = &self.saved.accounts[i];
+                        Ok::<_, RuntimeError>(LoginTarget {
+                            id,
+                            account_uuid: a
+                                .account_uuid()
+                                .filter(|id| !id.is_empty())
+                                .ok_or(RuntimeError::Identity)?
+                                .into(),
+                            organization_uuid: a
+                                .organization_uuid()
+                                .filter(|id| !id.is_empty())
+                                .ok_or(RuntimeError::Identity)?
+                                .into(),
+                            active_fingerprint: if self.active_id.as_deref() == Some(&a.id) {
+                                Some(self.live()?.fingerprint)
+                            } else {
+                                None
+                            },
+                        })
+                    })
+                    .transpose()?;
+                let mut login = PendingLogin::new(self.clock.now());
+                if let Some(target) = &target {
+                    let a = &self.saved.accounts[self.index(&target.id)?];
+                    login = login.with_account_hint(&target.organization_uuid, a.email());
+                }
                 let output = LoginSession {
                     id: login.id.clone(),
                     url: login.url.clone(),
                 };
                 self.pending_login = Some(login);
+                self.pending_login_target = target;
                 return Ok(Some(Output::Login(output)));
             }
             Command::FinishLogin(id, code, epoch) => {
@@ -1320,6 +1448,7 @@ impl Engine {
                     .take()
                     .filter(|p| p.id == id)
                     .ok_or(RuntimeError::Login)?;
+                let target = self.pending_login_target.take();
                 let login = self
                     .client()?
                     .finish_login(&pending, &code, self.clock.now())
@@ -1327,6 +1456,14 @@ impl Engine {
                     .map_err(|_| RuntimeError::Login)?;
                 if epoch != self.login_intent.load(Ordering::Acquire) {
                     return Err(RuntimeError::Login);
+                }
+                if let Some(target) = &target {
+                    let i = self.index(&target.id)?;
+                    if !target.matches(&login.profile.identity)
+                        || !target.matches(&self.saved.accounts[i].oauth_account)
+                    {
+                        return Err(RuntimeError::LoginIdentityMismatch);
+                    }
                 }
                 let mut account = StoredAccount::new(
                     login
@@ -1340,11 +1477,86 @@ impl Engine {
                     self.clock.now(),
                 );
                 login.profile.apply(&mut account, self.clock.now());
-                self.merge_account(account, true);
+                let stored_id = if let Some(target) = &target {
+                    let i = self.index(&target.id)?;
+                    self.merge_account_at(i, account, true)
+                } else {
+                    self.merge_account(account, true)
+                };
+                self.persist()?;
+                self.observe_active()?;
+                if target
+                    .as_ref()
+                    .is_some_and(|target| target.active_fingerprint.is_none())
+                    && self.active_id.as_deref() == Some(&stored_id)
+                    && self
+                        .saved
+                        .readings
+                        .get(&stored_id)
+                        .is_some_and(|r| r.active_reauth_pending)
+                {
+                    return Err(RuntimeError::ExternalChange);
+                }
+                if let Some(target) = &target
+                    && let Some(expected) = &target.active_fingerprint
+                {
+                    let i = self.index(&stored_id)?;
+                    self.saved
+                        .readings
+                        .entry(stored_id.clone())
+                        .or_default()
+                        .active_reauth_pending = true;
+                    self.saved
+                        .readings
+                        .entry(stored_id.clone())
+                        .or_default()
+                        .error = Some("activeSessionExpired".into());
+                    self.persist()?;
+                    let live = self.live()?;
+                    if live.fingerprint != *expected {
+                        let still_active = same_owner(&self.saved.accounts[i], &live.identity);
+                        let reading = self.saved.readings.entry(stored_id.clone()).or_default();
+                        reading.active_reauth_pending = still_active;
+                        reading.error = still_active.then(|| "activeSessionExpired".into());
+                        self.observe_active()?;
+                        return Err(RuntimeError::ExternalChange);
+                    }
+                    let account = self.saved.accounts[i].clone();
+                    self.active_store()?.switch_checked(
+                        &account.credentials,
+                        &account.oauth_account,
+                        expected,
+                        self.vault.as_ref().ok_or(RuntimeError::Storage)?,
+                    )?;
+                    self.saved
+                        .readings
+                        .entry(stored_id.clone())
+                        .or_default()
+                        .active_reauth_pending = false;
+                    self.saved
+                        .readings
+                        .entry(stored_id.clone())
+                        .or_default()
+                        .error = None;
+                    self.observe_active()?;
+                    self.saved.accounts[i].identity_verified = true;
+                    self.persist()?;
+                }
+                if target.is_some()
+                    && self.active_id.as_deref() != Some(&stored_id)
+                    && self.endpoint_allowed(&stored_id, true)
+                {
+                    // Auth repair is complete even if a separate quota read fails.
+                    // Fresh credentials are already durable before that read.
+                    let _ = self
+                        .poll_account_with_priming(&stored_id, true, false, false)
+                        .await;
+                }
             }
             Command::CancelLogin(id) => {
                 if self.pending_login.as_ref().is_some_and(|p| p.id == id) {
                     self.pending_login = None;
+                    self.pending_login_target = None;
                 }
             }
             Command::Preview(path) => {
@@ -1384,6 +1596,11 @@ impl Engine {
             .readings
             .get(&a.id)
             .is_some_and(|r| r.sign_in_required)
+            && self
+                .saved
+                .readings
+                .get(&a.id)
+                .is_some_and(|r| r.auth_failure_confirmed)
             && recent(a.refresh_fail_at, now, SIGN_IN_RETRY)
     }
 }
@@ -1456,6 +1673,24 @@ fn safe_label(value: &str) -> String {
         .take(160)
         .collect()
 }
+fn workspace_label(identity: &Value) -> Option<String> {
+    let name = identity
+        .get("organizationName")
+        .and_then(Value::as_str)
+        .map(safe_label)
+        .filter(|name| !name.trim().is_empty());
+    let suffix = identity
+        .get("organizationUuid")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
+        .map(|id| id.chars().take(8).collect::<String>());
+    match (name, suffix) {
+        (Some(name), Some(suffix)) => Some(format!("{name} · {suffix}")),
+        (Some(name), None) => Some(name),
+        (None, Some(suffix)) => Some(format!("Workspace {suffix}")),
+        _ => None,
+    }
+}
 
 impl Engine {
     /// `expected` is the identity fingerprint captured before an awaited request: the
@@ -1473,8 +1708,27 @@ impl Engine {
         token: &str,
         expected: &str,
     ) -> Result<(), RuntimeError> {
+        if self
+            .saved
+            .readings
+            .get(id)
+            .and_then(|r| r.profile_retry_at)
+            .is_some_and(|until| until > self.clock.now())
+        {
+            return Err(RuntimeError::Provider);
+        }
         let profile = self.client()?.profile(token).await;
         self.ensure_context(expected)?;
+        if let Err(ClientError::RateLimited { retry_after }) = &profile {
+            self.saved
+                .readings
+                .entry(id.into())
+                .or_default()
+                .profile_retry_at =
+                Some(self.clock.now().saturating_add(
+                    retry_after.unwrap_or(120).max(120).min(i64::MAX as u64) as i64,
+                ));
+        }
         let profile = profile.map_err(|error| match error {
             // A refused token is a sign-in problem, not an ownership mismatch.
             ClientError::Unauthorized => RuntimeError::SignInRequired,
@@ -1488,7 +1742,19 @@ impl Engine {
             return Err(RuntimeError::Identity);
         }
         profile.apply(&mut self.saved.accounts[i], self.clock.now());
+        self.saved
+            .readings
+            .entry(id.into())
+            .or_default()
+            .profile_retry_at = None;
+        self.clear_auth_failure(id);
         Ok(())
+    }
+    fn clear_auth_failure(&mut self, id: &str) {
+        if let Some(r) = self.saved.readings.get_mut(id) {
+            r.sign_in_required = false;
+            r.auth_failure_confirmed = false;
+        }
     }
     /// Adopts the CLI's current OAuth blob for the active account once its owner is
     /// proven. Returns the access token and the auth fingerprint of the adopted state,
@@ -1505,6 +1771,23 @@ impl Engine {
         let i = self.index(id)?;
         if !same_owner(&self.saved.accounts[i], &live.identity) {
             return Err(RuntimeError::Identity);
+        }
+        if self
+            .saved
+            .readings
+            .get(id)
+            .is_some_and(|r| r.active_reauth_pending)
+        {
+            if self.saved.accounts[i].credentials.get("claudeAiOauth")
+                != live.credentials.get("claudeAiOauth")
+            {
+                return Err(RuntimeError::ActiveSessionExpired);
+            }
+            self.saved
+                .readings
+                .entry(id.into())
+                .or_default()
+                .active_reauth_pending = false;
         }
         let token = live
             .credentials
@@ -1532,6 +1815,7 @@ impl Engine {
                 })?;
         }
         self.ensure_context(expected)?;
+        self.clear_auth_failure(id);
         // Only the CLI OAuth blob is adopted; saved credential extensions survive.
         let i = self.index(id)?;
         if !self.saved.accounts[i].credentials.is_object() {
@@ -1546,6 +1830,7 @@ impl Engine {
             // A newer proven CLI blob supersedes any captured copy and sign-in prompt.
             if let Some(r) = self.saved.readings.get_mut(id) {
                 r.unverified_oauth = None;
+                r.unverified_oauth_fallback_only = false;
                 r.sign_in_required = false;
             }
             self.persist()?;
@@ -1560,7 +1845,7 @@ impl Engine {
         forced: bool,
         user: bool,
         expected: &str,
-    ) -> Result<(), RuntimeError> {
+    ) -> Result<bool, RuntimeError> {
         self.ensure_context(expected)?;
         let i = self.index(id)?;
         let live = self.live()?;
@@ -1580,53 +1865,69 @@ impl Engine {
         // The CLI blob captured while switching away is newer than the saved copy (the
         // CLI rotated it), so it is resolved first and adopted only once proven.
         if !cooling
-            && let Some(candidate) = reading.unverified_oauth
+            && (!reading.unverified_oauth_fallback_only || reading.auth_failure_confirmed)
+            && let Some(candidate) = reading.unverified_oauth.clone()
             && self.resolve_candidate(id, candidate, expected).await?
         {
-            return Ok(());
+            return Ok(true);
         }
         let i = self.index(id)?;
         if !forced
+            && !reading.sign_in_required
             && self.saved.accounts[i]
                 .expires_at_ms()
                 .is_none_or(|t| t > now.saturating_add(120).saturating_mul(1000))
         {
-            return Ok(());
+            return Ok(false);
         }
         if cooling {
             return Err(RuntimeError::Provider);
         }
-        let refresh = self.saved.accounts[i]
+        let Some(refresh) = self.saved.accounts[i]
             .refresh_token()
-            .ok_or(RuntimeError::SignInRequired)?
-            .to_owned();
+            .filter(|token| !token.is_empty())
+            .map(str::to_owned)
+        else {
+            self.saved.accounts[i].refresh_fail_at = Some(now);
+            self.saved.accounts[i].identity_verified = false;
+            let r = self.saved.readings.entry(id.into()).or_default();
+            r.sign_in_required = true;
+            r.auth_failure_confirmed = true;
+            self.persist()?;
+            return Err(RuntimeError::SignInRequired);
+        };
         let result = self.client()?.refresh_token(&refresh).await;
         let i = self.index(id)?;
         match result {
             Ok(tokens) => {
                 tokens.apply_account(&mut self.saved.accounts[i], self.clock.now());
                 self.saved.accounts[i].identity_verified = false;
-                self.saved
-                    .readings
-                    .entry(id.into())
-                    .or_default()
-                    .sign_in_required = false;
+                self.clear_auth_failure(id);
                 self.persist()?;
                 self.ensure_context(expected)?;
-                Ok(())
+                Ok(true)
             }
             Err(error) => {
                 self.saved.accounts[i].refresh_fail_at = Some(now);
                 let refused = error == ClientError::InvalidGrant;
                 if refused {
-                    self.saved
-                        .readings
-                        .entry(id.into())
-                        .or_default()
-                        .sign_in_required = true;
+                    let r = self.saved.readings.entry(id.into()).or_default();
+                    r.sign_in_required = true;
+                    r.auth_failure_confirmed = true;
+                } else if let Some(r) = self.saved.readings.get_mut(id)
+                    && !r.auth_failure_confirmed
+                {
+                    r.sign_in_required = false;
                 }
                 self.persist()?;
                 self.ensure_context(expected)?;
+                if refused
+                    && reading.unverified_oauth_fallback_only
+                    && let Some(candidate) = reading.unverified_oauth
+                    && self.resolve_candidate(id, candidate, expected).await?
+                {
+                    return Ok(true);
+                }
                 Err(if refused {
                     RuntimeError::SignInRequired
                 } else {
@@ -1644,6 +1945,15 @@ impl Engine {
         candidate: Value,
         expected: &str,
     ) -> Result<bool, RuntimeError> {
+        if self
+            .saved
+            .readings
+            .get(id)
+            .and_then(|r| r.profile_retry_at)
+            .is_some_and(|until| until > self.clock.now())
+        {
+            return Err(RuntimeError::Provider);
+        }
         let Some(refresh) = candidate
             .get("refreshToken")
             .and_then(Value::as_str)
@@ -1696,18 +2006,35 @@ impl Engine {
                 profile.apply(account, now);
                 let reading = self.saved.readings.entry(id.into()).or_default();
                 reading.unverified_oauth = None;
+                reading.unverified_oauth_fallback_only = false;
+                reading.profile_retry_at = None;
                 reading.sign_in_required = false;
+                reading.auth_failure_confirmed = false;
                 self.persist()?;
                 Ok(true)
             }
             // Never adopted into an account it is not proven to belong to.
             Ok(_) | Err(ClientError::Unauthorized) => self.discard_candidate(id),
-            Err(_) => Err(RuntimeError::Provider),
+            Err(error) => {
+                let delay = match error {
+                    ClientError::RateLimited { retry_after } => retry_after.unwrap_or(120).max(120),
+                    _ => 120,
+                }
+                .min(i64::MAX as u64) as i64;
+                self.saved
+                    .readings
+                    .entry(id.into())
+                    .or_default()
+                    .profile_retry_at = Some(self.clock.now().saturating_add(delay));
+                self.persist()?;
+                Err(RuntimeError::Provider)
+            }
         }
     }
     fn discard_candidate(&mut self, id: &str) -> Result<bool, RuntimeError> {
         if let Some(reading) = self.saved.readings.get_mut(id) {
             reading.unverified_oauth = None;
+            reading.unverified_oauth_fallback_only = false;
         }
         self.persist()?;
         Ok(false)
@@ -1755,6 +2082,14 @@ impl Engine {
         Ok(())
     }
     async fn metadata(&mut self, id: &str, expected: &str) -> Result<UsageResponse, RuntimeError> {
+        self.metadata_with_refresh(id, expected, true).await
+    }
+    async fn metadata_with_refresh(
+        &mut self,
+        id: &str,
+        expected: &str,
+        allow_refresh: bool,
+    ) -> Result<UsageResponse, RuntimeError> {
         let i = self.index(id)?;
         self.saved.accounts[i].last_endpoint_attempt_at = Some(self.clock.now());
         self.persist()?;
@@ -1764,7 +2099,9 @@ impl Engine {
             .to_owned();
         let mut result = self.client()?.metadata(&token).await;
         self.ensure_context(expected)?;
-        if matches!(result, Err(ClientError::Unauthorized)) && self.active_id.as_deref() != Some(id)
+        if allow_refresh
+            && matches!(result, Err(ClientError::Unauthorized))
+            && self.active_id.as_deref() != Some(id)
         {
             // One bounded retry; rotated tokens are durable before another request.
             self.refresh_inactive(id, true, false, expected).await?;
@@ -1773,7 +2110,15 @@ impl Engine {
                 .access_token()
                 .ok_or(RuntimeError::Identity)?
                 .to_owned();
-            self.verify_profile(id, &token, expected).await?;
+            self.verify_profile(id, &token, expected)
+                .await
+                .map_err(|error| {
+                    if error == RuntimeError::SignInRequired {
+                        RuntimeError::Provider
+                    } else {
+                        error
+                    }
+                })?;
             result = self.client()?.metadata(&token).await;
             self.ensure_context(expected)?;
         }
@@ -1793,7 +2138,13 @@ impl Engine {
             }
             Err(error) => {
                 self.endpoint_error(id, &error)?;
-                Err(RuntimeError::Provider)
+                Err(
+                    if error == ClientError::Unauthorized && self.active_id.as_deref() == Some(id) {
+                        RuntimeError::ActiveSessionExpired
+                    } else {
+                        RuntimeError::Provider
+                    },
+                )
             }
         }
     }
@@ -1819,12 +2170,14 @@ impl Engine {
             return Err(RuntimeError::MissingAccount);
         }
         let result: Result<(), RuntimeError> = async {
+            let mut refreshed_auth = false;
             let token = if active {
                 self.adopt_active(id, &expected).await?.0
             } else {
-                self.refresh_inactive(id, false, force, &expected).await?;
+                let refreshed = self.refresh_inactive(id, false, force, &expected).await?;
+                refreshed_auth = refreshed;
                 let i = self.index(id)?;
-                let token = self.saved.accounts[i]
+                let mut token = self.saved.accounts[i]
                     .access_token()
                     .ok_or(RuntimeError::Identity)?
                     .to_owned();
@@ -1835,7 +2188,31 @@ impl Engine {
                         86400,
                     )
                 {
-                    self.verify_profile(id, &token, &expected).await?;
+                    match self.verify_profile(id, &token, &expected).await {
+                        Ok(()) => {}
+                        Err(RuntimeError::SignInRequired) if !refreshed => {
+                            // A rejected access token does not prove the refresh grant
+                            // is dead. Try it once, durably store rotation, then verify.
+                            self.refresh_inactive(id, true, force, &expected).await?;
+                            refreshed_auth = true;
+                            let i = self.index(id)?;
+                            token = self.saved.accounts[i]
+                                .access_token()
+                                .ok_or(RuntimeError::Identity)?
+                                .into();
+                            self.verify_profile(id, &token, &expected)
+                                .await
+                                .map_err(|error| {
+                                    if error == RuntimeError::SignInRequired {
+                                        RuntimeError::Provider
+                                    } else {
+                                        error
+                                    }
+                                })?;
+                        }
+                        Err(RuntimeError::SignInRequired) => return Err(RuntimeError::Provider),
+                        Err(error) => return Err(error),
+                    }
                 }
                 token
             };
@@ -1877,7 +2254,10 @@ impl Engine {
                 }
             }
             if !fast && self.endpoint_allowed(id, force || (active && live_usage.is_none())) {
-                match self.metadata(id, &expected).await {
+                match self
+                    .metadata_with_refresh(id, &expected, !refreshed_auth)
+                    .await
+                {
                     Ok(metadata) => {
                         let i = self.index(id)?;
                         let usage = if let Some(mut live) = live_usage.clone() {
@@ -1996,7 +2376,9 @@ impl Engine {
         self.automate(!ordinary).await?;
         // Inactive failures stay on their own rows; the active account's failure is
         // reported with its account so the status names it.
-        if let Some((id, error)) = active_error {
+        if let Some((id, error)) = active_error
+            && (self.active_id.as_deref() == Some(&id) || error == RuntimeError::ExternalChange)
+        {
             self.failed_account = Some(id);
             return Err(error);
         }
@@ -2073,9 +2455,6 @@ impl Engine {
             let now = self.clock.now();
             if reset > now
                 || self.returns_paused(now)
-                || self
-                    .active_account()
-                    .is_none_or(|active| active.last_usage.is_none() || !self.fresh(active))
                 || !self.is_return_candidate(&target)
                 || !self.recovery_headroom(&target, reset, now)
                 || target.last_usage_at.is_none_or(|at| at < reset)
@@ -2093,7 +2472,16 @@ impl Engine {
             self.saved.last_auto_switch_at = Some(now);
             self.persist()?;
         }
+        let outgoing = self.active_id.clone();
         self.capture_and_switch(&target, &expected).await?;
+        if let Some(outgoing) = outgoing.filter(|outgoing| outgoing != id)
+            && let Some(reading) = self.saved.readings.get_mut(&outgoing)
+        {
+            reading.active_reauth_pending = false;
+            if reading.error.as_deref() == Some("activeSessionExpired") {
+                reading.error = None;
+            }
+        }
         let live = self.live()?;
         self.active_id = Some(id.into());
         self.identity_fingerprint = Some(live.identity_fingerprint);
@@ -2165,6 +2553,31 @@ impl Engine {
             return Ok(live.fingerprint);
         };
         let i = self.index(&outgoing)?;
+        if self
+            .saved
+            .readings
+            .get(&outgoing)
+            .is_some_and(|r| r.active_reauth_pending)
+        {
+            if let Some(blob) = live
+                .credentials
+                .get("claudeAiOauth")
+                .filter(|v| v.is_object())
+            {
+                self.saved
+                    .readings
+                    .entry(outgoing.clone())
+                    .or_default()
+                    .unverified_oauth = Some(blob.clone());
+                self.saved
+                    .readings
+                    .entry(outgoing.clone())
+                    .or_default()
+                    .unverified_oauth_fallback_only = true;
+                self.persist()?;
+            }
+            return Ok(live.fingerprint);
+        }
         // Nothing to capture when the CLI holds no blob, or exactly the saved one that
         // was proven when it was saved: no verification request an expired token fails.
         let blob = live
@@ -2176,7 +2589,7 @@ impl Engine {
         }
         match self.adopt_active(&outgoing, expected).await {
             Ok((_, captured)) => Ok(captured),
-            Err(RuntimeError::ActiveSessionExpired) => {
+            Err(RuntimeError::ActiveSessionExpired | RuntimeError::Provider) => {
                 let live = self.live()?;
                 if live.identity_fingerprint != expected {
                     return Err(RuntimeError::ExternalChange);
@@ -2681,14 +3094,9 @@ impl Engine {
             self.saved.accounts[i].preferred_return_handled_reset_at = Some(reset);
             self.persist()?;
         }
-        // Like exhaustion switching (B14), returns need a current proof for the
-        // active account as well as the target; a failed active check suspends them.
-        if fast
-            || self.returns_paused(now)
-            || self
-                .active_account()
-                .is_none_or(|active| active.last_usage.is_none() || !self.fresh(active))
-        {
+        // Recovery is proven by the target's fresh quota. The outgoing CLI owner
+        // and any newer token are checked by the transactional switch below.
+        if fast || self.returns_paused(now) {
             return Ok(false);
         }
         let mut candidates: Vec<_> = self
@@ -2898,40 +3306,87 @@ impl Engine {
         self.observe_active()?;
         Ok(())
     }
-    fn merge_account(&mut self, mut incoming: StoredAccount, fresh_tokens: bool) {
-        if let Some(existing) = self.saved.accounts.iter_mut().find(|a| {
+    fn merge_account(&mut self, mut incoming: StoredAccount, fresh_tokens: bool) -> String {
+        if let Some(i) = self.saved.accounts.iter().position(|a| {
             a.provider == incoming.provider
                 && a.account_uuid().is_some()
                 && a.account_uuid() == incoming.account_uuid()
                 && a.organization_uuid() == incoming.organization_uuid()
         }) {
-            if fresh_tokens {
-                if !existing.credentials.is_object() {
-                    existing.credentials = json!({});
-                }
-                existing.credentials["claudeAiOauth"] =
-                    incoming.credentials["claudeAiOauth"].clone();
-                existing.oauth_account = incoming.oauth_account;
-                existing.saved_at = incoming.saved_at;
-                existing.identity_verified = incoming.identity_verified;
-                existing.subscription_status = incoming.subscription_status;
-                existing.subscription_started_at = incoming.subscription_started_at;
-                existing.plan_tier = incoming.plan_tier;
-                existing.profile_checked_at = incoming.profile_checked_at;
-                existing.refresh_fail_at = None;
-                // A new proven sign-in supersedes a captured blob and a sign-in prompt.
-                if let Some(reading) = self.saved.readings.get_mut(&existing.id) {
-                    reading.unverified_oauth = None;
-                    reading.sign_in_required = false;
-                    reading.error = None;
-                }
-            }
-            // A replayed legacy import must never replace newer rotations, renewal,
-            // cached observations, or unresolved operations in the encrypted vault.
+            self.merge_account_at(i, incoming, fresh_tokens)
         } else {
             incoming.identity_verified = fresh_tokens && incoming.identity_verified;
+            let pending_active = fresh_tokens && self.browser_login_needs_cli_repair(&incoming);
+            let id = incoming.id.clone();
             self.saved.accounts.push(incoming);
+            if fresh_tokens {
+                let reading = self.saved.readings.entry(id.clone()).or_default();
+                reading.active_reauth_pending = pending_active;
+                reading.error = pending_active.then(|| "activeSessionExpired".into());
+            }
+            id
         }
+    }
+    fn browser_login_needs_cli_repair(&self, incoming: &StoredAccount) -> bool {
+        self.live().map_or(true, |live| {
+            same_owner(incoming, &live.identity)
+                && live.credentials.get("claudeAiOauth")
+                    != incoming.credentials.get("claudeAiOauth")
+        })
+    }
+    fn merge_account_at(
+        &mut self,
+        i: usize,
+        incoming: StoredAccount,
+        fresh_tokens: bool,
+    ) -> String {
+        let pending_active = fresh_tokens && self.browser_login_needs_cli_repair(&incoming);
+        let existing = &mut self.saved.accounts[i];
+        if fresh_tokens {
+            if !existing.credentials.is_object() {
+                existing.credentials = json!({});
+            }
+            if !existing.credentials["claudeAiOauth"].is_object() {
+                existing.credentials["claudeAiOauth"] = json!({});
+            }
+            if let Some(fields) = incoming.credentials["claudeAiOauth"].as_object() {
+                existing.credentials["claudeAiOauth"]
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(fields.clone());
+            }
+            if !existing.oauth_account.is_object() {
+                existing.oauth_account = json!({});
+            }
+            if let Some(fields) = incoming.oauth_account.as_object() {
+                existing
+                    .oauth_account
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(fields.clone());
+            }
+            existing.saved_at = incoming.saved_at;
+            existing.identity_verified = incoming.identity_verified;
+            existing.subscription_status = incoming.subscription_status;
+            existing.subscription_started_at = incoming.subscription_started_at;
+            existing.plan_tier = incoming.plan_tier;
+            existing.profile_checked_at = incoming.profile_checked_at;
+            existing.refresh_fail_at = None;
+            // A new proven sign-in supersedes a captured blob and a sign-in prompt.
+            {
+                let reading = self.saved.readings.entry(existing.id.clone()).or_default();
+                reading.unverified_oauth = None;
+                reading.unverified_oauth_fallback_only = false;
+                reading.sign_in_required = false;
+                reading.auth_failure_confirmed = false;
+                reading.error = pending_active.then(|| "activeSessionExpired".into());
+                reading.complete = false;
+                reading.active_reauth_pending = pending_active;
+                reading.profile_retry_at = None;
+            }
+        }
+        // A replayed legacy import never replaces newer rotations or automation.
+        existing.id.clone()
     }
     fn preview_import(&mut self, path: PathBuf) -> Result<ImportPreview, RuntimeError> {
         let metadata = std::fs::symlink_metadata(&path).map_err(|_| RuntimeError::Import)?;
@@ -3475,6 +3930,14 @@ mod tests {
             1000,
             fake.clone(),
         );
+        {
+            // Ranking requires runtime owner proofs, not startup cache assertions.
+            let mut engine = handle.inner.owner.lock().await;
+            for a in &mut engine.saved.accounts {
+                a.identity_verified = true;
+            }
+            handle.publish(&mut engine, false);
+        }
         let snapshot = handle.get_snapshot();
         assert!(snapshot.settings.prefer_soonest_weekly_reset);
         assert_eq!(
@@ -6032,7 +6495,7 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn natural_returns_require_fresh_verified_complete_active_usage() {
+    async fn natural_returns_preserve_outgoing_owner_without_requiring_outgoing_quota() {
         for state in ["failed", "unverified", "stale", "incomplete", "missing"] {
             let fake = Arc::new(Fake::default());
             let mut b = account("b", 1000);
@@ -6063,26 +6526,20 @@ mod tests {
                 "missing" => engine.saved.accounts[0].last_usage = None,
                 _ => unreachable!(),
             }
-            assert!(!engine.automatic_return(false).await.unwrap(), "{state}");
-            assert_eq!(engine.active_id.as_deref(), Some("a"), "{state}");
-            assert_eq!(
+            assert!(engine.automatic_return(false).await.unwrap(), "{state}");
+            assert_eq!(engine.active_id.as_deref(), Some("b"), "{state}");
+            assert_ne!(
                 std::fs::read(&paths.credentials_file).unwrap(),
                 before,
                 "{state}"
             );
-            assert!(fake.calls.lock().unwrap().is_empty(), "{state}");
             let saved = saved_record(&temp);
-            assert_eq!(
-                saved.accounts[1].preferred_return_reset_at,
-                Some(1100),
-                "{state}"
-            );
-            assert!(saved.last_auto_switch_at.is_none(), "{state}");
-            assert!(saved.readings["b"].return_attempt_at.is_none(), "{state}");
+            assert_eq!(saved.accounts[1].preferred_return_reset_at, None, "{state}");
+            assert_eq!(saved.last_auto_switch_at, Some(1100), "{state}");
         }
     }
     #[tokio::test]
-    async fn failed_active_check_cannot_return_to_an_otherwise_healthy_recovered_target() {
+    async fn failed_active_quota_check_can_return_to_a_fresh_recovered_target() {
         let fake = Arc::new(Fake::default());
         let mut b = account("b", 1000);
         b.automation = AccountAutomation {
@@ -6106,16 +6563,759 @@ mod tests {
             .unwrap()
             .push(("token-a", ClientError::InvalidResponse));
         let before = std::fs::read(&paths.credentials_file).unwrap();
-        assert_eq!(handle.tick(true).await.unwrap_err(), RuntimeError::Provider);
-        assert_eq!(handle.get_snapshot().active_id.as_deref(), Some("a"));
+        handle.tick(true).await.unwrap();
+        assert_eq!(handle.get_snapshot().active_id.as_deref(), Some("b"));
         assert!(
             view(&handle, "b").decision_fresh,
             "the target is recovered and freshly proven"
         );
-        assert_eq!(std::fs::read(&paths.credentials_file).unwrap(), before);
+        assert_ne!(std::fs::read(&paths.credentials_file).unwrap(), before);
         let saved = saved_record(&temp);
-        assert_eq!(saved.accounts[1].preferred_return_reset_at, Some(1100));
-        assert!(saved.last_auto_switch_at.is_none());
+        assert_eq!(saved.accounts[1].preferred_return_reset_at, None);
+        assert_eq!(saved.last_auto_switch_at, Some(1100));
+    }
+    #[tokio::test]
+    async fn inactive_access_rejection_refreshes_once_and_revalidates_owner() {
+        let fake = Arc::new(Fake::default());
+        let (temp, handle, _clock, paths) = fixture(
+            vec![account("a", 1000), account("b", 1000)],
+            Some("a"),
+            1000,
+            fake.clone(),
+        );
+        let active = std::fs::read(&paths.credentials_file).unwrap();
+        fake.replies
+            .lock()
+            .unwrap()
+            .push_back((PROFILE_URL, Ok(response(401, Value::Null))));
+        handle.refresh_account("b").await.unwrap();
+        assert_eq!(count(&fake, TOKEN_URL), 1);
+        assert_eq!(count(&fake, PROFILE_URL), 2);
+        assert!(!view(&handle, "b").sign_in_required);
+        assert!(view(&handle, "b").decision_fresh);
+        assert_eq!(
+            saved_record(&temp).accounts[1].access_token(),
+            Some("token-b-rotated-SENTINEL")
+        );
+        assert_eq!(std::fs::read(&paths.credentials_file).unwrap(), active);
+        let calls = fake.calls.lock().unwrap();
+        let sequence: Vec<_> = calls.iter().map(|r| r.url.as_str()).collect();
+        assert_eq!(
+            sequence,
+            vec![PROFILE_URL, TOKEN_URL, PROFILE_URL, USAGE_URL]
+        );
+    }
+    #[tokio::test]
+    async fn explicit_retry_refreshes_a_rejected_grant_even_with_a_future_access_expiry() {
+        let fake = Arc::new(Fake::default());
+        let (temp, handle, _clock, _paths) = fixture(
+            vec![account("a", 1000), account("b", 1000)],
+            Some("a"),
+            1000,
+            fake.clone(),
+        );
+        fake.replies.lock().unwrap().extend([
+            (PROFILE_URL, Ok(response(401, Value::Null))),
+            (
+                TOKEN_URL,
+                Ok(response(400, json!({"error":"invalid_grant"}))),
+            ),
+        ]);
+        assert_eq!(
+            handle.refresh_account("b").await.unwrap_err(),
+            RuntimeError::SignInRequired
+        );
+        assert!(view(&handle, "b").sign_in_required);
+        assert!(saved_record(&temp).readings["b"].auth_failure_confirmed);
+        assert!(!view(&handle, "b").is_next);
+        handle.refresh_account("b").await.unwrap();
+        assert_eq!(count(&fake, TOKEN_URL), 2);
+        assert!(!view(&handle, "b").sign_in_required);
+        assert!(view(&handle, "b").decision_fresh);
+    }
+    #[tokio::test]
+    async fn profile_permissions_and_repeated_access_failures_do_not_claim_a_revoked_grant() {
+        for status in [403, 429, 503, 401] {
+            let fake = Arc::new(Fake::default());
+            let (_temp, handle, _clock, _paths) = fixture(
+                vec![account("a", 1000), account("b", 1000)],
+                Some("a"),
+                1000,
+                fake.clone(),
+            );
+            fake.replies
+                .lock()
+                .unwrap()
+                .push_back((PROFILE_URL, Ok(response(status, Value::Null))));
+            if status == 401 {
+                fake.replies.lock().unwrap().extend([
+                    (TOKEN_URL,Ok(response(200,json!({"access_token":"token-b-refreshed","refresh_token":"refresh-b-new","expires_in":3600})))),
+                    (PROFILE_URL,Ok(response(401,Value::Null))),
+                ]);
+            }
+            assert_eq!(
+                handle.refresh_account("b").await.unwrap_err(),
+                RuntimeError::Provider,
+                "{status}"
+            );
+            assert!(!view(&handle, "b").sign_in_required, "{status}");
+            assert!(!view(&handle, "b").is_next, "{status}");
+            assert_eq!(
+                count(&fake, TOKEN_URL),
+                usize::from(status == 401),
+                "{status}"
+            );
+        }
+    }
+    #[tokio::test]
+    async fn legacy_auth_flags_revalidate_once_and_valid_active_tokens_clear_stale_prompts() {
+        let fake = Arc::new(Fake::default());
+        let (temp, handle, clock, paths) = fixture(
+            vec![account("a", 1000), account("b", 1000)],
+            Some("a"),
+            1000,
+            fake.clone(),
+        );
+        {
+            let mut engine = handle.inner.owner.lock().await;
+            let r = engine.saved.readings.get_mut("b").unwrap();
+            r.sign_in_required = true;
+            r.error = Some("signInRequired".into());
+            engine.saved.accounts[1].refresh_fail_at = Some(1000);
+            engine.persist().unwrap();
+        }
+        drop(handle);
+        let reopened = RuntimeHandle::from_parts(
+            Vault::with_key(temp.path().join("vault"), [7; 32]).unwrap(),
+            ActiveStore::file(paths.clone()),
+            ClaudeClient::with_transport("2.1.300", fake.clone()).unwrap(),
+            clock,
+        )
+        .unwrap();
+        reopened.tick(true).await.unwrap();
+        assert_eq!(count(&fake, TOKEN_URL), 1);
+        assert!(!view(&reopened, "b").sign_in_required);
+        let auth = std::fs::read(&paths.credentials_file).unwrap();
+        {
+            let mut engine = reopened.inner.owner.lock().await;
+            let r = engine.saved.readings.get_mut("a").unwrap();
+            r.sign_in_required = true;
+            r.auth_failure_confirmed = true;
+            r.error = Some("signInRequired".into());
+        }
+        reopened.refresh_account("a").await.unwrap();
+        assert!(!view(&reopened, "a").sign_in_required);
+        assert_eq!(std::fs::read(&paths.credentials_file).unwrap(), auth);
+        assert_eq!(
+            count(&fake, TOKEN_URL),
+            1,
+            "active refresh belongs to Claude Code"
+        );
+    }
+    fn code_for(session: &LoginSession) -> String {
+        format!(
+            "fixture#{}",
+            session
+                .url
+                .split("state=")
+                .nth(1)
+                .unwrap()
+                .split('&')
+                .next()
+                .unwrap()
+        )
+    }
+    #[tokio::test]
+    async fn targeted_reauthentication_updates_only_the_selected_identity_and_preserves_preferences()
+     {
+        let fake = Arc::new(Fake::default());
+        let mut b = account("b", 1000);
+        b.automation = AccountAutomation {
+            threshold: Some(80.0),
+            priority: Some(1),
+            return_on_five_hour_reset: true,
+            ..AccountAutomation::default()
+        };
+        b.preferred_return_reset_at = Some(1100);
+        b.renewal_day = Some(17);
+        b.oauth_account["organizationName"] = json!("Personal");
+        let mut duplicate = b.clone();
+        duplicate.id = "b-other-row".into();
+        duplicate.credentials["claudeAiOauth"]["accessToken"] = json!("token-b-newest-other-row");
+        let (temp, handle, _clock, paths) = fixture(
+            vec![account("a", 1000), duplicate.clone(), b.clone()],
+            Some("a"),
+            1000,
+            fake.clone(),
+        );
+        let active = std::fs::read(&paths.credentials_file).unwrap();
+        let session = handle.begin_login_for_account("b").await.unwrap();
+        assert!(session.url.contains("orgUUID=org-b"));
+        let snapshot = handle
+            .finish_login(&session.id, &code_for(&session))
+            .await
+            .unwrap();
+        assert_eq!(snapshot.accounts.len(), 3);
+        let saved = saved_record(&temp);
+        assert_eq!(saved.accounts[1].credentials, duplicate.credentials);
+        let repaired = &saved.accounts[2];
+        assert_eq!(repaired.id, "b");
+        assert_eq!(repaired.name, b.name);
+        assert_eq!(repaired.automation, b.automation);
+        assert_eq!(repaired.preferred_return_reset_at, Some(1100));
+        assert_eq!(repaired.renewal_day, Some(17));
+        assert_eq!(repaired.credentials["claudeAiOauth"]["extension"], true);
+        assert_eq!(repaired.credentials["preserve"], true);
+        assert_eq!(repaired.access_token(), Some("token-b-rotated-SENTINEL"));
+        assert_eq!(std::fs::read(&paths.credentials_file).unwrap(), active);
+        assert!(view(&handle, "b").decision_fresh);
+        assert!(
+            view(&handle, "b")
+                .workspace_label
+                .as_deref()
+                .unwrap()
+                .contains("Personal")
+        );
+    }
+    #[tokio::test]
+    async fn targeted_reauthentication_rejects_another_workspace_or_owner_without_adding_rows() {
+        for owner in ["b", "different"] {
+            let fake = Arc::new(Fake::default());
+            let (temp, handle, _clock, _paths) = fixture(
+                vec![account("a", 1000), account("b", 1000)],
+                Some("a"),
+                1000,
+                fake.clone(),
+            );
+            let session = handle.begin_login_for_account("b").await.unwrap();
+            fake.replies.lock().unwrap().extend([
+                (TOKEN_URL,Ok(response(200,json!({"access_token":"token-b-login","refresh_token":"refresh-b-login","expires_in":3600})))),
+                (PROFILE_URL,Ok(response(200,json!({"account":{"uuid":owner,"email":"b@example.invalid"},"organization":{"uuid":"different-workspace"}})))),
+            ]);
+            assert_eq!(
+                handle
+                    .finish_login(&session.id, &code_for(&session))
+                    .await
+                    .unwrap_err(),
+                RuntimeError::LoginIdentityMismatch
+            );
+            let saved = saved_record(&temp);
+            assert_eq!(saved.accounts.len(), 2);
+            assert_eq!(
+                saved.accounts[1].credentials,
+                account("b", 1000).credentials
+            );
+        }
+    }
+    #[tokio::test]
+    async fn active_targeted_reauth_repairs_cli_atomically_and_conflicts_preserve_new_saved_tokens()
+    {
+        for conflict in ["none", "rotation", "rotation-retry", "owner"] {
+            let fake = Arc::new(Fake::default());
+            let (temp, handle, clock, paths) = fixture(
+                vec![account("a", 1000), account("c", 1000)],
+                Some("a"),
+                1000,
+                fake.clone(),
+            );
+            touch_cli(&paths);
+            let session = handle.begin_login_for_account("a").await.unwrap();
+            if conflict != "none" {
+                let paths = paths.clone();
+                *fake.hook.lock().unwrap() = Some(Box::new(move |_| {
+                    let mut external = account(if conflict == "owner" { "c" } else { "a" }, 1000);
+                    external.credentials["claudeAiOauth"]["accessToken"] =
+                        json!("token-external-newest");
+                    std::fs::write(
+                        &paths.credentials_file,
+                        serde_json::to_vec(&external.credentials).unwrap(),
+                    )
+                    .unwrap();
+                    std::fs::write(
+                        &paths.global_config_file,
+                        serde_json::to_vec(
+                            &json!({"oauthAccount":external.oauth_account,"keep":true}),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                }));
+            }
+            fake.replies.lock().unwrap().push_back((TOKEN_URL,Ok(response(200,json!({"access_token":"token-a-browser-new","refresh_token":"refresh-a-browser-new","expires_in":3600})))));
+            let result = handle.finish_login(&session.id, &code_for(&session)).await;
+            let saved = saved_record(&temp);
+            assert_eq!(
+                saved.accounts[0].access_token(),
+                Some("token-a-browser-new"),
+                "{conflict}"
+            );
+            let auth = read_json(&paths.credentials_file);
+            if conflict == "none" {
+                result.unwrap();
+                assert_eq!(auth["claudeAiOauth"]["accessToken"], "token-a-browser-new");
+                assert_eq!(auth["mcpOAuth"], 1);
+                assert_eq!(read_json(&paths.global_config_file)["numStartups"], 1);
+                assert!(!saved.readings["a"].active_reauth_pending);
+            } else {
+                assert_eq!(result.unwrap_err(), RuntimeError::ExternalChange);
+                assert_eq!(
+                    auth["claudeAiOauth"]["accessToken"],
+                    "token-external-newest"
+                );
+                assert_eq!(
+                    saved.readings["a"].active_reauth_pending,
+                    conflict != "owner"
+                );
+                if conflict.starts_with("rotation") {
+                    assert_eq!(
+                        view(&handle, "a").error.as_deref(),
+                        Some("activeSessionExpired")
+                    );
+                    assert_eq!(
+                        handle.refresh_account("a").await.unwrap_err(),
+                        RuntimeError::ActiveSessionExpired
+                    );
+                    assert_eq!(
+                        saved_record(&temp).accounts[0].access_token(),
+                        Some("token-a-browser-new")
+                    );
+                    drop(handle);
+                    let reopened = RuntimeHandle::from_parts(
+                        Vault::with_key(temp.path().join("vault"), [7; 32]).unwrap(),
+                        ActiveStore::file(paths.clone()),
+                        ClaudeClient::with_transport("2.1.300", fake.clone()).unwrap(),
+                        clock,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        reopened.refresh_account("a").await.unwrap_err(),
+                        RuntimeError::ActiveSessionExpired
+                    );
+                    assert_eq!(
+                        saved_record(&temp).accounts[0].access_token(),
+                        Some("token-a-browser-new")
+                    );
+                    if conflict == "rotation-retry" {
+                        let retry = reopened.begin_login_for_account("a").await.unwrap();
+                        fake.replies.lock().unwrap().push_back((TOKEN_URL,Ok(response(200,json!({"access_token":"token-a-browser-retry","refresh_token":"refresh-a-browser-retry","expires_in":3600})))));
+                        reopened
+                            .finish_login(&retry.id, &code_for(&retry))
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            read_json(&paths.credentials_file)["claudeAiOauth"]["accessToken"],
+                            "token-a-browser-retry"
+                        );
+                        assert!(!saved_record(&temp).readings["a"].active_reauth_pending);
+                    } else {
+                        reopened.switch_account("c").await.unwrap();
+                        assert_eq!(reopened.get_snapshot().active_id.as_deref(), Some("c"));
+                        let saved = saved_record(&temp);
+                        assert!(!saved.readings["a"].active_reauth_pending);
+                        assert_eq!(
+                            saved.accounts[0].access_token(),
+                            Some("token-a-browser-new")
+                        );
+                        assert_eq!(
+                            saved.readings["a"].unverified_oauth.as_ref().unwrap()["accessToken"],
+                            "token-external-newest"
+                        );
+                        let refreshes = count(&fake, TOKEN_URL);
+                        fake.replies.lock().unwrap().push_back((TOKEN_URL,Ok(response(200,json!({"access_token":"token-a-old-candidate-valid","refresh_token":"refresh-a-old-candidate-valid","expires_in":3600})))));
+                        reopened.refresh_account("a").await.unwrap();
+                        let saved = saved_record(&temp);
+                        assert_eq!(
+                            saved.accounts[0].access_token(),
+                            Some("token-a-browser-new")
+                        );
+                        assert_eq!(
+                            count(&fake, TOKEN_URL),
+                            refreshes,
+                            "the ambiguous captured grant is not preferred to browser auth"
+                        );
+                        assert!(saved.readings["a"].unverified_oauth_fallback_only);
+                        assert_eq!(
+                            saved.readings["a"].unverified_oauth.as_ref().unwrap()["accessToken"],
+                            "token-external-newest"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    #[tokio::test]
+    async fn next_account_requires_fresh_successful_auth_and_usage_proof() {
+        let fake = Arc::new(Fake::default());
+        let accounts = ["a", "dead", "failed", "unverified", "stale", "ready"]
+            .map(|id| account(id, 1000))
+            .to_vec();
+        let (_temp, handle, _clock, _paths) = fixture(accounts, Some("a"), 1000, fake);
+        assert!(handle.get_snapshot().consumption_plan.is_empty());
+        let mut engine = handle.inner.owner.lock().await;
+        for a in &mut engine.saved.accounts {
+            a.identity_verified = true;
+        }
+        engine
+            .saved
+            .readings
+            .get_mut("dead")
+            .unwrap()
+            .sign_in_required = true;
+        engine.saved.readings.get_mut("failed").unwrap().error = Some("providerError".into());
+        let i = engine.index("unverified").unwrap();
+        engine.saved.accounts[i].identity_verified = false;
+        let i = engine.index("stale").unwrap();
+        engine.saved.accounts[i].last_usage_at = Some(0);
+        let snapshot = engine.snapshot(false);
+        assert_eq!(snapshot.consumption_plan, vec!["a", "ready"]);
+        assert!(
+            snapshot
+                .accounts
+                .iter()
+                .find(|a| a.id == "ready")
+                .unwrap()
+                .is_next
+        );
+        assert!(
+            !snapshot
+                .accounts
+                .iter()
+                .filter(|a| a.id != "ready")
+                .any(|a| a.is_next)
+        );
+    }
+    #[tokio::test]
+    async fn observed_near_spent_history_survives_late_opt_in_and_restart() {
+        for (five, arms) in [(95.0, true), (92.0, false)] {
+            let fake = Arc::new(Fake::default());
+            let mut b = account("b", 1000);
+            b.automation.threshold = Some(97.0);
+            b.last_usage.as_mut().unwrap().five_hour = UsageWindow {
+                utilization: five,
+                resets_at: Some(1100),
+            };
+            let (temp, handle, clock, paths) =
+                fixture(vec![account("a", 1000), b], Some("a"), 1000, fake.clone());
+            assert_eq!(
+                handle.inner.owner.lock().await.saved.accounts[1].preferred_return_reset_at,
+                if arms { Some(1100) } else { None }
+            );
+            clock.0.store(1100, Ordering::SeqCst);
+            handle.tick(true).await.unwrap();
+            drop(handle);
+            let reopened = RuntimeHandle::from_parts(
+                Vault::with_key(temp.path().join("vault"), [7; 32]).unwrap(),
+                ActiveStore::file(paths),
+                ClaudeClient::with_transport("2.1.300", fake).unwrap(),
+                clock,
+            )
+            .unwrap();
+            reopened
+                .update_account_automation(
+                    "b",
+                    AccountAutomationView {
+                        threshold: Some(97.0),
+                        priority: Some(1),
+                        return_on_five_hour_reset: true,
+                        ..AccountAutomationView::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let mut settings: Settings = reopened.get_snapshot().settings.into();
+            settings.auto_switch_enabled = true;
+            reopened.update_settings(settings).await.unwrap();
+            reopened.tick(true).await.unwrap();
+            assert_eq!(
+                reopened.get_snapshot().active_id.as_deref(),
+                Some(if arms { "b" } else { "a" })
+            );
+        }
+    }
+    #[tokio::test]
+    async fn resume_wakes_a_sleeping_scheduler_and_runs_full_return_validation() {
+        let fake = Arc::new(Fake::default());
+        let mut b = account("b", 1000);
+        b.last_usage.as_mut().unwrap().five_hour = UsageWindow {
+            utilization: 95.0,
+            resets_at: Some(1100),
+        };
+        let (_temp, handle, clock, _paths) =
+            fixture(vec![account("a", 1000), b], Some("a"), 1000, fake);
+        clock.0.store(1100, Ordering::SeqCst);
+        handle.tick(true).await.unwrap();
+        handle
+            .update_account_automation(
+                "b",
+                AccountAutomationView {
+                    priority: Some(1),
+                    return_on_five_hour_reset: true,
+                    ..AccountAutomationView::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mut settings: Settings = handle.get_snapshot().settings.into();
+        settings.auto_switch_enabled = true;
+        settings.poll_interval = 900;
+        handle.update_settings(settings).await.unwrap();
+        {
+            let mut engine = handle.inner.owner.lock().await;
+            engine.saved.return_hold_until = Some(2000);
+            engine.persist().unwrap();
+        }
+        // Consume prior settings notifications before starting this isolated loop.
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            handle.inner.claude_wake.notified(),
+        )
+        .await
+        .unwrap();
+        let mut events = handle.subscribe();
+        handle.start_scheduler();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !events.recv().await.unwrap().busy {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(handle.get_snapshot().active_id.as_deref(), Some("a"));
+        handle.resume_automatic_returns().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let snapshot = events.recv().await.unwrap();
+                if !snapshot.busy && snapshot.active_id.as_deref() == Some("b") {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(handle.get_snapshot().active_id.as_deref(), Some("b"));
+    }
+    #[tokio::test]
+    async fn profile_rate_limit_floor_survives_restart_without_a_false_sign_in_prompt() {
+        let fake = Arc::new(Fake::default());
+        let (temp, handle, clock, paths) = fixture(
+            vec![account("a", 1000), account("b", 1000)],
+            Some("a"),
+            1000,
+            fake.clone(),
+        );
+        fake.replies.lock().unwrap().push_back((
+            PROFILE_URL,
+            Ok(HttpResponse {
+                status: 429,
+                headers: BTreeMap::from([("retry-after".into(), "600".into())]),
+                body: Value::Null,
+            }),
+        ));
+        assert_eq!(
+            handle.refresh_account("b").await.unwrap_err(),
+            RuntimeError::Provider
+        );
+        assert_eq!(
+            saved_record(&temp).readings["b"].profile_retry_at,
+            Some(1600)
+        );
+        assert!(!view(&handle, "b").sign_in_required);
+        drop(handle);
+        let reopened = RuntimeHandle::from_parts(
+            Vault::with_key(temp.path().join("vault"), [7; 32]).unwrap(),
+            ActiveStore::file(paths),
+            ClaudeClient::with_transport("2.1.300", fake.clone()).unwrap(),
+            clock.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.refresh_account("b").await.unwrap_err(),
+            RuntimeError::Provider
+        );
+        assert_eq!(count(&fake, PROFILE_URL), 1);
+        clock.0.store(1600, Ordering::SeqCst);
+        reopened.refresh_account("b").await.unwrap();
+        assert_eq!(count(&fake, PROFILE_URL), 2);
+        assert!(view(&reopened, "b").decision_fresh);
+    }
+    #[tokio::test]
+    async fn add_preserves_fresh_auth_for_live_owner_without_reading_or_saved_record() {
+        for saved_account in [true, false] {
+            let fake = Arc::new(Fake::default());
+            let (temp, handle, _clock, paths) = fixture(
+                if saved_account {
+                    vec![account("a", 1000)]
+                } else {
+                    vec![]
+                },
+                if saved_account { Some("a") } else { None },
+                1000,
+                fake.clone(),
+            );
+            if saved_account {
+                let mut engine = handle.inner.owner.lock().await;
+                engine.saved.readings.clear();
+                engine.persist().unwrap();
+            } else {
+                let a = account("a", 1000);
+                std::fs::write(
+                    &paths.credentials_file,
+                    serde_json::to_vec(&a.credentials).unwrap(),
+                )
+                .unwrap();
+                std::fs::write(
+                    &paths.global_config_file,
+                    serde_json::to_vec(&json!({"oauthAccount":a.oauth_account,"keep":true}))
+                        .unwrap(),
+                )
+                .unwrap();
+            }
+            let original = std::fs::read(&paths.credentials_file).unwrap();
+            let session = handle.begin_login().await.unwrap();
+            fake.replies.lock().unwrap().push_back((TOKEN_URL,Ok(response(200,json!({"access_token":"token-a-browser-added","refresh_token":"refresh-a-browser-added","expires_in":3600})))));
+            let snapshot = handle
+                .finish_login(&session.id, &code_for(&session))
+                .await
+                .unwrap();
+            assert_eq!(snapshot.accounts.len(), 1);
+            let id = &snapshot.accounts[0].id;
+            assert!(saved_record(&temp).readings[id].active_reauth_pending);
+            assert_eq!(
+                handle.refresh_account(id).await.unwrap_err(),
+                RuntimeError::ActiveSessionExpired
+            );
+            assert_eq!(
+                saved_record(&temp).accounts[0].access_token(),
+                Some("token-a-browser-added")
+            );
+            assert_eq!(
+                std::fs::read(&paths.credentials_file).unwrap(),
+                original,
+                "Add never activates credentials"
+            );
+        }
+    }
+    #[tokio::test]
+    async fn inactive_reauthentication_preserves_external_selection_during_oauth() {
+        let fake = Arc::new(Fake::default());
+        let (temp, handle, _clock, paths) = fixture(
+            vec![account("a", 1000), account("b", 1000)],
+            Some("a"),
+            1000,
+            fake.clone(),
+        );
+        let session = handle.begin_login_for_account("b").await.unwrap();
+        fake.replies.lock().unwrap().push_back((TOKEN_URL,Ok(response(200,json!({"access_token":"token-b-browser-new","refresh_token":"refresh-b-browser-new","expires_in":3600})))));
+        let started = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        *fake.pause.lock().unwrap() = Some((PROFILE_URL, started.clone(), resume.clone()));
+        let finish = {
+            let handle = handle.clone();
+            tokio::spawn(async move { handle.finish_login(&session.id, &code_for(&session)).await })
+        };
+        started.notified().await;
+        let b = account("b", 1000);
+        std::fs::write(
+            &paths.credentials_file,
+            serde_json::to_vec(&b.credentials).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            &paths.global_config_file,
+            serde_json::to_vec(&json!({"oauthAccount":b.oauth_account,"keep":true})).unwrap(),
+        )
+        .unwrap();
+        resume.notify_one();
+        assert_eq!(
+            finish.await.unwrap().unwrap_err(),
+            RuntimeError::ExternalChange
+        );
+        assert_eq!(handle.get_snapshot().active_id.as_deref(), Some("b"));
+        assert!(saved_record(&temp).readings["b"].active_reauth_pending);
+        assert_eq!(
+            handle.refresh_account("b").await.unwrap_err(),
+            RuntimeError::ActiveSessionExpired
+        );
+        assert_eq!(
+            saved_record(&temp).accounts[1].access_token(),
+            Some("token-b-browser-new")
+        );
+        assert_eq!(
+            read_json(&paths.credentials_file)["claudeAiOauth"]["accessToken"],
+            "token-b-SENTINEL"
+        );
+    }
+    #[tokio::test]
+    async fn transient_outgoing_profile_errors_allow_safe_leave_and_candidate_proofs_respect_backoff()
+     {
+        for status in [429, 503] {
+            let fake = Arc::new(Fake::default());
+            let (temp, handle, clock, paths) = fixture(
+                vec![account("a", 1000), account("c", 1000)],
+                Some("a"),
+                1000,
+                fake.clone(),
+            );
+            handle.tick(true).await.unwrap();
+            let mut auth = read_json(&paths.credentials_file);
+            auth["claudeAiOauth"]["accessToken"] = json!("token-a-external-rotated");
+            auth["claudeAiOauth"]["refreshToken"] = json!("refresh-a-external-rotated");
+            std::fs::write(&paths.credentials_file, serde_json::to_vec(&auth).unwrap()).unwrap();
+            fake.replies.lock().unwrap().push_back((
+                PROFILE_URL,
+                Ok(HttpResponse {
+                    status,
+                    headers: BTreeMap::from([("retry-after".into(), "600".into())]),
+                    body: Value::Null,
+                }),
+            ));
+            handle.switch_account("c").await.unwrap();
+            assert_eq!(handle.get_snapshot().active_id.as_deref(), Some("c"));
+            assert_eq!(
+                count(&fake, TOKEN_URL),
+                0,
+                "leaving never refreshes the outgoing session"
+            );
+            assert_eq!(
+                saved_record(&temp).readings["a"]
+                    .unverified_oauth
+                    .as_ref()
+                    .unwrap()["accessToken"],
+                "token-a-external-rotated"
+            );
+            if status == 503 {
+                fake.replies.lock().unwrap().extend([
+                    (TOKEN_URL,Ok(response(200,json!({"access_token":"token-a-candidate-first","refresh_token":"refresh-a-candidate-first","expires_in":3600})))),
+                    (PROFILE_URL,Ok(HttpResponse{status:429,headers:BTreeMap::from([("retry-after".into(),"600".into())]),body:Value::Null})),
+                ]);
+                assert_eq!(
+                    handle.refresh_account("a").await.unwrap_err(),
+                    RuntimeError::Provider
+                );
+            }
+            let tokens = count(&fake, TOKEN_URL);
+            let profiles = count(&fake, PROFILE_URL);
+            for now in [1000, 1599] {
+                clock.0.store(now, Ordering::SeqCst);
+                assert_eq!(
+                    handle.refresh_account("a").await.unwrap_err(),
+                    RuntimeError::Provider
+                );
+                assert_eq!(count(&fake, TOKEN_URL), tokens);
+                assert_eq!(count(&fake, PROFILE_URL), profiles);
+            }
+            clock.0.store(1600, Ordering::SeqCst);
+            fake.replies.lock().unwrap().push_back((TOKEN_URL,Ok(response(200,json!({"access_token":"token-a-candidate-recovered","refresh_token":"refresh-a-candidate-recovered","expires_in":3600})))));
+            handle.refresh_account("a").await.unwrap();
+            assert_eq!(
+                saved_record(&temp).accounts[0].access_token(),
+                Some("token-a-candidate-recovered")
+            );
+            assert_eq!(handle.get_snapshot().active_id.as_deref(), Some("c"));
+            assert!(saved_record(&temp).readings["a"].unverified_oauth.is_none());
+        }
     }
     #[tokio::test]
     async fn an_unreadable_cli_file_at_startup_reports_an_error_instead_of_an_empty_window() {

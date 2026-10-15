@@ -17,6 +17,8 @@ import {
   orderEmptyText,
   orderEntries,
   rankRows,
+  reconcileRecommendations,
+  automaticReturnNotes,
   statusView,
   type AccountRowView,
   type LimitKind,
@@ -78,7 +80,9 @@ function row(
   threshold: number,
 ): AccountRowView {
   const usage = account.usage;
-  const signIn = !!account.signInRequired;
+  const signIn =
+    !!account.signInRequired ||
+    (account.active && account.error === 'activeSessionExpired');
   const limit = limitOf(account);
   const kind: StatusKind = signIn
     ? 'signIn'
@@ -90,13 +94,19 @@ function row(
           : 'checking'
         : !usage
           ? 'unread'
-          : limit
-            ? limit
-            : account.isNext
-              ? 'next'
-              : 'ready';
+          : account.error
+            ? 'failed'
+            : limit
+              ? limit
+              : account.decisionFresh === false
+                ? 'stale'
+                : account.isNext
+                  ? 'next'
+                  : 'ready';
   const failure =
-    account.error && !signIn ? codeMessage(account.error, locale) : null;
+    account.error && (!signIn || account.error === 'activeSessionExpired')
+      ? codeMessage(account.error, locale)
+      : null;
   const freesAt = account.exhausted ? (account.freesAt ?? null) : null;
   const notes: NoteView[] = [];
   if (failure)
@@ -124,7 +134,10 @@ function row(
     id: account.id,
     name: account.name,
     initial: initial(account.name || account.email || 'C'),
-    secondary: account.email || null,
+    secondary:
+      [account.email, account.workspaceLabel].filter(Boolean).join(' · ') ||
+      null,
+    workspaceLabel: account.workspaceLabel ?? null,
     plan: planLabel(account.planTier),
     active: account.active,
     next: account.isNext,
@@ -190,24 +203,27 @@ function row(
     readAt: account.usageAt,
     savedReading: !!account.error || account.decisionFresh === false,
     credits: null,
-    identity: t(
-      locale,
-      signIn
-        ? 'identitySignIn'
-        : account.identityVerified
-          ? 'identityVerified'
-          : account.error
-            ? 'identityUnverified'
-            : 'identityChecking',
-    ),
+    identity:
+      account.active && account.error === 'activeSessionExpired'
+        ? codeMessage('activeSessionExpired', locale)
+        : t(
+            locale,
+            signIn
+              ? 'identitySignIn'
+              : account.identityVerified
+                ? 'identityVerified'
+                : account.error
+                  ? 'identityUnverified'
+                  : 'identityChecking',
+          ),
     identityOk: account.identityVerified && !signIn,
-    primary: account.active ? null : signIn ? 'signIn' : 'switch',
+    primary: signIn ? 'signIn' : account.active ? null : 'switch',
     canSwitch: !account.active && !signIn && account.identityVerified,
     switchReason:
       account.active || signIn || account.identityVerified
         ? null
         : t(locale, account.error ? 'switchUnverified' : 'switchChecking'),
-    canSignIn: signIn && !account.active,
+    canSignIn: signIn,
     canRefresh: true,
     // Same rule as Codex: switch away before removing the account in use.
     canDelete: !account.active,
@@ -241,6 +257,7 @@ export function claudeView(
       threshold: 95,
       settings: null,
       returnHoldUntil: null,
+      returnNotes: [],
     };
   const settings = snapshot.settings;
   const plan = snapshot.consumptionPlan ?? [];
@@ -252,7 +269,15 @@ export function claudeView(
       providerThreshold(settings, 'claude'),
     ),
   );
-  const rows = rankRows(unsorted, plan);
+  const recommendations = reconcileRecommendations(
+    unsorted,
+    plan,
+    snapshot.accounts.find((account) => account.isNext && !account.active)
+      ?.id ?? null,
+    snapshot.demo,
+    locale,
+  );
+  const rows = rankRows(recommendations.rows, recommendations.order);
   const active =
     rows.find((r) => r.id === snapshot.activeId) ??
     rows.find((r) => r.active) ??
@@ -265,16 +290,15 @@ export function claudeView(
     demo: snapshot.demo,
     rows,
     active,
-    next: rows.find((r) => r.next && !r.active) ?? null,
+    next: recommendations.next,
     nextReason:
-      rows.find((r) => r.next && !r.active)?.automation.priority != null
+      recommendations.next?.automation.priority != null
         ? t(locale, 'nextWhyPriority', {
-            priority: rows.find((r) => r.next && !r.active)!.automation
-              .priority!,
+            priority: recommendations.next.automation.priority,
           })
         : nextReason(settings, locale),
     model: snapshot.activeModel ?? t(locale, 'defaultModel'),
-    order: orderEntries(plan, rows),
+    order: orderEntries(recommendations.order, rows),
     orderEmpty: orderEmptyText(rows, locale),
     alert:
       activeAccount && activeLimit
@@ -303,5 +327,6 @@ export function claudeView(
     threshold: providerThreshold(settings, 'claude'),
     settings,
     returnHoldUntil: snapshot.returnHoldUntil ?? null,
+    returnNotes: automaticReturnNotes(rows, settings, locale),
   };
 }

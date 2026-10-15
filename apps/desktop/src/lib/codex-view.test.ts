@@ -201,8 +201,8 @@ describe('Codex adapter: statuses in the shared words', () => {
     const failed = fixture();
     failed.accounts[2].error = 'providerUnavailable';
     expect(row(failed, 'codex-research').status).toMatchObject({
-      label: 'Next',
-      detail: 'Last check failed',
+      label: 'Check failed',
+      detail: 'Refresh to try again',
       title: codexMessage('providerUnavailable', 'en'),
     });
   });

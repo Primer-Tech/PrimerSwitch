@@ -7,6 +7,7 @@ import {
   within,
 } from '@testing-library/svelte';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { get } from 'svelte/store';
 import App from './App.svelte';
 import { createController } from './lib/controller';
 import { snapshot, account } from './test/fixtures';
@@ -399,7 +400,8 @@ describe('desktop workflows', () => {
       activeCard().getByRole('meter', { name: '5-hour window' }),
     ).not.toHaveAttribute('aria-valuenow');
     expect(activeCard().getByText('Not checked yet')).toBeVisible();
-    const failed = row('Personal').getByText('Last check failed');
+    expect(row('Personal').getByText('Check failed')).toBeVisible();
+    const failed = row('Personal').getByText('Refresh to try again');
     expect(failed).toHaveAttribute('title', t('en', 'providerError'));
     const dialog = await details();
     expect(dialog).toHaveTextContent('The last reading is retained.');
@@ -623,13 +625,194 @@ describe('desktop workflows', () => {
     const trigger = personal.getByRole('button', { name: 'Sign in again' });
     expect(trigger).toHaveAccessibleDescription('Personal');
     await fireEvent.click(trigger);
-    await waitFor(() => expect(call).toHaveBeenCalledWith('begin_login'));
+    await waitFor(() =>
+      expect(call).toHaveBeenCalledWith('begin_login', { accountId: 'b' }),
+    );
+    const retryDialog = within(screen.getByRole('dialog'));
+    expect(retryDialog.getByRole('heading')).toHaveTextContent(
+      t('en', 'claudeLoginAgainTitle'),
+    );
+    expect(
+      retryDialog.getByRole('button', { name: t('en', 'saveSignIn') }),
+    ).toBeDisabled();
+    expect(
+      retryDialog.getByText(
+        t('en', 'claudeLoginAgainDescription', { name: 'b@example.invalid' }),
+      ),
+    ).toBeVisible();
+    expect(
+      retryDialog.queryByRole('button', { name: 'Add account' }),
+    ).toBeNull();
     await fireEvent(
       screen.getByRole('dialog'),
       new Event('cancel', { cancelable: true }),
     );
     await waitFor(() => expect(trigger).toHaveFocus());
   });
+  it.each(['banner', 'details', 'active card'] as const)(
+    'opens targeted active-session repair from the %s when Claude explicitly reports expiry',
+    async (entry) => {
+      const raw = snapshot({
+        accounts: [
+          account('a', {
+            error: 'activeSessionExpired',
+            signInRequired: false,
+          }),
+          account('b'),
+        ],
+      });
+      const { call } = setup(raw);
+      await screen.findAllByText('a@example.invalid');
+      expect(
+        activeCard().getAllByText(
+          new RegExp("Claude Code's session needs renewal or repair"),
+        )[0],
+      ).toHaveTextContent(t('en', 'activeSessionExpired'));
+      expect(activeCard().queryByText(t('en', 'identitySignIn'))).toBeNull();
+      expect(
+        screen.queryByText(t('en', 'signInNeeded', { names: 'Studio' })),
+      ).toBeNull();
+      call.mockResolvedValueOnce({
+        id: 'active-repair-session',
+        url: 'https://example.invalid/authorize',
+      });
+      if (entry === 'details') {
+        await fireEvent.click(
+          within(await details('Studio')).getByRole('button', {
+            name: 'Sign in again',
+          }),
+        );
+      } else if (entry === 'banner') {
+        const banner = screen
+          .getByText(
+            t('en', 'accountError', {
+              name: 'Studio',
+              reason: t('en', 'activeSessionExpired'),
+            }),
+          )
+          .closest<HTMLElement>('[role="note"]')!;
+        await fireEvent.click(
+          within(banner).getByRole('button', { name: 'Sign in again' }),
+        );
+      } else
+        await fireEvent.click(
+          activeCard().getByRole('button', { name: 'Sign in again' }),
+        );
+      await waitFor(() =>
+        expect(call).toHaveBeenCalledWith('begin_login', { accountId: 'a' }),
+      );
+      const dialog = within(screen.getByRole('dialog'));
+      expect(dialog.getByText(t('en', 'claudeLoginAgainActive'))).toBeVisible();
+      expect(
+        dialog.getByText(
+          t('en', 'claudeLoginAgainDescription', { name: 'a@example.invalid' }),
+        ),
+      ).toBeVisible();
+      expect(
+        dialog.queryByText(t('en', 'claudeLoginAgainNoActivate')),
+      ).toBeNull();
+      expect(
+        dialog.getByRole('button', { name: 'Save sign-in' }),
+      ).toBeDisabled();
+    },
+  );
+  it.each(['banner', 'details'] as const)(
+    'retains the saved target from the %s sign-in action and reports wrong-owner rejection without adding an account',
+    async (entry) => {
+      const raw = snapshot({
+        accounts: [
+          account('a'),
+          account('b', {
+            signInRequired: true,
+            error: 'signInRequired',
+            decisionFresh: false,
+          }),
+        ],
+      });
+      const { call, controller } = setup(raw);
+      await screen.findAllByText('a@example.invalid');
+      expect(section('Next up').getByText(t('en', 'noNext'))).toBeVisible();
+      expect(
+        within(
+          screen.getByRole('region', { name: 'Next in order' }),
+        ).queryByText('Personal'),
+      ).toBeNull();
+      call.mockResolvedValueOnce({
+        id: 'retry-session',
+        url: 'https://example.invalid/authorize',
+      });
+      if (entry === 'banner') {
+        const banner = screen
+          .getByText(t('en', 'signInNeeded', { names: 'Personal' }))
+          .closest<HTMLElement>('[role="note"]')!;
+        await fireEvent.click(
+          within(banner).getByRole('button', { name: 'Sign in again' }),
+        );
+      } else {
+        const dialog = await details();
+        await fireEvent.click(
+          within(dialog).getByRole('button', { name: 'Sign in again' }),
+        );
+      }
+      await waitFor(() =>
+        expect(call).toHaveBeenCalledWith('begin_login', { accountId: 'b' }),
+      );
+      const dialog = within(screen.getByRole('dialog'));
+      expect(
+        dialog.getByText(
+          t('en', 'claudeLoginAgainDescription', { name: 'b@example.invalid' }),
+        ),
+      ).toBeVisible();
+      await fireEvent.input(
+        dialog.getByLabelText(t('en', 'authorizationCode')),
+        { target: { value: 'fixture-code#state' } },
+      );
+      call.mockRejectedValueOnce('loginIdentityMismatch');
+      await fireEvent.click(
+        dialog.getByRole('button', { name: 'Save sign-in' }),
+      );
+      expect(await dialog.findByRole('alert')).toHaveTextContent(
+        t('en', 'loginIdentityMismatch'),
+      );
+      expect(call).toHaveBeenLastCalledWith('finish_login', {
+        id: 'retry-session',
+        code: 'fixture-code#state',
+      });
+      expect(screen.getByRole('dialog')).toBeVisible();
+      expect(dialog.getByRole('heading')).toHaveTextContent(
+        t('en', 'claudeLoginAgainTitle'),
+      );
+      expect(get(controller).login.accountId).toBe('b');
+      expect(
+        get(controller).snapshot?.accounts.map((account) => account.id),
+      ).toEqual(['a', 'b']);
+      expect(
+        within(screen.getByRole('table')).getAllByRole('row'),
+      ).toHaveLength(3);
+      call.mockResolvedValueOnce(raw).mockResolvedValueOnce({
+        id: 'retry-session-2',
+        url: 'https://example.invalid/authorize',
+      });
+      await fireEvent.click(
+        dialog.getByRole('button', { name: 'Open browser again' }),
+      );
+      await waitFor(() =>
+        expect(get(controller).login.session?.id).toBe('retry-session-2'),
+      );
+      expect(call).toHaveBeenCalledWith('cancel_login', {
+        id: 'retry-session',
+      });
+      expect(call).toHaveBeenLastCalledWith('begin_login', { accountId: 'b' });
+      expect(
+        within(screen.getByRole('dialog')).getByLabelText(
+          t('en', 'authorizationCode'),
+        ),
+      ).toHaveValue('');
+      expect(
+        within(screen.getByRole('dialog')).queryByRole('alert'),
+      ).toBeNull();
+    },
+  );
   it('shows when limited accounts free up and who frees up first', async () => {
     const now = Math.floor(Date.now() / 1000);
     const raw = snapshot({

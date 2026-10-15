@@ -3088,7 +3088,12 @@ async fn external_owner_selection_persists_a_hold_but_same_owner_rotation_does_n
 fn a_prepared_codex_return_preserves_an_external_login_before_or_during_replacement() {
     for during_replace in [false, true] {
         let mut f = Fixture::new();
-        let (_, _, plan) = ready_return(&mut f);
+        let (a, _, plan) = ready_return(&mut f);
+        // Owner/generation protection is unchanged when outgoing quota is stale.
+        f.engine.verified_now.remove(&a);
+        f.engine
+            .account_errors
+            .insert(a, CodexReason::ProviderUnavailable);
         let external = auth("user-c", "ws-c", "external");
         if during_replace {
             let path = f.home.join("auth.json");
@@ -3171,5 +3176,344 @@ async fn external_selection_during_return_preflight_and_preference_edits_cancel_
         Some(CodexReason::ExternalChange)
     );
     assert_eq!(f.active(), auth("user-a", "ws-a", "initial"));
+    f.claude_untouched();
+}
+
+async fn background_read(
+    f: &mut Fixture,
+    id: &str,
+    workspace: &str,
+    five: i32,
+    week: i32,
+    now: i64,
+) {
+    let mut reading = quota(Some(workspace), five, week);
+    reading.rate_limits.primary.as_mut().unwrap().resets_at = Some(now + 18000);
+    reading.rate_limits.secondary.as_mut().unwrap().resets_at = Some(now + 7 * 86400);
+    f.factory.enqueue(Plan::quota(Ok(reading)));
+    let report = f.engine.plan_quota(id, now, false).unwrap().run().await;
+    f.engine.finish_quota(report, &f.vault, now).unwrap();
+}
+
+#[tokio::test]
+async fn minute_active_polling_alternates_with_due_inactive_reset_and_hourly_readings() {
+    let mut f = Fixture::new();
+    let a = f.id_of("ws-a");
+    let b = f.add("user-b", "ws-b", "saved");
+    let c = f.add("user-c", "ws-c", "saved");
+    f.read(
+        &b,
+        main_quota_at(100, NOW + 30, 20, NOW + 86400),
+        NOW - 4000,
+    );
+    f.read(&c, main_quota(20, 20), NOW - 4000);
+    background_read(&mut f, &a, "ws-a", 90, 20, NOW).await;
+    let policy = CodexPolicy::default();
+    assert_eq!(f.engine.active_interval(&policy), 60);
+    // Both the active and inactive accounts stay due at these minute ticks.
+    // Reset recovery gets its turn, then the active account, then hourly work.
+    assert_eq!(f.engine.due_quota(NOW + 60, &policy), Some(b.clone()));
+    background_read(&mut f, &b, "ws-b", 0, 20, NOW + 60).await;
+    assert_eq!(f.engine.due_quota(NOW + 120, &policy), Some(a.clone()));
+    background_read(&mut f, &a, "ws-a", 90, 20, NOW + 120).await;
+    assert_eq!(f.engine.due_quota(NOW + 180, &policy), Some(c.clone()));
+    background_read(&mut f, &c, "ws-c", 20, 20, NOW + 180).await;
+    assert_eq!(f.engine.due_quota(NOW + 240, &policy), Some(a));
+    assert_eq!(f.active(), auth("user-a", "ws-a", "initial"));
+    assert!(f.factory.reset_keys.lock().unwrap().is_empty());
+    f.claude_untouched();
+}
+
+#[test]
+fn known_inactive_reset_retry_floors_are_independent_of_the_active_check_interval() {
+    let mut f = Fixture::new();
+    let a = f.id_of("ws-a");
+    let b = f.add("user-b", "ws-b", "saved");
+    f.read(&a, main_quota(20, 20), NOW);
+    f.read(
+        &b,
+        main_quota_at(10, NOW + RETURN_RETRY, 20, NOW + 86400),
+        NOW,
+    );
+    let policy = CodexPolicy {
+        poll_interval: 900,
+        ..CodexPolicy::default()
+    };
+    assert_eq!(f.engine.due_quota(NOW + RETURN_RETRY - 1, &policy), None);
+    assert_eq!(
+        f.engine.due_quota(NOW + RETURN_RETRY, &policy),
+        Some(b.clone())
+    );
+    // A failed reading still waits900 seconds rather than the successful reset floor.
+    let index = f.engine.account_index(&b).unwrap();
+    f.engine.saved.accounts[index].last_attempt_at = Some(NOW + 60);
+    f.engine
+        .account_errors
+        .insert(b.clone(), CodexReason::ProviderUnavailable);
+    assert_eq!(f.engine.due_quota(NOW + RETURN_RETRY, &policy), None);
+    assert_eq!(f.engine.due_quota(NOW + 60 + ERROR_RETRY, &policy), Some(b));
+    assert!(f.factory.calls().is_empty());
+}
+
+#[tokio::test]
+async fn a_weekly_blocked_preferred_return_is_rechecked_after_its_later_weekly_reset() {
+    let mut f = Fixture::new();
+    let a = f.id_of("ws-a");
+    let b = f.add("user-b", "ws-b", "saved");
+    preferred(&mut f, &b, Some(80.0), 1);
+    f.read(&b, main_quota_at(80, NOW - 3600, 76, NOW + 120), NOW - 4200);
+    f.read(&b, main_quota_at(0, NOW + 18000, 76, NOW + 120), NOW);
+    background_read(&mut f, &a, "ws-a", 90, 20, NOW).await;
+    let policy = CodexPolicy::default();
+    assert_eq!(f.engine.automation(NOW, &policy), CodexAutomation::Idle);
+    assert_eq!(f.engine.due_quota(NOW + 120, &policy), Some(b.clone()));
+    // An unsuccessful weekly-reset recheck preserves its longer retry floor.
+    f.factory
+        .enqueue(Plan::quota(Err(CodexError::ServiceUnavailable)));
+    let report = f
+        .engine
+        .plan_quota(&b, NOW + 120, false)
+        .unwrap()
+        .run()
+        .await;
+    f.engine.finish_quota(report, &f.vault, NOW + 120).unwrap();
+    assert_ne!(f.engine.due_quota(NOW + 240, &policy), Some(b.clone()));
+    background_read(&mut f, &a, "ws-a", 90, 20, NOW + 120 + ERROR_RETRY - 60).await;
+    assert_eq!(
+        f.engine.due_quota(NOW + 120 + ERROR_RETRY, &policy),
+        Some(b.clone())
+    );
+    background_read(&mut f, &b, "ws-b", 0, 0, NOW + 120 + ERROR_RETRY).await;
+    assert_eq!(
+        f.engine.automation(NOW + 120 + ERROR_RETRY, &policy),
+        return_to(&f, &b)
+    );
+    assert!(f.factory.reset_keys.lock().unwrap().is_empty());
+    f.claude_untouched();
+}
+
+#[tokio::test]
+async fn background_sign_in_retries_are_not_starved_by_a_near_limit_active_account() {
+    let mut f = Fixture::new();
+    let a = f.id_of("ws-a");
+    let b = f.add("user-b", "ws-b", "saved");
+    let index = f.engine.account_index(&b).unwrap();
+    f.engine.saved.accounts[index].needs_sign_in = true;
+    f.engine.saved.accounts[index].last_attempt_at = Some(NOW - SIGN_IN_RETRY);
+    background_read(&mut f, &a, "ws-a", 90, 20, NOW).await;
+    assert_eq!(
+        f.engine.due_quota(NOW + 60, &CodexPolicy::default()),
+        Some(b.clone())
+    );
+    background_read(&mut f, &b, "ws-b", 20, 20, NOW + 60).await;
+    assert!(!f.engine.saved.accounts[index].needs_sign_in);
+    assert_eq!(
+        f.engine.due_quota(NOW + 120, &CodexPolicy::default()),
+        Some(a)
+    );
+    f.claude_untouched();
+}
+
+#[tokio::test]
+async fn spent_history_survives_disabled_returns_restart_recovery_and_late_opt_in() {
+    let mut f = Fixture::new();
+    let a = f.id_of("ws-a");
+    let b = f.add("user-b", "ws-b", "saved");
+    // Keep history even when the account has no priority or return preference yet.
+    f.read(&b, main_quota_at(95, NOW + 300, 20, NOW + 86400), NOW);
+    let index = f.engine.account_index(&b).unwrap();
+    assert_eq!(
+        f.engine.saved.accounts[index].preferred_return_reset_at,
+        Some(NOW + 300)
+    );
+    f.engine.save(&f.vault).unwrap();
+    reopen(&mut f, NOW + 600);
+    assert!(!f.engine.verified_now.contains(&b));
+    background_read(&mut f, &b, "ws-b", 0, 20, NOW + 600).await;
+    assert_eq!(
+        f.engine.saved.accounts[index].preferred_return_reset_at,
+        Some(NOW + 300)
+    );
+    f.engine
+        .command(
+            CodexCommand::UpdateAccountAutomation(
+                b.clone(),
+                AccountAutomationView {
+                    enabled: true,
+                    threshold: None,
+                    priority: Some(1),
+                    return_on_five_hour_reset: true,
+                },
+            ),
+            &f.vault,
+            NOW + 600,
+        )
+        .await
+        .unwrap();
+    // Outgoing account a has no fresh quota after restart; its live owner is known.
+    assert_eq!(f.engine.selected_id, Some(a));
+    assert_eq!(
+        f.engine.automation(NOW + 600, &CodexPolicy::default()),
+        return_to(&f, &b)
+    );
+    f.claude_untouched();
+}
+
+#[tokio::test]
+async fn legacy_cached_spent_history_can_arm_after_restart_without_session_verification() {
+    let mut f = Fixture::new();
+    let b = f.add("user-b", "ws-b", "saved");
+    account_preferences(
+        &mut f,
+        &b,
+        AccountAutomation {
+            threshold: Some(80.0),
+            ..AccountAutomation::default()
+        },
+    );
+    f.read(&b, main_quota_at(80, NOW + 300, 20, NOW + 86400), NOW);
+    let index = f.engine.account_index(&b).unwrap();
+    // Simulate an older record from before spent history was retained by default.
+    f.engine.saved.accounts[index].preferred_return_reset_at = None;
+    f.engine.save(&f.vault).unwrap();
+    reopen(&mut f, NOW + 600);
+    assert!(!f.engine.verified_now.contains(&b));
+    f.engine
+        .command(
+            CodexCommand::UpdateAccountAutomation(
+                b.clone(),
+                AccountAutomationView {
+                    enabled: true,
+                    threshold: Some(80.0),
+                    priority: Some(1),
+                    return_on_five_hour_reset: true,
+                },
+            ),
+            &f.vault,
+            NOW + 600,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        f.engine.saved.accounts[index].preferred_return_reset_at,
+        Some(NOW + 300)
+    );
+    // The historical marker alone never supplies fresh post-reset usage/identity.
+    assert_eq!(
+        f.engine.automation(NOW + 600, &CodexPolicy::default()),
+        CodexAutomation::Refresh(b.clone())
+    );
+    assert!(f.factory.calls().is_empty());
+    background_read(&mut f, &b, "ws-b", 0, 20, NOW + 600).await;
+    assert_eq!(
+        f.engine.automation(NOW + 600, &CodexPolicy::default()),
+        return_to(&f, &b)
+    );
+    f.claude_untouched();
+}
+
+#[tokio::test]
+async fn near_headroom_history_arms_ninety_five_at_ninety_seven_but_not_ninety_two() {
+    for used in [92, 95] {
+        for legacy_missing_history in [false, true] {
+            let mut f = Fixture::new();
+            let b = f.add("user-b", "ws-b", "saved");
+            account_preferences(
+                &mut f,
+                &b,
+                AccountAutomation {
+                    threshold: Some(97.0),
+                    ..AccountAutomation::default()
+                },
+            );
+            f.read(&b, main_quota_at(used, NOW + 300, 30, NOW + 86400), NOW);
+            let index = f.engine.account_index(&b).unwrap();
+            let observed_reset = (used > 92).then_some(NOW + 300);
+            assert_eq!(
+                f.engine.saved.accounts[index].preferred_return_reset_at,
+                observed_reset
+            );
+            if legacy_missing_history {
+                f.engine.saved.accounts[index].preferred_return_reset_at = None;
+            }
+            f.engine.save(&f.vault).unwrap();
+            reopen(&mut f, NOW + 600);
+            assert!(!f.engine.verified_now.contains(&b));
+            f.engine
+                .command(
+                    CodexCommand::UpdateAccountAutomation(
+                        b.clone(),
+                        AccountAutomationView {
+                            enabled: true,
+                            threshold: Some(97.0),
+                            priority: Some(1),
+                            return_on_five_hour_reset: true,
+                        },
+                    ),
+                    &f.vault,
+                    NOW + 600,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                f.engine.saved.accounts[index].preferred_return_reset_at,
+                observed_reset
+            );
+            background_read(&mut f, &b, "ws-b", 0, 30, NOW + 600).await;
+            assert_eq!(
+                f.engine.automation(NOW + 600, &CodexPolicy::default()),
+                if used > 92 {
+                    return_to(&f, &b)
+                } else {
+                    CodexAutomation::Idle
+                }
+            );
+            f.claude_untouched();
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_natural_return_survives_failed_outgoing_quota_but_keeps_target_and_owner_guards() {
+    let mut f = Fixture::new();
+    let (a, b, plan) = ready_return(&mut f);
+    let index = f.engine.account_index(&a).unwrap();
+    f.engine.saved.accounts[index].quota = None;
+    f.engine.saved.accounts[index].quota_read_at = None;
+    f.engine.saved.accounts[index].needs_sign_in = true;
+    f.engine.verified_now.remove(&a);
+    f.engine
+        .account_errors
+        .insert(a.clone(), CodexReason::SignInRequired);
+    assert_eq!(
+        f.engine.automation(NOW, &CodexPolicy::default()),
+        return_to(&f, &b)
+    );
+    // The fresh target proof remains mandatory despite relaxing outgoing usage.
+    f.engine.verified_now.remove(&b);
+    assert_eq!(
+        f.engine.automation(NOW, &CodexPolicy::default()),
+        CodexAutomation::Idle
+    );
+    assert_eq!(
+        f.engine
+            .begin_automatic_switch(&plan, true, &CodexPolicy::default(), &f.vault, NOW)
+            .err(),
+        Some(CodexReason::ExternalChange)
+    );
+    assert_eq!(f.active(), auth("user-a", "ws-a", "initial"));
+    f.read(&b, main_quota_at(0, NOW + 18000, 20, NOW + 86400), NOW);
+    f.engine.begin_auto_switch(NOW, &f.vault).unwrap();
+    let job = f
+        .engine
+        .begin_automatic_switch(&plan, true, &CodexPolicy::default(), &f.vault, NOW)
+        .unwrap()
+        .unwrap();
+    f.engine
+        .finish_switch(&job, &job.run().await, &f.vault, NOW + 1, true)
+        .unwrap();
+    assert_eq!(f.engine.selected_id, Some(b));
+    assert_eq!(f.active(), auth("user-b", "ws-b", "saved"));
+    assert!(f.factory.calls().is_empty());
     f.claude_untouched();
 }

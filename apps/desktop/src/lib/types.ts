@@ -72,6 +72,7 @@ export const accountSchema = z
     id: z.string(),
     name: z.string(),
     email: z.string(),
+    workspaceLabel: z.string().max(512).nullable().optional(),
     provider: z.literal('claude'),
     automation: accountAutomationSchema.optional(),
     effectiveThreshold: z.number().finite().min(50).max(100).optional(),

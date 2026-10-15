@@ -567,7 +567,10 @@ describe('Codex accounts page', () => {
     expect(researchRow.getByText('102%')).toBeVisible();
     expect(researchRow.queryByText('Using credits')).toBeNull();
     expect(researchRow.getByText('Limit reached')).toBeVisible();
-    expect(section('Next up').getByText('Using credits')).toBeVisible();
+    expect(section('Next up').getByText(t('en', 'noNext'))).toBeVisible();
+    expect(
+      section('Next up').queryByRole('button', { name: /^Switch now/ }),
+    ).toBeNull();
   });
   it('shows a partial switch as a warning and moves focus to the result', async () => {
     const { call } = await setup();

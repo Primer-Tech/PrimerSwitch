@@ -34,6 +34,7 @@ export type StatusKind =
   | 'checking'
   | 'unread'
   | 'failed'
+  | 'stale'
   | 'apiKey'
   | 'unsupported';
 
@@ -81,6 +82,7 @@ const labels: Record<StatusKind, MessageKey> = {
   checking: 'statusChecking',
   unread: 'statusUnread',
   failed: 'statusFailed',
+  stale: 'statusNeedsRefresh',
   apiKey: 'statusApiKey',
   unsupported: 'statusUnsupported',
 };
@@ -210,6 +212,7 @@ export interface AccountRowView {
   initial: string;
   /** Email and, for Codex, the workspace; null when the name already says it all. */
   secondary: string | null;
+  workspaceLabel: string | null;
   plan: string | null;
   active: boolean;
   next: boolean;
@@ -286,6 +289,8 @@ export interface PageView {
   threshold: number;
   settings: Settings | null;
   returnHoldUntil: number | null;
+  /** Snapshot facts only; native runtime remains authoritative for automatic returns. */
+  returnNotes: NoteView[];
 }
 
 /** A provider-specific line inside the shared Automation card. */
@@ -388,7 +393,157 @@ export function orderEntries(
   return order
     .map((id) => rows.find((row) => row.id === id))
     .filter((row): row is AccountRowView => !!row && !row.active)
-    .map((row) => ({ id: row.id, name: row.name }));
+    .map((row) => ({ id: row.id, name: identityLabel(row, rows) }));
+}
+
+/** Distinguish saved identities with the same display name without merging them. */
+export function identityLabel(
+  row: AccountRowView,
+  rows: readonly AccountRowView[],
+): string {
+  return row.workspaceLabel &&
+    rows.filter((candidate) => candidate.name === row.name).length > 1
+    ? `${row.name} · ${row.workspaceLabel}`
+    : row.name;
+}
+
+/** Never advertise an unavailable account just because an old native order contains it. */
+export function isAutomaticCandidate(
+  row: AccountRowView,
+  demo: boolean,
+): boolean {
+  return (
+    !row.active &&
+    !row.switching &&
+    row.automation.enabled &&
+    row.identityOk &&
+    !row.limited &&
+    !row.savedReading &&
+    row.readAt !== null &&
+    (demo || row.canSwitch) &&
+    (row.status.kind === 'ready' || row.status.kind === 'next')
+  );
+}
+
+/** Filter the native ranking; never invent another account or another ordering. */
+export function reconcileRecommendations(
+  rows: AccountRowView[],
+  order: readonly string[],
+  nextId: string | null,
+  demo: boolean,
+  locale: Language,
+): { rows: AccountRowView[]; order: string[]; next: AccountRowView | null } {
+  const eligible = new Set(
+    rows.filter((row) => isAutomaticCandidate(row, demo)).map((row) => row.id),
+  );
+  const next =
+    rows.find((row) => row.id === nextId && eligible.has(row.id)) ?? null;
+  return {
+    rows: rows.map((row) =>
+      row.next && row !== next
+        ? {
+            ...row,
+            next: false,
+            status:
+              row.status.kind === 'next'
+                ? {
+                    ...row.status,
+                    kind: 'ready',
+                    label: t(locale, 'statusReady'),
+                  }
+                : row.status,
+          }
+        : row,
+    ),
+    order: [...new Set(order)].filter((id) => eligible.has(id)),
+    next,
+  };
+}
+
+/** Explain visible return blockers, without deriving reset markers or making a switch decision. */
+export function automaticReturnNotes(
+  rows: readonly AccountRowView[],
+  settings: Settings | null,
+  locale: Language,
+): NoteView[] {
+  const configured = rows.filter((row) => row.automation.returnOnFiveHourReset);
+  if (!configured.length)
+    return [{ tone: 'muted', text: t(locale, 'returnsNotConfigured') }];
+  const notes: NoteView[] =
+    settings?.autoSwitchEnabled === false
+      ? [{ tone: 'muted', text: t(locale, 'returnsSwitchingOff') }]
+      : [];
+  const active = rows.find((row) => row.active);
+  for (const row of configured) {
+    // Display-only explanation of the native return headroom contract.
+    const returnCeiling = row.effectiveThreshold - 5;
+    let key: MessageKey;
+    let tone: NoteView['tone'] = 'muted';
+    if (!row.automation.enabled) key = 'returnsAccountExcluded';
+    else if (row.automation.priority === null) key = 'returnsAccountNoPriority';
+    else if (row.status.kind === 'signIn' || row.primary === 'signIn') {
+      key = 'returnsAccountSignIn';
+      tone = 'warn';
+    } else if (!row.identityOk) {
+      key = 'returnsAccountUnverified';
+      tone = 'warn';
+    } else if (
+      row.savedReading ||
+      row.readAt === null ||
+      row.status.kind === 'failed'
+    )
+      key = 'returnsAccountUnconfirmed';
+    else if (
+      row.weeklyBinding.value !== null &&
+      row.weeklyBinding.value > returnCeiling
+    ) {
+      key = 'returnsAccountWeeklyBlocked';
+      tone = 'warn';
+    } else if (row.active) key = 'returnsAccountActive';
+    else if (
+      active?.automation.priority !== null &&
+      active?.automation.priority !== undefined &&
+      row.automation.priority >= active.automation.priority
+    )
+      key = 'returnsAccountLowerPriority';
+    else if (row.fiveHour.value !== null && row.fiveHour.value > returnCeiling)
+      key = 'returnsAccountFiveHourBlocked';
+    else key = 'returnsAccountWatching';
+    const values = {
+      name: identityLabel(row, rows),
+      threshold: exactPercent(row.effectiveThreshold, locale),
+      headroom: exactPercent(returnCeiling, locale),
+      priority: row.automation.priority ?? '',
+      activePriority: active?.automation.priority ?? '',
+    };
+    notes.push({ tone, text: t(locale, key, values) });
+    if (
+      key !== 'returnsAccountWeeklyBlocked' &&
+      row.automation.enabled &&
+      row.automation.priority !== null &&
+      row.weeklyBinding.value !== null &&
+      row.weeklyBinding.value > returnCeiling
+    ) {
+      notes.push({
+        tone: 'warn',
+        text: t(locale, 'returnsAccountWeeklyBlocked', values),
+      });
+    }
+    if (
+      key !== 'returnsAccountLowerPriority' &&
+      !row.active &&
+      row.automation.enabled &&
+      row.automation.priority !== null &&
+      active?.automation.priority != null &&
+      row.automation.priority >= active.automation.priority
+    ) {
+      notes.push({
+        tone: 'muted',
+        text: t(locale, 'returnsAccountLowerPriority', values),
+      });
+    }
+  }
+  return notes;
 }
 
 /** Why the next account goes first, in the words of the reset-order setting. */

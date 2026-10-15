@@ -130,6 +130,15 @@ The [future provider plan](FUTURE_CODEX.md) defines C00–C04 gates. Add test gr
 
 ## 8. Commands and completion record
 
+### 0.2.5 sign-in repair and automatic return regressions
+
+- A saved inactive Claude account with an expired/rejected access token and valid refresh grant recovers with one refresh and a matching profile proof. Generic 401, permission 403, rate limits and explicit `invalid_grant` stay distinct; confirmed revocation backs off, old unconfirmed sign-in flags revalidate, and a successful unchanged active session clears a stale prompt.
+- Targeted browser repair retains the saved record/workspace across cancellation, wrong-workspace rejection and browser restart. A retry cannot add another row. Active repair preserves newer external logins and keeps fresh saved tokens after a conflict; unrelated JSON and account preferences survive. The subscription authorization URL, PKCE, scopes and account/workspace hints are asserted against synthetic data.
+- Neither provider advertises failed, signed-out, stale or unverified accounts as Next up. Same-email known different workspaces remain separate and visibly distinguishable.
+- A preferred account at 95% with threshold 97 watches its known five-hour reset; 92% still has preferred headroom and does not arm. History survives disabled returns, restart and late opt-in. The return itself needs fresh workspace-verified post-reset quota at or below threshold minus five points.
+- Continuous minute active polling cannot starve due inactive resets, weekly recovery or sign-in retries. Claude setting/resume changes wake the scheduler. Failed outgoing quota does not block a verified recovered target; live owner/file/generation guards and target freshness still block unsafe switches.
+- Tests remain temporary-home/fake-transport only. The owner's explicit local-setup investigation separately reads a protected copy of encrypted state and reports allowlisted metadata without credentials, raw identities or provider bodies. Installation preservation is verified before production relaunch; a production observation is not a hermetic test or proof of a future timed return.
+
 ### 0.2.4 account automation acceptance
 
 - Legacy threshold/default and encrypted-record shape remain compatible; editing either provider default does not change the other. Per-account overrides persist and determine candidate eligibility, headroom, cadence and displayed status.

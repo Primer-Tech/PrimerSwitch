@@ -158,6 +158,7 @@
         items={automationItems}
         threshold={view.threshold}
         returnHoldUntil={view.returnHoldUntil}
+        returnNotes={view.returnNotes}
         {now}
         {locked}
         {onresume}

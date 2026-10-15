@@ -38,6 +38,7 @@ const errorCodes: ReadonlySet<string> = new Set<MessageKey>([
   'missingAccount',
   'externalChange',
   'identityError',
+  'loginIdentityMismatch',
   'providerError',
   'signInRequired',
   'activeSessionExpired',
@@ -114,6 +115,8 @@ export interface ViewState {
   error: string | null;
   login: {
     open: boolean;
+    /** Saved account being reauthenticated; native session retains the intent. */
+    accountId: string | null;
     session: LoginSession | null;
     working: boolean;
     error: string | null;
@@ -149,7 +152,13 @@ export function createController(bridge: Bridge = nativeBridge) {
     snapshot: null,
     pending: null,
     error: null,
-    login: { open: false, session: null, working: false, error: null },
+    login: {
+      open: false,
+      accountId: null,
+      session: null,
+      working: false,
+      error: null,
+    },
     preview: null,
   };
   const store = writable(state);
@@ -229,24 +238,48 @@ export function createController(bridge: Bridge = nativeBridge) {
       set({ pending: null });
     }
   }
-  async function beginLogin() {
+  async function beginLogin(accountId: string | null = null) {
     if (blocked() || state.login.open) return;
+    if (
+      accountId !== null &&
+      !state.snapshot?.accounts.some((account) => account.id === accountId)
+    )
+      return;
     const mine = ++generation;
     set({
-      login: { open: true, session: null, working: true, error: null },
+      login: {
+        open: true,
+        accountId,
+        session: null,
+        working: true,
+        error: null,
+      },
       error: null,
     });
     try {
-      const session = loginSchema.parse(await bridge.call('begin_login'));
+      const session = loginSchema.parse(
+        await (accountId === null
+          ? bridge.call('begin_login')
+          : bridge.call('begin_login', { accountId })),
+      );
       if (mine !== generation || disposed) {
         await bridge.call('cancel_login', { id: session.id });
       } else
-        set({ login: { open: true, session, working: false, error: null } });
+        set({
+          login: {
+            open: true,
+            accountId,
+            session,
+            working: false,
+            error: null,
+          },
+        });
     } catch (error) {
       if (mine === generation)
         set({
           login: {
             open: true,
+            accountId,
             session: null,
             working: false,
             error: safeError(error, locale()),
@@ -279,13 +312,67 @@ export function createController(bridge: Bridge = nativeBridge) {
   async function cancelLogin() {
     const session = state.login.session;
     generation++;
-    set({ login: { open: false, session: null, working: false, error: null } });
+    set({
+      login: {
+        open: false,
+        accountId: null,
+        session: null,
+        working: false,
+        error: null,
+      },
+    });
     if (session) {
       try {
         accept(await bridge.call('cancel_login', { id: session.id }));
       } catch (error) {
         set({ error: safeError(error, locale()) });
       }
+    }
+  }
+  async function restartLogin() {
+    if (blocked() || !state.login.open || state.login.working) return;
+    const accountId = state.login.accountId;
+    const session = state.login.session;
+    const mine = ++generation;
+    set({
+      login: {
+        open: true,
+        accountId,
+        session: null,
+        working: true,
+        error: null,
+      },
+    });
+    try {
+      if (session) {
+        const result = await bridge.call('cancel_login', { id: session.id });
+        if (mine !== generation || disposed) return;
+        accept(result);
+      }
+      if (mine !== generation || disposed) return;
+      // Re-read the saved target after cancellation; never retarget by email.
+      set({
+        login: {
+          open: false,
+          accountId: null,
+          session: null,
+          working: false,
+          error: null,
+        },
+      });
+      await beginLogin(accountId);
+    } catch (error) {
+      if (mine === generation && !disposed)
+        set({
+          login: {
+            open: true,
+            accountId,
+            // Retain cleanup intent so another restart cancels this session first.
+            session,
+            working: false,
+            error: safeError(error, locale()),
+          },
+        });
     }
   }
   async function finishLogin(code: string) {
@@ -312,7 +399,13 @@ export function createController(bridge: Bridge = nativeBridge) {
       if (mine === generation && !disposed) {
         accept(result);
         set({
-          login: { open: false, session: null, working: false, error: null },
+          login: {
+            open: false,
+            accountId: null,
+            session: null,
+            working: false,
+            error: null,
+          },
         });
       }
     } catch (error) {
@@ -345,6 +438,7 @@ export function createController(bridge: Bridge = nativeBridge) {
     resumeAutomaticReturns: () => action('resume_automatic_returns'),
     beginLogin,
     cancelLogin,
+    restartLogin,
     finishLogin,
     dismissError: () => set({ error: null }),
     dismissPreview: () => set({ preview: null }),

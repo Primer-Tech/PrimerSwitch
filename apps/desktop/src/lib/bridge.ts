@@ -14,7 +14,7 @@ export interface CommandArgs {
   update_account_automation: { id: string; automation: AccountAutomation };
   resume_automatic_returns: undefined;
   import_current: undefined;
-  begin_login: undefined;
+  begin_login: { accountId?: string | null } | undefined;
   finish_login: { id: string; code: string };
   cancel_login: { id: string };
   preview_legacy_import: undefined;

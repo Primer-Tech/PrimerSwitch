@@ -363,6 +363,58 @@ pub fn api_key_auth_payload(key: &str) -> Result<Vec<u8>, CodexError> {
     );
     Ok(OpaqueAuth::parse(bytes.to_vec())?.as_bytes().to_vec())
 }
+/// The two logins in a key file with late tokens: the key payload, then the ChatGPT payload.
+pub type KeyAndTokens = (Zeroizing<Vec<u8>>, Zeroizing<Vec<u8>>);
+/// A file with an API key and ChatGPT tokens at once. Codex before 0.163 leaves it when
+/// an old process finishes a ChatGPT refresh after the key was written: its
+/// `persist_tokens` merges the rotated tokens into the current file and keeps the key
+/// and the mode. Returns the key as a normal API-key payload and the tokens as a normal
+/// ChatGPT payload that parses strictly. None for anything else: no key, a mode other
+/// than `apikey`, a foreign credential field, or tokens that are not a valid login.
+pub fn split_key_with_tokens(bytes: &[u8]) -> Option<KeyAndTokens> {
+    let json = SecretJson::parse(bytes).ok()?;
+    let object = json.0.as_object()?;
+    let nonnull = |key: &str| object.get(key).is_some_and(|v| !v.is_null());
+    let foreign = [
+        "agent_identity",
+        "personal_access_token",
+        "bedrock_api_key",
+        "bedrock_access_keys",
+    ]
+    .iter()
+    .any(|key| nonnull(key));
+    let mode_ok = match object.get("auth_mode") {
+        None | Some(serde_json::Value::Null) => true,
+        Some(mode) => mode.as_str() == Some("apikey"),
+    };
+    let key = object
+        .get("OPENAI_API_KEY")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty());
+    let tokens = object.get("tokens").filter(|v| v.is_object());
+    if foreign || !mode_ok {
+        return None;
+    }
+    let (key, tokens) = (key?, tokens?);
+    let key_payload = api_key_auth_payload(key).ok()?;
+    let mut chatgpt = serde_json::json!({
+        "auth_mode": "chatgpt",
+        "OPENAI_API_KEY": null,
+        "tokens": tokens.clone(),
+    });
+    if let Some(stamp) = object.get("last_refresh").filter(|v| v.is_string()) {
+        chatgpt["last_refresh"] = stamp.clone();
+    }
+    let serialized = serde_json::to_vec_pretty(&chatgpt).map(Zeroizing::new);
+    crate::wire::wipe(&mut chatgpt);
+    let chatgpt = OpaqueAuth::parse(serialized.ok()?.to_vec()).ok()?;
+    (chatgpt.kind() == AuthKind::ManagedChatgpt).then(|| {
+        (
+            Zeroizing::new(key_payload),
+            Zeroizing::new(chatgpt.as_bytes().to_vec()),
+        )
+    })
+}
 /// The key inside an API-key auth.json, for comparisons that must not depend on how
 /// the file was formatted.
 fn api_key_of(bytes: &[u8]) -> Option<Zeroizing<String>> {

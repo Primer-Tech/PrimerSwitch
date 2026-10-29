@@ -409,3 +409,96 @@ fn api_key_tail_and_comparison_ignore_formatting_and_never_expose_more_than_four
     // A key too short to hide behind four characters shows nothing.
     assert_eq!(api_key_tail(br#"{"OPENAI_API_KEY":"sk-short"}"#), None);
 }
+#[test]
+fn a_key_file_with_late_chatgpt_tokens_splits_into_two_normal_logins() {
+    let tokens = tokens_for("user-a", "ws-a", "A2", "RA2");
+    let mixed = json!({"auth_mode":"apikey","OPENAI_API_KEY":FAKE_KEY,"tokens":tokens,
+        "last_refresh":"2026-10-29T10:00:00Z","future":{"dropped":true}});
+    let bytes = serde_json::to_vec(&mixed).unwrap();
+    // Alone it is neither a key login nor a ChatGPT login, and never a write target.
+    assert_eq!(
+        OpaqueAuth::inspect(&bytes).unwrap().kind,
+        AuthKind::Unsupported
+    );
+    let (key, chatgpt) = split_key_with_tokens(&bytes).unwrap();
+    assert_eq!(*key, api_key_auth_payload(FAKE_KEY).unwrap());
+    assert_eq!(
+        OpaqueAuth::parse(key.to_vec()).unwrap().kind(),
+        AuthKind::ApiKey
+    );
+    let login = OpaqueAuth::parse(chatgpt.to_vec()).unwrap();
+    assert_eq!(login.kind(), AuthKind::ManagedChatgpt);
+    assert_eq!(
+        login.routing_claims().chatgpt_account_id.as_deref(),
+        Some("ws-a")
+    );
+    let value: serde_json::Value = serde_json::from_slice(&chatgpt).unwrap();
+    assert_eq!(value["auth_mode"], "chatgpt");
+    assert!(value["OPENAI_API_KEY"].is_null());
+    assert_eq!(value["tokens"]["refresh_token"], "RA2");
+    assert_eq!(value["last_refresh"], "2026-10-29T10:00:00Z");
+    assert!(value.get("future").is_none());
+    // The mode may be missing: Codex infers the key from the file.
+    let mut unlabelled = mixed.clone();
+    unlabelled.as_object_mut().unwrap().remove("auth_mode");
+    assert!(split_key_with_tokens(&serde_json::to_vec(&unlabelled).unwrap()).is_some());
+    // The helper never prints or keeps what it returns in a Debug view of the login.
+    assert!(!format!("{login:?}").contains("RA2"));
+}
+#[test]
+fn only_a_key_with_a_valid_chatgpt_login_splits_and_anything_else_stays_unsupported() {
+    let base = || {
+        json!({"auth_mode":"apikey","OPENAI_API_KEY":FAKE_KEY,
+        "tokens":tokens_for("user-a","ws-a","A2","RA2")})
+    };
+    assert!(split_key_with_tokens(&serde_json::to_vec(&base()).unwrap()).is_some());
+    let mut cases = Vec::new();
+    for field in [
+        "agent_identity",
+        "personal_access_token",
+        "bedrock_api_key",
+        "bedrock_access_keys",
+    ] {
+        let mut value = base();
+        value[field] = "FOREIGN".into();
+        cases.push((field, value));
+    }
+    let mut value = base();
+    value["auth_mode"] = "chatgpt".into();
+    cases.push(("mode chatgpt", value));
+    let mut value = base();
+    value["auth_mode"] = 7.into();
+    cases.push(("mode not a string", value));
+    let mut value = base();
+    value["OPENAI_API_KEY"] = " ".into();
+    cases.push(("blank key", value));
+    let mut value = base();
+    value["OPENAI_API_KEY"] = serde_json::Value::Null;
+    cases.push(("no key", value));
+    let mut value = base();
+    value["tokens"] = serde_json::Value::Null;
+    cases.push(("no tokens", value));
+    let mut value = base();
+    value["tokens"] = "text".into();
+    cases.push(("tokens not an object", value));
+    let mut value = base();
+    value["tokens"]["refresh_token"] = "".into();
+    cases.push(("empty refresh token", value));
+    let mut value = base();
+    value["tokens"]["id_token"] = "not-a-jwt".into();
+    cases.push(("bad id_token", value));
+    let mut value = base();
+    value["tokens"]["account_id"] = "ws-other".into();
+    cases.push(("tokens of another workspace", value));
+    for (why, value) in cases {
+        assert!(
+            split_key_with_tokens(&serde_json::to_vec(&value).unwrap()).is_none(),
+            "{why}"
+        );
+    }
+    assert!(split_key_with_tokens(b"not json").is_none());
+    assert!(split_key_with_tokens(b"[]").is_none());
+    // A plain key or a plain ChatGPT login has nothing to split.
+    assert!(split_key_with_tokens(&api_key_auth_payload(FAKE_KEY).unwrap()).is_none());
+    assert!(split_key_with_tokens(&payload("workspace-a")).is_none());
+}

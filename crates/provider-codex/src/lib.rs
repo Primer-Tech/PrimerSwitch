@@ -9,7 +9,7 @@ mod wire;
 pub use auth::{
     AuthInspection, AuthKind, OpaqueAuth, UnverifiedRoutingClaims, api_key_auth_payload,
     api_key_tail, chatgpt_auth_payload, merge_rotated_tokens, normalize_hybrid, same_api_key,
-    validate_api_key,
+    split_key_with_tokens, validate_api_key,
 };
 pub use client::{
     BrowserLoginChallenge, CancelOutcome, CodexClient, CodexContext, CodexService,

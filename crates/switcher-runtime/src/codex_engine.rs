@@ -1526,9 +1526,17 @@ impl CodexEngine {
                 self.save(vault)?;
             }
             _ => {
-                self.selected_id = None;
-                if self.note_external_selection(previous.as_deref(), observed_before, now) {
-                    self.save_automation(vault)?;
+                if let Some((key, chatgpt)) = split_key_with_tokens(bytes) {
+                    // Codex is still in key mode; the late tokens belong to a saved account.
+                    let index = self.adopt_key_with_tokens(&key, &chatgpt, now)?;
+                    self.selected_id = Some(self.saved.accounts[index].id.clone());
+                    self.note_external_selection(previous.as_deref(), observed_before, now);
+                    self.save(vault)?;
+                } else {
+                    self.selected_id = None;
+                    if self.note_external_selection(previous.as_deref(), observed_before, now) {
+                        self.save_automation(vault)?;
+                    }
                 }
             }
         }
@@ -1611,6 +1619,42 @@ impl CodexEngine {
             preferred_return_handled_reset_at: None,
         });
         Ok(self.saved.accounts.len() - 1)
+    }
+    /// A key file that gained ChatGPT tokens (see `split_key_with_tokens`): move the
+    /// rotated tokens into the saved account of the same owner, or keep them as a new
+    /// account, and adopt the key. Returns the key's account. The file is not rewritten;
+    /// the next switch replaces it.
+    fn adopt_key_with_tokens(
+        &mut self,
+        key: &[u8],
+        chatgpt: &[u8],
+        now: i64,
+    ) -> Result<usize, CodexReason> {
+        let (user, workspace) = OpaqueAuth::inspect(chatgpt)
+            .map_err(provider_reason)?
+            .claims
+            .token_owner();
+        let owner = Binding {
+            user,
+            workspace,
+            email: None,
+        };
+        if let Some(account) = self
+            .saved
+            .accounts
+            .iter_mut()
+            .find(|a| a.auth_kind == AuthKind::ManagedChatgpt && a.binding.same_owner(&owner))
+        {
+            if let Ok(merged) = merge_rotated_tokens(&account.auth, chatgpt) {
+                account.set_merged(merged)?;
+                account.needs_sign_in = false;
+            }
+        } else {
+            let auth = OpaqueAuth::parse(chatgpt.to_vec()).map_err(provider_reason)?;
+            self.adopt_or_import(auth, CodexIdentityEvidence::ClaimsOnly, now)?;
+        }
+        let auth = OpaqueAuth::parse(key.to_vec()).map_err(provider_reason)?;
+        self.adopt_or_import(auth, CodexIdentityEvidence::ClaimsOnly, now)
     }
     /// A Codex process that still held another account refreshed after the file was
     /// switched: its `persist_tokens` merged that account's tokens into the current
@@ -1879,11 +1923,17 @@ impl CodexEngine {
         if inspection.hybrid {
             return self.repair_hybrid(bytes, &current, &store, vault, now);
         }
-        if inspection.kind == AuthKind::Unsupported {
+        let split = split_key_with_tokens(bytes);
+        if inspection.kind == AuthKind::Unsupported && split.is_none() {
             return Err(CodexReason::UnsupportedAuth);
         }
-        let auth = OpaqueAuth::parse(bytes.to_vec()).map_err(provider_reason)?;
-        let index = self.adopt_or_import(auth, CodexIdentityEvidence::ClaimsOnly, now)?;
+        let index = match split {
+            Some((key, chatgpt)) => self.adopt_key_with_tokens(&key, &chatgpt, now)?,
+            None => {
+                let auth = OpaqueAuth::parse(bytes.to_vec()).map_err(provider_reason)?;
+                self.adopt_or_import(auth, CodexIdentityEvidence::ClaimsOnly, now)?
+            }
+        };
         self.save(vault)?;
         self.selected_id = Some(self.saved.accounts[index].id.clone());
         self.observed_generation = Some(current.generation);
@@ -1955,7 +2005,7 @@ impl CodexEngine {
                             _ => continue,
                         }
                     }
-                    Some("api_key") => match text("key") {
+                    Some("api_key") => match text("key").map(str::trim).filter(|k| !k.is_empty()) {
                         Some(key) => api_key_auth_payload(key),
                         None => continue,
                     },
@@ -1991,7 +2041,9 @@ impl CodexEngine {
         let issued = auth.routing_claims().issued_at;
         if let Some(account) = self.saved.accounts.iter_mut().find(|a| {
             a.auth_kind == auth.kind()
-                && (a.binding.same_owner(&binding) || a.auth == auth.as_bytes())
+                && (a.binding.same_owner(&binding)
+                    || a.auth == auth.as_bytes()
+                    || (a.auth_kind == AuthKind::ApiKey && same_api_key(&a.auth, auth.as_bytes())))
         }) {
             let saved_issued = OpaqueAuth::inspect(&account.auth)
                 .ok()
@@ -2565,8 +2617,12 @@ impl CodexEngine {
             return Ok(());
         }
         if inspection.kind == AuthKind::Unsupported {
-            // Agent identity, personal access token or Bedrock: never overwrite it.
-            return Err(CodexReason::UnsupportedAuth);
+            // A key with late ChatGPT tokens is kept; agent identity, personal access
+            // token or Bedrock: never overwrite it.
+            let (key, chatgpt) =
+                split_key_with_tokens(bytes).ok_or(CodexReason::UnsupportedAuth)?;
+            self.adopt_key_with_tokens(&key, &chatgpt, now)?;
+            return Ok(());
         }
         let auth = OpaqueAuth::parse(bytes.to_vec()).map_err(provider_reason)?;
         self.adopt_or_import(auth, CodexIdentityEvidence::ClaimsOnly, now)?;
@@ -2614,7 +2670,20 @@ impl CodexEngine {
                     }
                     self.observed_generation = Some(current.generation);
                 }
-                _ => (),
+                _ => {
+                    self.switching = None;
+                    let previous = self.selected_id.take();
+                    // A key that only gained late ChatGPT tokens stays active. Anything
+                    // else is not the target: the switch did not stick (ExternalChange).
+                    if let Some((key, chatgpt)) =
+                        current.auth_bytes().and_then(split_key_with_tokens)
+                    {
+                        let index = self.adopt_key_with_tokens(&key, &chatgpt, now)?;
+                        self.selected_id = Some(self.saved.accounts[index].id.clone());
+                    }
+                    self.note_external_selection(previous.as_deref(), true, now);
+                    self.observed_generation = Some(current.generation);
+                }
             }
         }
         if repaired && allow_repair && outcome.daemon_running {

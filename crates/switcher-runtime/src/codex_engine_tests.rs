@@ -3939,3 +3939,259 @@ async fn refreshing_an_api_key_reads_nothing_and_leaves_no_error_or_sign_in_stat
         })
         .await;
 }
+
+// A late ChatGPT refresh of an old Codex process (before 0.163) after the key was
+// written merges the rotated tokens into the key file and keeps the key and the mode.
+fn key_with_tokens(key: &str, user: &str, workspace: &str, revision: &str) -> Vec<u8> {
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&auth(user, workspace, revision)).unwrap();
+    value["auth_mode"] = "apikey".into();
+    value["OPENAI_API_KEY"] = key.into();
+    value["last_refresh"] = "2026-10-29T10:00:00Z".into();
+    serde_json::to_vec_pretty(&value).unwrap()
+}
+
+#[tokio::test]
+async fn a_late_chatgpt_refresh_during_a_switch_to_a_key_is_kept_and_never_blocks_switching_back() {
+    let mut f = Fixture::new();
+    let a = f.id_of("ws-a");
+    f.add_key("Work key", FAKE_KEY).await.unwrap();
+    let key = f.key_id(FAKE_KEY);
+    // While the daemon drains, a `codex exec` still holding A finishes its refresh and
+    // merges the new tokens into the file that now holds the key.
+    let mixed = key_with_tokens(FAKE_KEY, "user-a", "ws-a", "late");
+    *f.daemon.during_restart.lock().unwrap() = Some(mixed.clone());
+    let outcome = f.switch(&key).await.unwrap();
+    assert_eq!(outcome.error, None);
+    assert!(f.engine.switching.is_none());
+    // The key stays the active login and A keeps the rotated tokens it would have lost.
+    assert_eq!(f.engine.selected_id.as_deref(), Some(key.as_str()));
+    assert_eq!(f.engine.saved.accounts.len(), 2);
+    assert_eq!(f.saved_by_id(&key), key_file(FAKE_KEY));
+    let (refresh, workspace) = tokens_of(&f.saved_bytes("ws-a"));
+    assert_eq!(refresh, "refresh-secret-sentinel-late");
+    assert_eq!(workspace, "ws-a");
+    // The file is not rewritten by this repair; the next switch replaces it.
+    assert_eq!(f.active(), mixed);
+    // Switching back used to fail with UnsupportedAuth.
+    f.switch(&a).await.unwrap();
+    assert_eq!(f.engine.selected_id.as_deref(), Some(a.as_str()));
+    assert_eq!(f.active(), f.saved_bytes("ws-a"));
+    assert_eq!(tokens_of(&f.active()).0, "refresh-secret-sentinel-late");
+    assert_eq!(f.saved_by_id(&key), key_file(FAKE_KEY));
+    assert_eq!(f.engine.saved.accounts.len(), 2);
+    assert!(!f.vault_holds(FAKE_KEY));
+    f.claude_untouched();
+}
+
+#[tokio::test]
+async fn the_observer_follows_a_key_file_with_late_tokens_and_adopts_an_unknown_owner() {
+    let mut f = Fixture::new();
+    let a = f.id_of("ws-a");
+    f.add_key("Work key", FAKE_KEY).await.unwrap();
+    let key = f.key_id(FAKE_KEY);
+    *f.daemon.state.lock().unwrap() = Ok(DaemonState::NotRunning);
+    f.switch(&key).await.unwrap();
+    let mixed = key_with_tokens(FAKE_KEY, "user-a", "ws-a", "much-later");
+    f.write_active(&mixed);
+    f.engine.observe(&f.vault, 400).unwrap();
+    assert_eq!(f.engine.selected_id.as_deref(), Some(key.as_str()));
+    assert_eq!(f.engine.saved.accounts.len(), 2);
+    assert_eq!(
+        tokens_of(&f.saved_bytes("ws-a")).0,
+        "refresh-secret-sentinel-much-later"
+    );
+    assert_eq!(f.active(), mixed);
+    // No manual-selection hold: the active login did not change.
+    assert_eq!(f.engine.saved.return_hold_until, None);
+    // Tokens of an account that was never saved become a new account, not a loss.
+    f.write_active(&key_with_tokens(FAKE_KEY, "user-z", "ws-z", "unknown"));
+    f.engine.observe(&f.vault, 410).unwrap();
+    assert_eq!(f.engine.saved.accounts.len(), 3);
+    assert_eq!(tokens_of(&f.saved_bytes("ws-z")).1, "ws-z");
+    assert_eq!(f.engine.selected_id.as_deref(), Some(key.as_str()));
+    // The same tokens again add no copy.
+    f.write_active(&key_with_tokens(FAKE_KEY, "user-z", "ws-z", "unknown-2"));
+    f.engine.observe(&f.vault, 420).unwrap();
+    assert_eq!(f.engine.saved.accounts.len(), 3);
+    // Switching away keeps all three and works.
+    f.switch(&a).await.unwrap();
+    assert_eq!(f.engine.selected_id.as_deref(), Some(a.as_str()));
+    assert_eq!(f.engine.saved.accounts.len(), 3);
+    // An import of the current login follows the same rule.
+    f.write_active(&key_with_tokens(FAKE_KEY, "user-a", "ws-a", "imported"));
+    f.engine
+        .command(CodexCommand::ImportCurrent, &f.vault, 430)
+        .await
+        .unwrap();
+    assert_eq!(f.engine.selected_id.as_deref(), Some(key.as_str()));
+    assert_eq!(f.engine.saved.accounts.len(), 3);
+    assert_eq!(
+        tokens_of(&f.saved_bytes("ws-a")).0,
+        "refresh-secret-sentinel-imported"
+    );
+    f.claude_untouched();
+}
+
+#[tokio::test]
+async fn an_unseen_key_file_with_tokens_is_saved_as_the_outgoing_login_before_a_switch() {
+    let mut f = Fixture::new();
+    let a = f.id_of("ws-a");
+    let other_key = "sk-proj-SENTINEL-unseenkey-000000";
+    // The observer has not seen this file: a key and tokens that belong to nobody saved.
+    f.write_active(&key_with_tokens(other_key, "user-z", "ws-z", "unseen"));
+    let b = f.add("user-b", "ws-b", "saved");
+    f.switch(&b).await.unwrap();
+    assert_eq!(f.engine.saved.accounts.len(), 4);
+    assert_eq!(
+        tokens_of(&f.saved_bytes("ws-z")).0,
+        "refresh-secret-sentinel-unseen"
+    );
+    f.key_id(other_key);
+    assert_eq!(f.engine.selected_id.as_deref(), Some(b.as_str()));
+    assert_eq!(f.active(), auth("user-b", "ws-b", "saved"));
+    assert!(f.engine.account_index(&a).is_ok());
+    f.claude_untouched();
+}
+
+#[tokio::test]
+async fn a_key_file_with_a_foreign_field_or_unusable_tokens_stays_unsupported_and_is_never_overwritten()
+ {
+    let mut f = Fixture::new();
+    let a = f.id_of("ws-a");
+    let b = f.add("user-b", "ws-b", "saved");
+    let accounts = f.engine.saved.accounts.len();
+    let base = || -> serde_json::Value {
+        serde_json::from_slice(&key_with_tokens(FAKE_KEY, "user-a", "ws-a", "late")).unwrap()
+    };
+    let mut foreign = base();
+    foreign["agent_identity"] = "agent-secret-sentinel".into();
+    let mut unusable = base();
+    unusable["tokens"]["refresh_token"] = "".into();
+    let mut chatgpt_mode = base();
+    chatgpt_mode["auth_mode"] = "chatgpt".into();
+    for file in [foreign, unusable, chatgpt_mode] {
+        let bytes = serde_json::to_vec_pretty(&file).unwrap();
+        f.write_active(&bytes);
+        f.engine.observe(&f.vault, 400).unwrap();
+        assert_eq!(f.engine.selected_id, None);
+        assert_eq!(f.engine.saved.accounts.len(), accounts);
+        assert_eq!(
+            tokens_of(&f.saved_bytes("ws-a")).0,
+            "refresh-secret-sentinel-initial"
+        );
+        for target in [&a, &b] {
+            assert_eq!(
+                f.engine.begin_switch(target, &f.vault, 410).err(),
+                Some(CodexReason::UnsupportedAuth)
+            );
+        }
+        assert_eq!(f.active(), bytes);
+        assert!(f.engine.switching.is_none());
+        assert_eq!(
+            f.engine
+                .command(CodexCommand::ImportCurrent, &f.vault, 420)
+                .await
+                .err(),
+            Some(CodexReason::UnsupportedAuth)
+        );
+        assert_eq!(f.engine.saved.accounts.len(), accounts);
+    }
+    f.claude_untouched();
+}
+
+#[tokio::test]
+async fn a_switch_whose_file_becomes_unusable_during_the_drain_is_reported_and_never_stays_in_progress()
+ {
+    let mut f = Fixture::new();
+    f.add_key("Work key", FAKE_KEY).await.unwrap();
+    let key = f.key_id(FAKE_KEY);
+    let agent = br#"{"agent_identity":"agent-secret-sentinel"}"#;
+    *f.daemon.during_restart.lock().unwrap() = Some(agent.to_vec());
+    assert_eq!(
+        f.switch(&key).await.err(),
+        Some(CodexReason::ExternalChange)
+    );
+    assert!(f.engine.switching.is_none());
+    assert_eq!(f.engine.selected_id, None);
+    // The file that replaced ours is left alone.
+    assert_eq!(f.active(), agent);
+    assert_eq!(f.engine.saved.accounts.len(), 2);
+    f.claude_untouched();
+}
+
+#[tokio::test]
+async fn a_lampese_key_never_duplicates_renames_or_resets_a_saved_key_and_is_trimmed() {
+    let mut f = Fixture::new();
+    // The same key saved three ways: legacy payload without auth_mode (an older import),
+    // an externally observed login, and one added by name.
+    let legacy = format!(r#"{{"OPENAI_API_KEY":"{FAKE_KEY}"}}"#);
+    let legacy_index = f
+        .engine
+        .adopt_or_import(
+            OpaqueAuth::parse(legacy.clone().into_bytes()).unwrap(),
+            CodexIdentityEvidence::ClaimsOnly,
+            100,
+        )
+        .unwrap();
+    let legacy_id = f.engine.saved.accounts[legacy_index].id.clone();
+    f.engine.saved.accounts[legacy_index].name = "My own name".into();
+    f.engine.saved.accounts[legacy_index].needs_sign_in = true;
+    f.engine.saved.accounts[legacy_index].auth_failures = 2;
+    let external = "sk-proj-SENTINEL-externalkey-000000";
+    f.write_active(format!(r#"{{"auth_mode":"apikey","OPENAI_API_KEY":"{external}"}}"#).as_bytes());
+    f.engine.observe(&f.vault, 110).unwrap();
+    let external_id = f.key_id(external);
+    f.add_key("Named", "sk-proj-SENTINEL-namedkey-00000000")
+        .await
+        .unwrap();
+    let before = f.engine.saved.accounts.len();
+    let store = json!({"version":1,"active_account_id":"x","masked_account_ids":[],"accounts":[
+        {"id":"k1","name":"Lampese one","auth_mode":"api_key","created_at":"2026-01-01T00:00:00Z",
+         "auth_data":{"type":"api_key","key":FAKE_KEY}},
+        {"id":"k2","name":"Lampese two","auth_mode":"api_key","created_at":"2026-01-01T00:00:00Z",
+         "auth_data":{"type":"api_key","key":format!("  {external}\n")}},
+        {"id":"k3","name":"Lampese three","auth_mode":"api_key","created_at":"2026-01-01T00:00:00Z",
+         "auth_data":{"type":"api_key","key":"sk-proj-SENTINEL-namedkey-00000000"}},
+        {"id":"k4","name":"Blank","auth_mode":"api_key","created_at":"2026-01-01T00:00:00Z",
+         "auth_data":{"type":"api_key","key":"   "}}
+    ]});
+    *f.switcher.0.lock().unwrap() = Some(serde_json::to_vec(&store).unwrap());
+    f.engine
+        .command(CodexCommand::ImportSwitcher, &f.vault, 300)
+        .await
+        .unwrap();
+    // Nothing was added, renamed or reset by the duplicates; the blank key is skipped.
+    assert_eq!(f.engine.saved.accounts.len(), before);
+    let legacy_row = &f.engine.saved.accounts[f.engine.account_index(&legacy_id).unwrap()];
+    assert_eq!(legacy_row.name, "My own name");
+    assert!(legacy_row.needs_sign_in);
+    assert_eq!(legacy_row.auth_failures, 2);
+    assert_eq!(legacy_row.auth, legacy.as_bytes());
+    assert_eq!(f.view(&external_id).name, "Codex API key");
+    // A new key with surrounding whitespace is stored trimmed, under the name given.
+    let store = json!({"version":1,"active_account_id":"x","masked_account_ids":[],"accounts":[
+        {"id":"k5","name":"Padded","auth_mode":"api_key","created_at":"2026-01-01T00:00:00Z",
+         "auth_data":{"type":"api_key","key":"\t sk-proj-SENTINEL-paddedkey-0000000 \n"}}
+    ]});
+    *f.switcher.0.lock().unwrap() = Some(serde_json::to_vec(&store).unwrap());
+    f.engine
+        .command(CodexCommand::ImportSwitcher, &f.vault, 310)
+        .await
+        .unwrap();
+    assert_eq!(f.engine.saved.accounts.len(), before + 1);
+    let padded = f.key_id("sk-proj-SENTINEL-paddedkey-0000000");
+    assert_eq!(
+        f.saved_by_id(&padded),
+        key_file("sk-proj-SENTINEL-paddedkey-0000000")
+    );
+    assert_eq!(f.view(&padded).name, "Padded");
+    assert_eq!(f.view(&padded).api_key_tail.as_deref(), Some("0000"));
+    // The same padded key again is a duplicate.
+    f.engine
+        .command(CodexCommand::ImportSwitcher, &f.vault, 320)
+        .await
+        .unwrap();
+    assert_eq!(f.engine.saved.accounts.len(), before + 1);
+    f.claude_untouched();
+}

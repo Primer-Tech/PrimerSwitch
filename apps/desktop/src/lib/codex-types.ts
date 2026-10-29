@@ -28,6 +28,7 @@ export const codexReasonSchema = z.enum([
   'noResetCredits',
   'resetUnconfirmed',
   'invalidAutomation',
+  'invalidApiKey',
 ]);
 export type CodexReason = z.infer<typeof codexReasonSchema>;
 export const codexResetOutcomeSchema = z.enum([
@@ -81,6 +82,8 @@ export const codexAccountSchema = z
     workspaceId: text.nullable(),
     workspaceName: text.nullable(),
     authKind: z.enum(['chatgpt', 'apiKey', 'unsupported']),
+    /** The last four characters of an API key, for comparing it with the provider's key list. */
+    apiKeyTail: z.string().min(1).max(8).nullable().optional(),
     planType: text.nullable(),
     identityEvidence: z.enum([
       'none',
@@ -182,6 +185,7 @@ export const codexSnapshotSchema = z
         loginBrowser: codexCapabilitySchema,
         importCurrent: codexCapabilitySchema,
         importSwitcher: codexCapabilitySchema,
+        addApiKey: codexCapabilitySchema,
         refreshQuota: codexCapabilitySchema,
         switchAccount: codexCapabilitySchema,
         deleteSaved: codexCapabilitySchema,

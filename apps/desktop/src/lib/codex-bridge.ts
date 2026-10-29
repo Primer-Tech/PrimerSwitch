@@ -9,6 +9,7 @@ export interface CodexCommandArgs {
   codex_cancel_login: { id: string };
   codex_import_current: undefined;
   codex_import_switcher: undefined;
+  codex_add_api_key: { name: string; key: string };
   codex_refresh_account: { id: string };
   codex_consume_reset: { id: string };
   codex_refresh_all: undefined;
@@ -36,6 +37,7 @@ const commands: readonly CodexCommand[] = [
   'codex_cancel_login',
   'codex_import_current',
   'codex_import_switcher',
+  'codex_add_api_key',
   'codex_refresh_account',
   'codex_consume_reset',
   'codex_refresh_all',

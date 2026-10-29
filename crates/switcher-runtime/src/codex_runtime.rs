@@ -3,6 +3,7 @@
 //! `codex_job`, so Claude actions and polling are never blocked by it.
 use super::*;
 use crate::codex_engine::{CodexAutoSwitch, CodexAutomation, QuotaJob, ResetJob, SwitchJob};
+use zeroize::Zeroizing;
 
 /// Background cadence: follow auth.json, read at most one due quota, then decide
 /// automatic switching.
@@ -127,6 +128,18 @@ impl RuntimeHandle {
         });
         Ok(snapshot)
     }
+    /// Save a typed OpenAI API key under `name`. The key is wrapped for wiping at once
+    /// and appears in no snapshot, error or log.
+    pub async fn codex_add_api_key(
+        &self,
+        name: &str,
+        key: String,
+    ) -> Result<CodexSnapshot, CodexReason> {
+        let key = Zeroizing::new(key);
+        let _job = self.codex_job_lock().await?;
+        self.codex_snapshot_command(CodexCommand::AddApiKey(name.into(), key))
+            .await
+    }
     pub async fn codex_delete_account(&self, id: &str) -> Result<CodexSnapshot, CodexReason> {
         let _job = self.codex_job_lock().await?;
         self.codex_snapshot_command(CodexCommand::Delete(id.into()))
@@ -218,6 +231,11 @@ impl RuntimeHandle {
             let mut engine = self.inner.owner.lock().await;
             if engine.demo || engine.vault.is_none() {
                 return Err(CodexReason::VaultUnavailable);
+            }
+            // An API key has no plan limits to read; that is neither an error nor a
+            // sign-in problem, and it leaves no "unread" or failed state behind.
+            if !engine.codex.reads_quota(id) {
+                return Ok(());
             }
             let now = engine.clock.now();
             let policy = CodexPolicy::from(&engine.saved.settings);

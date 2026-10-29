@@ -333,12 +333,54 @@ pub fn chatgpt_auth_payload(
     crate::wire::wipe(&mut value);
     Ok(OpaqueAuth::parse(bytes.to_vec())?.as_bytes().to_vec())
 }
-/// auth.json payload for an imported OpenAI API key (saved, never selected).
+/// Strict shape check for an API key typed by the user: trimmed, 20 to 512 printable
+/// ASCII characters, starting with `sk-`. A failure never echoes the input.
+pub fn validate_api_key(input: &str) -> Result<Zeroizing<String>, CodexError> {
+    let key = input.trim();
+    if !(20..=512).contains(&key.len())
+        || !key.starts_with("sk-")
+        || !key.bytes().all(|b| b.is_ascii_graphic())
+    {
+        return Err(CodexError::InvalidApiKey);
+    }
+    Ok(Zeroizing::new(key.to_owned()))
+}
+/// auth.json payload for an OpenAI API key, in the shape `codex login --with-api-key`
+/// writes (Codex 0.163.0-alpha.2): the mode and the key, no tokens.
 pub fn api_key_auth_payload(key: &str) -> Result<Vec<u8>, CodexError> {
-    let mut value = serde_json::json!({ "OPENAI_API_KEY": key });
-    let bytes = serde_json::to_vec_pretty(&value).map_err(|_| CodexError::Protocol);
-    crate::wire::wipe(&mut value);
-    Ok(OpaqueAuth::parse(bytes?)?.as_bytes().to_vec())
+    #[derive(Serialize)]
+    struct ApiKeyAuth<'a> {
+        auth_mode: &'static str,
+        #[serde(rename = "OPENAI_API_KEY")]
+        key: &'a str,
+    }
+    let bytes = Zeroizing::new(
+        serde_json::to_vec_pretty(&ApiKeyAuth {
+            auth_mode: "apikey",
+            key,
+        })
+        .map_err(|_| CodexError::Protocol)?,
+    );
+    Ok(OpaqueAuth::parse(bytes.to_vec())?.as_bytes().to_vec())
+}
+/// The key inside an API-key auth.json, for comparisons that must not depend on how
+/// the file was formatted.
+fn api_key_of(bytes: &[u8]) -> Option<Zeroizing<String>> {
+    let json = SecretJson::parse(bytes).ok()?;
+    let key = json.0.as_object()?.get("OPENAI_API_KEY")?.as_str()?;
+    Some(Zeroizing::new(key.to_owned()))
+}
+/// Both payloads hold the same, non-empty API key.
+pub fn same_api_key(a: &[u8], b: &[u8]) -> bool {
+    matches!((api_key_of(a), api_key_of(b)), (Some(x), Some(y)) if !x.trim().is_empty() && *x == *y)
+}
+/// The last four characters of the saved key, for the owner to compare with the key
+/// list at platform.openai.com. Nothing is shown for a key too short to hide behind them.
+pub fn api_key_tail(bytes: &[u8]) -> Option<String> {
+    let key = api_key_of(bytes)?;
+    let tail: Vec<char> = key.chars().rev().take(4).collect();
+    (key.chars().count() >= 12 && tail.iter().all(char::is_ascii_graphic))
+        .then(|| tail.into_iter().rev().collect())
 }
 fn metadata(value: Option<&str>) -> Result<Option<String>, CodexError> {
     value

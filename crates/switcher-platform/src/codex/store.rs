@@ -187,6 +187,8 @@ fn zeroize_json(value: &mut serde_json::Value) {
     }
 }
 /// Shape validation only. JWT routing claims never establish verified ownership.
+/// Two shapes are written: managed ChatGPT tokens and an API-key login (the key and
+/// no tokens, as `codex login --with-api-key` writes it). Everything else is refused.
 fn validate_auth(bytes: &[u8]) -> CodexResult<()> {
     if bytes.is_empty() || bytes.len() > 32 * 1024 * 1024 {
         return Err(CodexStoreError::UnsupportedAuth);
@@ -195,22 +197,32 @@ fn validate_auth(bytes: &[u8]) -> CodexResult<()> {
         serde_json::from_slice(bytes).map_err(|_| CodexStoreError::UnsupportedAuth)?;
     let valid = (|| {
         let object = value.as_object()?;
-        if object
-            .get("auth_mode")
-            .is_some_and(|v| !v.is_null() && v.as_str() != Some("chatgpt"))
-        {
-            return None;
-        }
+        let present = |key: &str| object.get(key).is_some_and(|v| !v.is_null());
         for key in [
-            "OPENAI_API_KEY",
             "agent_identity",
             "personal_access_token",
             "bedrock_api_key",
             "bedrock_access_keys",
         ] {
-            if object.get(key).is_some_and(|v| !v.is_null()) {
+            if present(key) {
                 return None;
             }
+        }
+        let mode = match object.get("auth_mode") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(mode) => Some(mode.as_str()?),
+        };
+        if present("OPENAI_API_KEY") {
+            if mode.is_some_and(|mode| mode != "apikey")
+                || present("tokens")
+                || object.get("OPENAI_API_KEY")?.as_str()?.trim().is_empty()
+            {
+                return None;
+            }
+            return Some(());
+        }
+        if mode.is_some_and(|mode| mode != "chatgpt") {
+            return None;
         }
         let tokens = object.get("tokens")?.as_object()?;
         for key in ["id_token", "access_token", "refresh_token"] {
@@ -246,6 +258,9 @@ mod tests {
 
     const OLD: &[u8] = br#"{ "OPENAI_API_KEY":null,"tokens":{"id_token":"old-id-secret","access_token":"old-access-secret","refresh_token":"old-refresh-secret","account_id":null},"future":{"oldAccountOnly":true}}"#;
     const NEW: &[u8] = br#"{ "auth_mode":"chatgpt","OPENAI_API_KEY":null,"tokens":{"id_token":"new-id-secret","access_token":"new-access-secret","refresh_token":"new-refresh-secret","account_id":"new-workspace"},"future":{"incomingOnly":[1,2,3]}}"#;
+    /// What `codex login --with-api-key` writes (fake key).
+    const KEY: &[u8] =
+        br#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-proj-SENTINEL-0123456789abcdef"}"#;
 
     pub(crate) fn evidence(root: &Path, home: &Path) -> CodexContextEvidence {
         let sources_dir = root.join("sources");
@@ -377,15 +392,81 @@ mod tests {
         let (_root, store, vault) = fixture(Some(OLD));
         let before = store.read().unwrap();
         for payload in [
-            br#"{"OPENAI_API_KEY":"sk-secret"}"#.as_slice(),
-            br#"{"tokens":{"id_token":"","access_token":"a","refresh_token":"r"}}"#,
+            br#"{"tokens":{"id_token":"","access_token":"a","refresh_token":"r"}}"#.as_slice(),
             br#"{"auth_mode":"apikey","tokens":{}}"#,
+            // A key with tokens, in either mode, is a mixed file.
+            br#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-secret","tokens":{"id_token":"i","access_token":"a","refresh_token":"r"}}"#,
+            br#"{"OPENAI_API_KEY":"sk-secret","tokens":{"id_token":"i","access_token":"a","refresh_token":"r"}}"#,
+            br#"{"auth_mode":"chatgpt","OPENAI_API_KEY":"sk-secret"}"#,
+            // Empty, non-string or missing keys, and other modes or sign-ins.
+            br#"{"auth_mode":"apikey","OPENAI_API_KEY":""}"#,
+            br#"{"auth_mode":"apikey","OPENAI_API_KEY":"  "}"#,
+            br#"{"auth_mode":"apikey","OPENAI_API_KEY":42}"#,
+            br#"{"auth_mode":"apikey"}"#,
+            br#"{"auth_mode":"future","OPENAI_API_KEY":"sk-secret"}"#,
+            br#"{"auth_mode":42,"OPENAI_API_KEY":"sk-secret"}"#,
+            br#"{"OPENAI_API_KEY":"sk-secret","personal_access_token":"p"}"#,
+            br#"{"OPENAI_API_KEY":"sk-secret","agent_identity":{}}"#,
+            br#"{"OPENAI_API_KEY":"sk-secret","bedrock_api_key":"b"}"#,
+            br#"{"OPENAI_API_KEY":"sk-secret","bedrock_access_keys":{}}"#,
             b"not json",
         ] {
-            assert!(matches!(
-                store.replace(payload, &before.generation, &vault),
-                Err(CodexStoreError::UnsupportedAuth)
-            ));
+            assert!(
+                matches!(
+                    store.replace(payload, &before.generation, &vault),
+                    Err(CodexStoreError::UnsupportedAuth)
+                ),
+                "{}",
+                String::from_utf8_lossy(payload)
+            );
+        }
+        assert_eq!(store.read().unwrap().auth_bytes(), Some(OLD));
+    }
+    #[test]
+    fn an_api_key_login_is_written_byte_for_byte() {
+        let (_root, store, vault) = fixture(Some(OLD));
+        let home = store.context.home().to_owned();
+        let before = store.read().unwrap();
+        let written = store.replace(KEY, &before.generation, &vault).unwrap();
+        assert_eq!(written.auth_bytes(), Some(KEY));
+        assert_eq!(fs::read(home.join("auth.json")).unwrap(), KEY);
+        assert!(!format!("{written:?}").contains("SENTINEL"));
+        #[cfg(windows)]
+        crate::protection::tests::assert_private_acl(&home.join("auth.json"), false);
+        // The older shape without a mode, and an explicit null for the tokens, are the
+        // same login.
+        for payload in [
+            br#"{"OPENAI_API_KEY":"sk-proj-SENTINEL-0123456789abcdef"}"#.as_slice(),
+            br#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-proj-SENTINEL-0123456789abcdef","tokens":null,"future":{"kept":true}}"#,
+        ] {
+            let current = store.read().unwrap();
+            let written = store.replace(payload, &current.generation, &vault).unwrap();
+            assert_eq!(written.auth_bytes(), Some(payload));
+        }
+        // A missing login becomes a key login too.
+        let (_root, store, vault) = fixture(None);
+        let absent = store.read().unwrap();
+        let written = store.replace(KEY, &absent.generation, &vault).unwrap();
+        assert_eq!(written.auth_bytes(), Some(KEY));
+    }
+    #[test]
+    fn a_key_login_and_a_chatgpt_login_replace_each_other_completely() {
+        let (_root, store, vault) = fixture(Some(OLD));
+        let path = store.context.home().join("auth.json");
+        for (incoming, absent) in [
+            (KEY, "secret"),
+            (NEW, "SENTINEL"),
+            (KEY, "secret"),
+            (OLD, "SENTINEL"),
+        ] {
+            let current = store.read().unwrap();
+            store
+                .replace(incoming, &current.generation, &vault)
+                .unwrap();
+            let on_disk = fs::read(&path).unwrap();
+            assert_eq!(on_disk, incoming);
+            // Nothing of the previous login survives in the file.
+            assert!(!String::from_utf8_lossy(&on_disk).contains(absent));
         }
         assert_eq!(store.read().unwrap().auth_bytes(), Some(OLD));
     }

@@ -282,3 +282,130 @@ fn two_users_of_one_workspace_are_told_apart_by_the_access_token() {
         (Some("user-a".into()), Some("ws-a".into()))
     );
 }
+
+const FAKE_KEY: &str = "sk-proj-SENTINEL-0123456789abcdef";
+#[test]
+fn api_key_payload_has_the_shape_codex_login_writes() {
+    let bytes = api_key_auth_payload(FAKE_KEY).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    // Exactly the mode and the key: no tokens, no refresh stamp, no null placeholders.
+    assert_eq!(
+        value,
+        json!({"auth_mode":"apikey","OPENAI_API_KEY":FAKE_KEY})
+    );
+    let text = String::from_utf8(bytes.clone()).unwrap();
+    assert!(text.find("auth_mode").unwrap() < text.find("OPENAI_API_KEY").unwrap());
+    let auth = OpaqueAuth::parse(bytes.clone()).unwrap();
+    assert_eq!(auth.kind(), AuthKind::ApiKey);
+    assert_eq!(auth.as_bytes(), bytes);
+    // Both the file Codex writes and the older file without a mode are API-key logins.
+    for file in [
+        format!(r#"{{"auth_mode":"apikey","OPENAI_API_KEY":"{FAKE_KEY}"}}"#),
+        format!(r#"{{"OPENAI_API_KEY":"{FAKE_KEY}"}}"#),
+        format!(r#"{{"auth_mode":"apikey","OPENAI_API_KEY":"{FAKE_KEY}","tokens":null}}"#),
+    ] {
+        let inspection = OpaqueAuth::inspect(file.as_bytes()).unwrap();
+        assert_eq!(inspection.kind, AuthKind::ApiKey, "{file}");
+        assert!(!inspection.hybrid);
+        assert_eq!(
+            OpaqueAuth::parse(file.clone().into_bytes()).unwrap().kind(),
+            AuthKind::ApiKey
+        );
+    }
+    // A key next to tokens, or in another mode, is never an API-key login.
+    for file in [
+        format!(r#"{{"auth_mode":"chatgpt","OPENAI_API_KEY":"{FAKE_KEY}"}}"#),
+        format!(
+            r#"{{"auth_mode":"apikey","OPENAI_API_KEY":"{FAKE_KEY}","tokens":{{"id_token":"i"}}}}"#
+        ),
+        format!(
+            r#"{{"auth_mode":"apikey","OPENAI_API_KEY":"{FAKE_KEY}","personal_access_token":"p"}}"#
+        ),
+    ] {
+        assert_eq!(
+            OpaqueAuth::inspect(file.as_bytes()).unwrap().kind,
+            AuthKind::Unsupported,
+            "{file}"
+        );
+    }
+    // Nothing prints the key.
+    let inspection = OpaqueAuth::inspect(&bytes).unwrap();
+    let printed = format!("{auth:?} {:?} {inspection:?}", auth.routing_claims());
+    assert!(!printed.contains("SENTINEL") && !printed.contains("sk-"));
+}
+#[test]
+fn api_key_validation_is_strict_and_never_echoes_the_input() {
+    // Pasted whitespace around the key is dropped, the key itself is kept as typed.
+    for padded in [
+        FAKE_KEY.to_owned(),
+        format!("  {FAKE_KEY}\r\n"),
+        format!("\t{FAKE_KEY} "),
+    ] {
+        assert_eq!(validate_api_key(&padded).unwrap().as_str(), FAKE_KEY);
+    }
+    let at = |length: usize| format!("sk-{}", "a".repeat(length - 3));
+    assert!(validate_api_key(&at(20)).is_ok());
+    assert!(validate_api_key(&at(512)).is_ok());
+    for (bad, why) in [
+        (String::new(), "empty"),
+        ("   \n".into(), "blank"),
+        (at(19), "too short"),
+        (at(513), "too long"),
+        (format!("pk-{}", "a".repeat(30)), "prefix"),
+        (format!("SK-{}", "a".repeat(30)), "prefix case"),
+        (
+            format!("sk-{} {}", "a".repeat(15), "b".repeat(15)),
+            "inner space",
+        ),
+        (
+            format!("sk-{}\tb{}", "a".repeat(15), "b".repeat(15)),
+            "inner tab",
+        ),
+        (
+            format!("sk-{}\nb{}", "a".repeat(15), "b".repeat(15)),
+            "inner newline",
+        ),
+        (
+            format!("sk-{}\u{7}{}", "a".repeat(15), "b".repeat(15)),
+            "control",
+        ),
+        (
+            format!("sk-{}é{}", "a".repeat(15), "b".repeat(15)),
+            "non-ASCII",
+        ),
+        (
+            format!("sk-{}\u{200b}{}", "a".repeat(15), "b".repeat(15)),
+            "invisible",
+        ),
+    ] {
+        let error = validate_api_key(&bad).unwrap_err();
+        assert_eq!(error, CodexError::InvalidApiKey, "{why}");
+        // The error carries nothing of the input.
+        let printed = format!("{error} {error:?}");
+        assert!(
+            !printed.contains("sk-") && !printed.contains("aaaa"),
+            "{why}"
+        );
+    }
+}
+#[test]
+fn api_key_tail_and_comparison_ignore_formatting_and_never_expose_more_than_four_characters() {
+    let pretty = api_key_auth_payload(FAKE_KEY).unwrap();
+    let compact = format!(r#"{{"OPENAI_API_KEY":"{FAKE_KEY}","auth_mode":"apikey"}}"#).into_bytes();
+    assert_eq!(api_key_tail(&pretty).as_deref(), Some("cdef"));
+    assert_eq!(api_key_tail(&compact).as_deref(), Some("cdef"));
+    assert!(same_api_key(&pretty, &compact));
+    let other = api_key_auth_payload("sk-proj-SENTINEL-0123456789abcdeg").unwrap();
+    assert!(!same_api_key(&pretty, &other));
+    // A ChatGPT login or an unreadable file has neither a tail nor a match.
+    let chatgpt = payload("workspace-a");
+    assert_eq!(api_key_tail(&chatgpt), None);
+    assert_eq!(api_key_tail(b"not json"), None);
+    assert!(!same_api_key(&chatgpt, &chatgpt));
+    assert!(!same_api_key(
+        br#"{"OPENAI_API_KEY":" "}"#,
+        br#"{"OPENAI_API_KEY":" "}"#
+    ));
+    // A key too short to hide behind four characters shows nothing.
+    assert_eq!(api_key_tail(br#"{"OPENAI_API_KEY":"sk-short"}"#), None);
+}

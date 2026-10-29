@@ -7,7 +7,11 @@
     codexMessage,
     codexResetOutcome,
   } from '../lib/codex-format';
-  import type { CodexController, CodexNotice } from '../lib/codex-controller';
+  import type {
+    CodexController,
+    CodexError,
+    CodexNotice,
+  } from '../lib/codex-controller';
   import type { CodexAccount } from '../lib/codex-types';
   import type { Settings } from '../lib/types';
   import { codexView } from '../lib/codex-view';
@@ -25,6 +29,7 @@
   import Modal from './Modal.svelte';
   import Icon from './Icon.svelte';
   import CodexResets from './CodexResets.svelte';
+  import CodexApiKeyDialog from './CodexApiKeyDialog.svelte';
   let {
     controller,
     now,
@@ -128,7 +133,8 @@
     !!snapshot &&
       (snapshot.capabilities.loginBrowser.enabled ||
         snapshot.capabilities.importCurrent.enabled ||
-        snapshot.capabilities.importSwitcher.enabled),
+        snapshot.capabilities.importSwitcher.enabled ||
+        snapshot.capabilities.addApiKey.enabled),
   );
   let loginFor = $derived(
     snapshot?.accounts.find((a) => a.id === $controller.login.accountId) ??
@@ -136,6 +142,8 @@
   );
   let detailsId = $state<string | null>(null),
     deleteTarget = $state<AccountRowView | null>(null),
+    apiKeyOpen = $state(false),
+    apiKeyError = $state<CodexError | null>(null),
     returnFocus = $state<HTMLElement | null>(null);
   let details = $derived(view.rows.find((r) => r.id === detailsId) ?? null);
   const account = (id: string | undefined): CodexAccount | null =>
@@ -159,6 +167,17 @@
         return codexImportedMessage('current', notice.added, $language);
       case 'importedSwitcher':
         return codexImportedMessage('switcher', notice.added, $language);
+      case 'apiKeyAdded': {
+        const saved = account(notice.accountId);
+        return saved?.apiKeyTail
+          ? t($language, 'codexApiKeyAdded', {
+              name: saved.name,
+              tail: saved.apiKeyTail,
+            })
+          : t($language, 'codexApiKeyAddedNoTail', { name: saved?.name ?? '' });
+      }
+      case 'apiKeyExisting':
+        return t($language, 'codexApiKeyExisting');
       case 'switched':
         return t(
           $language,
@@ -198,6 +217,21 @@
     detailsId = null;
     returnFocus = trigger;
     void controller.beginLogin(row ? account(row.id) : null);
+  }
+  function askApiKey(trigger: HTMLElement | null) {
+    returnFocus = trigger;
+    apiKeyError = null;
+    apiKeyOpen = true;
+  }
+  async function addApiKey(name: string, key: string): Promise<boolean> {
+    apiKeyError = null;
+    const saved = await controller.addApiKey(name, key);
+    if (saved) {
+      apiKeyOpen = false;
+      await tick();
+      focusOutcome(returnFocus);
+    } else apiKeyError = $controller.error ?? snapshot?.error ?? 'actionFailed';
+    return saved;
   }
   function askDelete(row: AccountRowView, trigger: HTMLElement | null) {
     returnFocus = trigger;
@@ -396,6 +430,13 @@
       icon: 'import',
       disabled: locked || !snapshot?.capabilities.importCurrent.enabled,
       run: () => void controller.importCurrent(),
+    },
+    {
+      key: 'api-key',
+      label: t($language, 'codexAddApiKey'),
+      icon: 'key',
+      disabled: locked || !snapshot?.capabilities.addApiKey.enabled,
+      run: (trigger) => askApiKey(trigger),
     },
     ...(snapshot?.capabilities.importSwitcher.enabled
       ? [
@@ -597,6 +638,16 @@
       <button onclick={() => cancelLogin()}>{t($language, 'cancel')}</button>
     </div>
   </Modal>{/if}
+{#if apiKeyOpen}<CodexApiKeyDialog
+    pending={pending === 'codex_add_api_key'}
+    error={apiKeyError}
+    {returnFocus}
+    onsubmit={addApiKey}
+    oncancel={() => {
+      apiKeyOpen = false;
+      apiKeyError = null;
+    }}
+  />{/if}
 {#if details}{@const saved = account(details.id)}<Modal
     title={details.name}
     {returnFocus}
@@ -650,6 +701,10 @@
               )}
             </dd>
           </div>
+          {#if saved.authKind === 'apiKey' && saved.apiKeyTail}<div>
+              <dt>{t($language, 'codexApiKeyEndingLabel')}</dt>
+              <dd>…{saved.apiKeyTail}</dd>
+            </div>{/if}
           {#if details?.credits}<div>
               <dt>{t($language, 'credits')}</dt>
               <dd>{details.credits}</dd>

@@ -208,6 +208,9 @@ function row(
     initial: codexInitial(account),
     secondary:
       [
+        account.authKind === 'apiKey' && account.apiKeyTail
+          ? t(locale, 'codexApiKeyEnding', { tail: account.apiKeyTail })
+          : null,
         account.email && account.email !== account.name ? account.email : null,
         workspaceLabel,
       ]
@@ -245,6 +248,10 @@ function row(
       account.quotaState === 'cached' ||
       account.quotaState === 'unavailable',
     credits: codexCredits(account, locale),
+    apiKey:
+      account.authKind === 'apiKey'
+        ? { tail: account.apiKeyTail ?? null }
+        : null,
     identity: t(
       locale,
       account.needsSignIn
@@ -369,11 +376,17 @@ export function codexView(
           )
         : null,
     alertLimit: activeLimit,
+    // An API key has no limit to reach and automation never switches to it, so it
+    // neither prevents nor counts in "every account is limited".
     allLimited:
-      built.some((r) => r.automation.enabled) &&
-      built.filter((r) => r.automation.enabled).every((r) => r.limited)
+      built.some((r) => r.automation.enabled && !r.apiKey) &&
+      built
+        .filter((r) => r.automation.enabled && !r.apiKey)
+        .every((r) => r.limited)
         ? allLimitedText(
-            rows.filter((account) => account.automation.enabled),
+            rows.filter(
+              (account) => account.automation.enabled && !account.apiKey,
+            ),
             now,
             locale,
           )

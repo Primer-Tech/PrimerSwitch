@@ -269,6 +269,18 @@ async fn codex_delete_account(
         .await
         .map_err(|e| e.to_string())
 }
+/// The key crosses IPC once, inbound only; it is wiped in Rust and never returned.
+#[tauri::command]
+async fn codex_add_api_key(
+    runtime: State<'_, RuntimeHandle>,
+    name: String,
+    key: String,
+) -> Reply<CodexSnapshot> {
+    runtime
+        .codex_add_api_key(&name, key)
+        .await
+        .map_err(|e| e.to_string())
+}
 #[tauri::command]
 async fn codex_import_switcher(runtime: State<'_, RuntimeHandle>) -> Reply<CodexSnapshot> {
     runtime
@@ -370,6 +382,7 @@ fn main() {
             codex_refresh_account,
             codex_delete_account,
             codex_import_switcher,
+            codex_add_api_key,
             codex_refresh_all,
             codex_consume_reset,
             codex_update_account_automation,

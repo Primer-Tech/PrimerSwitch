@@ -6,6 +6,7 @@ import { defaults, type Settings } from './types';
 import {
   codexAccount,
   codexAccounts,
+  codexApiKeyAccount,
   codexCapability,
   codexMainLimit,
   codexSnapshot,
@@ -213,7 +214,6 @@ describe('Codex adapter: statuses in the shared words', () => {
       codexAccount('codex-api', {
         authKind: 'apiKey',
         quota: null,
-        switchable: codexCapability('unsupportedAuth'),
       }),
       codexAccount('codex-unconfirmed', {
         switchable: codexCapability('identityUnverified'),
@@ -223,12 +223,13 @@ describe('Codex adapter: statuses in the shared words', () => {
     expect(row(raw, 'codex-new').notes[0].text).toBe(t('en', 'codexNoQuota'));
     expect(row(raw, 'codex-api').status).toMatchObject({
       label: 'API key',
-      detail: 'No ChatGPT plan limits',
+      detail: 'Billed per token · no ChatGPT plan limits',
     });
+    // A key can be switched to by hand but has no limits to refresh.
     expect(row(raw, 'codex-api')).toMatchObject({
-      canSwitch: false,
+      canSwitch: true,
       canRefresh: false,
-      switchReason: codexMessage('unsupportedAuth', 'en'),
+      switchReason: null,
     });
     expect(row(raw, 'codex-unconfirmed').status).toMatchObject({
       label: 'Ready',
@@ -341,6 +342,76 @@ describe('Codex adapter: the page', () => {
       'Every account is at or near its limit. personal@example.invalid frees up first, in 2h 10m.',
     );
     expect(view(fixture()).allLimited).toBeNull();
+  });
+  it('shows an API key as billed per token, with its last four characters and a normal Switch', () => {
+    const raw = fixture();
+    raw.accounts.push(codexApiKeyAccount());
+    const key = row(raw, 'codex-key');
+    expect(key).toMatchObject({
+      name: 'Work key',
+      secondary: 'API key …cdef',
+      plan: null,
+      primary: 'switch',
+      canSwitch: true,
+      canRefresh: false,
+      canDelete: true,
+      identityOk: false,
+      identity: t('en', 'identityApiKey'),
+      apiKey: { tail: 'cdef' },
+    });
+    expect(key.status).toMatchObject({
+      kind: 'apiKey',
+      label: 'API key',
+      detail: 'Billed per token · no ChatGPT plan limits',
+    });
+    expect(key.notes).toEqual([
+      {
+        tone: 'muted',
+        text: 'API key, billed per token, no ChatGPT plan limits.',
+      },
+    ]);
+    expect(t('ro', 'codexApiKeyEnding', { tail: 'cdef' })).toBe(
+      'Cheie API …cdef',
+    );
+    // Automatic switching never targets it: the native order does not include it,
+    // and the page would not advertise it even if an old order did.
+    const page = view(raw);
+    expect(page.order.map((entry) => entry.id)).not.toContain('codex-key');
+    const stale = view({ ...raw, nextId: 'codex-key', order: ['codex-key'] });
+    expect(stale.next).toBeNull();
+    expect(stale.order).toEqual([]);
+    // An older saved key without a known ending shows nothing about it.
+    raw.accounts.push(codexApiKeyAccount('codex-old', { apiKeyTail: null }));
+    expect(row(raw, 'codex-old')).toMatchObject({
+      secondary: null,
+      apiKey: { tail: null },
+    });
+  });
+  it('shows an active API key without usage windows and never raises a limit alert for it', () => {
+    const raw = fixture();
+    raw.accounts.forEach((account) => (account.selected = false));
+    raw.accounts.push(codexApiKeyAccount('codex-key', { selected: true }));
+    raw.selectedId = 'codex-key';
+    const page = view(raw);
+    expect(page.active).toMatchObject({
+      id: 'codex-key',
+      primary: null,
+      status: { kind: 'active' },
+      apiKey: { tail: 'cdef' },
+      canDelete: false,
+    });
+    expect(page.alert).toBeNull();
+    expect(page.allLimited).toBeNull();
+    expect(page.signIn).toEqual([]);
+  });
+  it('does not let an API key hide that every ChatGPT account is limited', () => {
+    const raw = fixture();
+    raw.accounts[0].quota!.limits[0].primary!.usedPercent = 100;
+    raw.accounts[2].quota!.limits[0].secondary!.usedPercent = 96;
+    raw.accounts.push(codexApiKeyAccount());
+    expect(view(raw).allLimited).toBe(
+      'Every account is at or near its limit. personal@example.invalid frees up first, in 2h 10m.',
+    );
   });
   it('leaves the read-only reason to the preview instead of a blocked capability', () => {
     // The native demo blocks every capability as if storage were unavailable.

@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "camelCase")]
 pub enum CodexReason {
     InvalidAutomation,
+    /// The name or the API key was refused; never says which part of the key.
+    InvalidApiKey,
     NotInstalled,
     UnsupportedVersion,
     UnsupportedStore,
@@ -68,6 +70,7 @@ pub struct CodexCapabilities {
     pub login_browser: CodexCapability,
     pub import_current: CodexCapability,
     pub import_switcher: CodexCapability,
+    pub add_api_key: CodexCapability,
     pub refresh_quota: CodexCapability,
     pub switch_account: CodexCapability,
     pub delete_saved: CodexCapability,
@@ -78,6 +81,7 @@ impl CodexCapabilities {
             login_browser: CodexCapability::blocked(reason),
             import_current: CodexCapability::blocked(reason),
             import_switcher: CodexCapability::blocked(reason),
+            add_api_key: CodexCapability::blocked(reason),
             refresh_quota: CodexCapability::blocked(reason),
             switch_account: CodexCapability::blocked(reason),
             delete_saved: CodexCapability::blocked(reason),
@@ -162,6 +166,9 @@ pub struct CodexAccountView {
     pub workspace_id: Option<String>,
     pub workspace_name: Option<String>,
     pub auth_kind: String,
+    /// The last four characters of an API key, to compare with the key list at
+    /// platform.openai.com. Never more than that.
+    pub api_key_tail: Option<String>,
     /// Raw lowercase plan from Codex (`plus`, `pro`, `prolite`, `team`, ...).
     pub plan_type: Option<String>,
     pub identity_evidence: CodexIdentityEvidence,

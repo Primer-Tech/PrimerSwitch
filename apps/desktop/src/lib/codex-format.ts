@@ -11,6 +11,7 @@ import type {
 
 const reasonKeys: Record<CodexReason, MessageKey> = {
   invalidAutomation: 'codexReason_invalidAutomation',
+  invalidApiKey: 'codexReason_invalidApiKey',
   notInstalled: 'codexReason_notInstalled',
   unsupportedVersion: 'codexReason_unsupportedVersion',
   unsupportedStore: 'codexReason_unsupportedStore',

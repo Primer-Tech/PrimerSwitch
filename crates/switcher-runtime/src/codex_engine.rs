@@ -627,6 +627,8 @@ pub(crate) enum CodexCommand {
     CancelLogin(String),
     ImportCurrent,
     ImportSwitcher,
+    /// Display name and the typed key; the key is wiped when the command is dropped.
+    AddApiKey(String, Zeroizing<String>),
     Delete(String),
     UpdateAccountAutomation(String, AccountAutomationView),
     ResumeAutomaticReturns,
@@ -891,8 +893,11 @@ impl CodexEngine {
         let reason = self.common_block().or_else(|| {
             if self.switching.is_some() {
                 Some(CodexReason::SwitchInProgress)
-            } else if account.auth_kind != AuthKind::ManagedChatgpt {
+            } else if account.auth_kind == AuthKind::Unsupported {
                 Some(CodexReason::UnsupportedAuth)
+            } else if account.auth_kind == AuthKind::ApiKey {
+                // A key has no sign-in to expire and no workspace to verify.
+                None
             } else if account.needs_sign_in {
                 Some(CodexReason::SignInRequired)
             } else if !account.binding.complete() {
@@ -925,6 +930,7 @@ impl CodexEngine {
     /// Accounts automatic switching may use, with their ranking inputs: switchable
     /// saved ChatGPT sign-ins (not active, not signed out) whose latest reading
     /// succeeded and shows at least one main window, all below the threshold, and no limit.
+    /// An API key is billed per token and is only ever selected by hand.
     fn candidates(
         &self,
         threshold: f64,
@@ -933,7 +939,8 @@ impl CodexEngine {
             .accounts
             .iter()
             .filter(move |a| {
-                a.automation.enabled
+                a.auth_kind == AuthKind::ManagedChatgpt
+                    && a.automation.enabled
                     && !self.account_errors.contains_key(&a.id)
                     && self.switch_capability(a).enabled
             })
@@ -1001,7 +1008,7 @@ impl CodexEngine {
                     .saved
                     .accounts
                     .iter()
-                    .filter(|a| a.automation.enabled)
+                    .filter(|a| a.auth_kind == AuthKind::ManagedChatgpt && a.automation.enabled)
                     .filter_map(|a| {
                         Some((
                             frees_at(
@@ -1039,7 +1046,8 @@ impl CodexEngine {
             .accounts
             .iter()
             .filter(|a| {
-                a.automation.enabled
+                a.auth_kind == AuthKind::ManagedChatgpt
+                    && a.automation.enabled
                     && a.automation.return_on_five_hour_reset
                     && a.automation.is_higher_priority_than(&active.automation)
                     && self.switch_capability(a).enabled
@@ -1219,6 +1227,7 @@ impl CodexEngine {
             import_switcher: capability(common.or_else(|| {
                 (!self.switcher_available).then_some(CodexReason::SwitcherUnavailable)
             })),
+            add_api_key: capability(common.or_else(|| self.store().err())),
             refresh_quota: capability(common),
             switch_account: capability(
                 common.or(self
@@ -1262,6 +1271,9 @@ impl CodexEngine {
                     plan_type,
                     identity_evidence: account.evidence,
                     identity_verified: self.verified_now.contains(&account.id),
+                    api_key_tail: (account.auth_kind == AuthKind::ApiKey)
+                        .then(|| api_key_tail(&account.auth))
+                        .flatten(),
                     selected: self.selected_id.as_ref() == Some(&account.id),
                     switchable: self.switch_capability(account),
                     quota: account.quota.clone(),
@@ -1347,6 +1359,9 @@ impl CodexEngine {
             }
             CodexCommand::ImportSwitcher => {
                 self.import_switcher(vault, now)?;
+            }
+            CodexCommand::AddApiKey(name, key) => {
+                self.add_api_key(&name, &key, vault, now)?;
             }
             CodexCommand::Delete(id) => {
                 if self.pending_login.is_some() || self.switching.is_some() {
@@ -1541,9 +1556,12 @@ impl CodexEngine {
         _now: i64,
     ) -> Result<usize, CodexReason> {
         let binding = Binding::from_auth(&auth)?;
+        // The same key written by Codex or by this app differs only in formatting.
         let existing = self.saved.accounts.iter().position(|a| {
             a.auth_kind == auth.kind()
-                && (a.binding.same_owner(&binding) || a.auth == auth.as_bytes())
+                && (a.binding.same_owner(&binding)
+                    || a.auth == auth.as_bytes()
+                    || (a.auth_kind == AuthKind::ApiKey && same_api_key(&a.auth, auth.as_bytes())))
         });
         if let Some(index) = existing {
             let account = &mut self.saved.accounts[index];
@@ -1871,6 +1889,34 @@ impl CodexEngine {
         self.observed_generation = Some(current.generation);
         Ok(())
     }
+    /// Save an OpenAI API key as a new account. It is never selected here; a switch
+    /// writes it like any other saved login. The same key again changes nothing.
+    fn add_api_key(
+        &mut self,
+        name: &str,
+        key: &str,
+        vault: &Vault,
+        now: i64,
+    ) -> Result<(), CodexReason> {
+        if self.pending_login.is_some() || self.switching.is_some() {
+            return Err(CodexReason::Busy);
+        }
+        self.ready()?;
+        self.store()?;
+        let name = name.trim();
+        if name.is_empty() || name.chars().count() > 60 || name.chars().any(char::is_control) {
+            return Err(CodexReason::InvalidApiKey);
+        }
+        let key = validate_api_key(key).map_err(provider_reason)?;
+        let payload = Zeroizing::new(api_key_auth_payload(&key).map_err(provider_reason)?);
+        let auth = OpaqueAuth::parse(payload.to_vec()).map_err(provider_reason)?;
+        let before = self.saved.accounts.len();
+        let index = self.adopt_or_import(auth, CodexIdentityEvidence::ClaimsOnly, now)?;
+        if self.saved.accounts.len() > before {
+            self.saved.accounts[index].name = name.to_owned();
+        }
+        self.save(vault)
+    }
     /// Import every account saved by lampese "Codex Switcher". For an account that is
     /// already saved here, the copy whose id_token was issued later wins.
     fn import_switcher(&mut self, vault: &Vault, now: i64) -> Result<(), CodexReason> {
@@ -2015,7 +2061,8 @@ impl CodexEngine {
                 .accounts
                 .iter()
                 .filter(|a| {
-                    a.automation.enabled
+                    a.auth_kind == AuthKind::ManagedChatgpt
+                        && a.automation.enabled
                         && a.automation.return_on_five_hour_reset
                         && a.automation.is_higher_priority_than(&active.automation)
                         && self.switch_capability(a).enabled
@@ -2080,6 +2127,15 @@ impl CodexEngine {
             (None, None) => return None,
         };
         Some(next.id.clone())
+    }
+    /// An API key has no plan limits: there is nothing to read, and not reading it is
+    /// not a failure.
+    pub(crate) fn reads_quota(&self, id: &str) -> bool {
+        !self
+            .saved
+            .accounts
+            .iter()
+            .any(|a| a.id == id && a.auth_kind == AuthKind::ApiKey)
     }
     /// Prepare a quota reading. `manual` readings ignore back-off and token-expiry margins.
     pub(crate) fn plan_quota(
@@ -2329,7 +2385,14 @@ impl CodexEngine {
         let Some(active) = self.selected().filter(|a| a.id == plan.previous_id) else {
             return false;
         };
-        if !policy.auto_switch {
+        // Last line of defence: only a saved ChatGPT sign-in is an automatic target.
+        if !policy.auto_switch
+            || !self
+                .saved
+                .accounts
+                .iter()
+                .any(|a| a.id == plan.target_id && a.auth_kind == AuthKind::ManagedChatgpt)
+        {
             return false;
         }
         if returning {
@@ -2742,6 +2805,7 @@ pub(crate) fn provider_reason(error: CodexError) -> CodexReason {
         CodexError::IdentityMismatch => CodexReason::IdentityMismatch,
         CodexError::AuthRequired => CodexReason::SignInRequired,
         CodexError::DaemonUnavailable => CodexReason::DaemonRestartFailed,
+        CodexError::InvalidApiKey => CodexReason::InvalidApiKey,
         _ => CodexReason::ProviderUnavailable,
     }
 }

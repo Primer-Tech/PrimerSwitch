@@ -67,6 +67,7 @@ export const ro: Record<keyof typeof en, string> = {
   codexAddSignIn: 'Autentifică-te cu ChatGPT…',
   codexImportCurrent: 'Importă autentificarea curentă din Codex',
   codexImportSwitcher: 'Importă din Codex Switcher',
+  codexAddApiKey: 'Adaugă o cheie API…',
   importing: 'Se importă…',
   emptyTitle: 'Niciun cont salvat încă',
   emptyClaude:
@@ -85,7 +86,7 @@ export const ro: Record<keyof typeof en, string> = {
   statusFailed: 'Verificare eșuată',
   statusFailedDetail: 'Actualizează pentru a reîncerca',
   statusApiKey: 'Cheie API',
-  statusApiKeyDetail: 'Fără limite de abonament ChatGPT',
+  statusApiKeyDetail: 'Facturat pe token · fără limite de abonament ChatGPT',
   statusUnsupported: 'Autentificare neacceptată',
   statusCheckFailed: 'Ultima verificare a eșuat',
   statusCantSwitch: 'Nu se poate comuta pe acest cont',
@@ -186,7 +187,8 @@ export const ro: Record<keyof typeof en, string> = {
   identityUnverified: 'Neverificat încă. Actualizează pentru a-l verifica.',
   identitySignIn:
     'Autentificarea salvată nu mai funcționează. Autentifică-te din nou ca să-l folosești.',
-  identityApiKey: 'Folosește o cheie API, deci nu are limite de abonament.',
+  identityApiKey:
+    'Folosește o cheie API, facturată pe token, deci nu are limitele unui abonament ChatGPT.',
   identityUnsupported:
     'Folosește o autentificare pe care PrimerSwitch nu o poate comuta.',
   codexAuthChatGPT: 'Cont ChatGPT',
@@ -411,7 +413,7 @@ export const ro: Record<keyof typeof en, string> = {
   codexNoQuota:
     'Utilizarea nu a fost verificată încă. Actualizează ca să citești limitele actuale.',
   codexApiQuota:
-    'Acest cont folosește o cheie API, deci nu are limitele unui abonament ChatGPT.',
+    'Cheie API, facturată pe token, fără limitele unui abonament ChatGPT.',
   codexNoWindows: 'Nu au fost raportate limite de utilizare pentru acest cont.',
   codexUsageBlocked: 'Utilizarea inclusă este blocată pentru acest cont.',
   codexSpendBlocked: 'Limita de cheltuieli a spațiului de lucru a fost atinsă.',
@@ -486,6 +488,22 @@ export const ro: Record<keyof typeof en, string> = {
     'Autentifică-te în browser ca {name}. Fereastra se actualizează singură când termini, deci nu trebuie să lipești niciun cod.',
   codexLoginKeepsCurrent:
     'Adăugarea unui cont nu schimbă contul folosit de Codex.',
+  codexApiKeyTitle: 'Adaugă o cheie API OpenAI',
+  codexApiKeyDescription:
+    'Codex facturează cheia API pe token, în afara abonamentului ChatGPT. PrimerSwitch nu comută singur pe ea; o alegi tu cu Comută.',
+  codexApiKeyNameLabel: 'Nume',
+  codexApiKeyLabel: 'Cheie API',
+  codexApiKeyHelp:
+    'Începe cu sk-. Se păstrează criptat pe acest computer, iar după salvare se afișează doar ultimele 4 caractere.',
+  codexApiKeySave: 'Salvează cheia',
+  codexApiKeyEnding: 'Cheie API …{tail}',
+  codexApiKeyEndingLabel: 'Cheia API se termină în',
+  codexApiKeyAdded:
+    'S-a salvat {name} (cheie API …{tail}). Verifică dacă ultimele 4 caractere se potrivesc cu lista de chei de pe platform.openai.com. Codex continuă să folosească contul curent până comuți.',
+  codexApiKeyAddedNoTail:
+    'S-a salvat {name}. Codex continuă să folosească contul curent până comuți.',
+  codexApiKeyExisting:
+    'Cheia API era deja salvată, deci nu s-a schimbat nimic.',
   codexLoginOpening: 'Se deschide browserul…',
   codexLoginWaiting: 'Se așteaptă finalizarea în browser…',
   codexLoginVerifying: 'Se verifică contul…',
@@ -496,7 +514,7 @@ export const ro: Record<keyof typeof en, string> = {
   codexReason_unsupportedStore:
     'Codex își păstrează autentificarea într-un loc pe care PrimerSwitch nu îl poate folosi încă. Nu s-a schimbat nimic.',
   codexReason_unsupportedAuth:
-    'Acest cont folosește o cheie API sau o altă autentificare care nu poate fi comutată.',
+    'Acest cont folosește o autentificare pe care PrimerSwitch nu o poate comuta.',
   codexReason_policyRestricted:
     'Politica Codex a organizației tale nu permite schimbarea conturilor.',
   codexReason_externalCredentials:
@@ -534,4 +552,6 @@ export const ro: Record<keyof typeof en, string> = {
     'Nu există resetări disponibile pentru acest cont.',
   codexReason_resetUnconfirmed:
     'Rezultatul resetării nu a putut fi confirmat. Verifică resetarea anterioară pentru a recupera rezultatul.',
+  codexReason_invalidApiKey:
+    'Introdu un nume de cel mult 60 de caractere și o cheie API OpenAI validă, care începe cu sk-. Nu s-a salvat nimic.',
 };

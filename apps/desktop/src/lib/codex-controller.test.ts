@@ -8,6 +8,7 @@ import {
 import type { CodexBridge } from './codex-bridge';
 import {
   codexAccount,
+  codexApiKeyAccount,
   codexCapability,
   codexMainLimit,
   codexSnapshot,
@@ -490,9 +491,104 @@ describe('Codex refresh, import and delete', () => {
     const { c, call } = setup(codexSnapshot({ demo: true }));
     await c.start();
     await c.beginLogin();
+    expect(await c.addApiKey('Work key', FAKE_KEY)).toBe(false);
     expect(await c.refreshAll()).toBe(false);
     expect(await c.switchAccount(get(c).snapshot!.accounts[2])).toBe(false);
     expect(call).toHaveBeenCalledTimes(1);
+  });
+});
+const FAKE_KEY = 'sk-proj-SENTINEL-0123456789abcdef';
+describe('Codex API keys', () => {
+  it('saves a key in one native call and keeps it out of state, notices and errors', async () => {
+    const { c, call } = setup();
+    await c.start();
+    const saved = codexSnapshot({ revision: 2 });
+    saved.accounts.push(codexApiKeyAccount());
+    call.mockResolvedValueOnce(saved);
+    expect(await c.addApiKey('Work key', FAKE_KEY)).toBe(true);
+    expect(call).toHaveBeenLastCalledWith('codex_add_api_key', {
+      name: 'Work key',
+      key: FAKE_KEY,
+    });
+    expect(get(c).notice).toEqual({
+      kind: 'apiKeyAdded',
+      accountId: 'codex-key',
+    });
+    expect(get(c).pending).toBeNull();
+    // The same key again adds no account: nothing changed, and it is said plainly.
+    call.mockResolvedValueOnce(
+      codexSnapshot({ revision: 3, accounts: saved.accounts }),
+    );
+    expect(await c.addApiKey('Another name', FAKE_KEY)).toBe(true);
+    expect(get(c).notice).toEqual({ kind: 'apiKeyExisting' });
+    // Failures show a stable reason or a generic message, never the error's own text.
+    call.mockRejectedValueOnce('invalidApiKey');
+    expect(await c.addApiKey('Work key', 'sk-short')).toBe(false);
+    expect(get(c).error).toBe('invalidApiKey');
+    expect(get(c).notice).toBeNull();
+    call.mockRejectedValueOnce(new Error(`Bad key ${FAKE_KEY}`));
+    expect(await c.addApiKey('Work key', FAKE_KEY)).toBe(false);
+    expect(get(c).error).toBe('actionFailed');
+    expect(JSON.stringify(get(c))).not.toContain('SENTINEL');
+    expect(codexMessage('invalidApiKey', 'en')).toBe(
+      en.codexReason_invalidApiKey,
+    );
+    expect(codexMessage('invalidApiKey', 'ro')).toBe(
+      ro.codexReason_invalidApiKey,
+    );
+  });
+  it('is gated like every mutation and never sends empty input', async () => {
+    const blocked = codexSnapshot();
+    blocked.capabilities.addApiKey = codexCapability('vaultUnavailable');
+    const { c, call, event } = setup(blocked);
+    await c.start();
+    const before = call.mock.calls.length;
+    expect(await c.addApiKey('Work key', FAKE_KEY)).toBe(false);
+    event(codexSnapshot({ revision: 2 }));
+    expect(await c.addApiKey('  ', FAKE_KEY)).toBe(false);
+    expect(await c.addApiKey('Work key', ' 	')).toBe(false);
+    event(
+      codexSnapshot({
+        revision: 3,
+        switching: {
+          targetId: 'codex-personal',
+          stage: 'saving',
+          startedAt: Math.floor(Date.now() / 1000),
+        },
+      }),
+    );
+    expect(await c.addApiKey('Work key', FAKE_KEY)).toBe(false);
+    expect(call.mock.calls.length).toBe(before);
+  });
+  it('shows a pending save and rejects a second one meanwhile', async () => {
+    const { c, call } = setup();
+    await c.start();
+    const pending = deferred();
+    call.mockReturnValueOnce(pending.promise);
+    const first = c.addApiKey('Work key', FAKE_KEY);
+    expect(get(c).pending).toBe('codex_add_api_key');
+    expect(
+      await c.addApiKey('Other', 'sk-proj-SENTINEL-0123456789abcdeg'),
+    ).toBe(false);
+    pending.resolve(codexSnapshot({ revision: 2 }));
+    expect(await first).toBe(true);
+    expect(get(c).pending).toBeNull();
+    expect(
+      call.mock.calls.filter(([name]) => name === 'codex_add_api_key'),
+    ).toHaveLength(1);
+  });
+  it('rejects an account view that carries more than the last characters of a key', () => {
+    const raw = codexSnapshot();
+    raw.accounts.push(codexApiKeyAccount());
+    expect(codexSnapshotSchema.safeParse(raw).success).toBe(true);
+    const leaking = structuredClone(raw);
+    leaking.accounts[3].apiKeyTail = FAKE_KEY;
+    expect(codexSnapshotSchema.safeParse(leaking).success).toBe(false);
+    const extra = structuredClone(raw) as unknown as {
+      accounts: Record<string, unknown>[];
+    };
+    extra.accounts[3].apiKey = FAKE_KEY;
+    expect(codexSnapshotSchema.safeParse(extra).success).toBe(false);
   });
 });
 describe('Codex managed browser sign-in', () => {

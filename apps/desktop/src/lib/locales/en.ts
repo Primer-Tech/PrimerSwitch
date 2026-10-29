@@ -64,6 +64,7 @@ export const en = {
   codexAddSignIn: 'Sign in with ChatGPT…',
   codexImportCurrent: 'Import current Codex login',
   codexImportSwitcher: 'Import from Codex Switcher',
+  codexAddApiKey: 'Add API key…',
   importing: 'Importing…',
   emptyTitle: 'No saved accounts yet',
   emptyClaude:
@@ -82,7 +83,7 @@ export const en = {
   statusFailed: 'Check failed',
   statusFailedDetail: 'Refresh to try again',
   statusApiKey: 'API key',
-  statusApiKeyDetail: 'No ChatGPT plan limits',
+  statusApiKeyDetail: 'Billed per token · no ChatGPT plan limits',
   statusUnsupported: 'Unsupported sign-in',
   statusCheckFailed: 'Last check failed',
   statusCantSwitch: 'Can’t switch to this account',
@@ -180,7 +181,8 @@ export const en = {
   identityChecking: 'Checking the saved sign-in…',
   identityUnverified: 'Not verified yet. Refresh to check it.',
   identitySignIn: 'The saved sign-in no longer works. Sign in again to use it.',
-  identityApiKey: 'Uses an API key, so it has no plan limits.',
+  identityApiKey:
+    'Uses an API key, billed per token, so it has no ChatGPT plan limits.',
   identityUnsupported: 'Uses a sign-in PrimerSwitch can’t switch.',
   codexAuthChatGPT: 'ChatGPT account',
   codexAuthApiKey: 'API key',
@@ -399,8 +401,7 @@ export const en = {
   codexBusy: 'Codex is finishing another account action…',
   codexNoQuota:
     'Usage hasn’t been checked yet. Refresh to read the latest limits.',
-  codexApiQuota:
-    'This account uses an API key, so it has no ChatGPT plan limits.',
+  codexApiQuota: 'API key, billed per token, no ChatGPT plan limits.',
   codexNoWindows: 'No usage limits were reported for this account.',
   codexUsageBlocked: 'Included usage is blocked for this account.',
   codexSpendBlocked: 'The workspace spending limit has been reached.',
@@ -472,6 +473,21 @@ export const en = {
     'Sign in as {name} in your browser. This window updates on its own when you’re done, so there’s no code to paste.',
   codexLoginKeepsCurrent:
     'Adding an account doesn’t change which account Codex uses.',
+  codexApiKeyTitle: 'Add an OpenAI API key',
+  codexApiKeyDescription:
+    'Codex bills an API key per token, outside your ChatGPT plan. PrimerSwitch never switches to it on its own; you choose it with Switch.',
+  codexApiKeyNameLabel: 'Name',
+  codexApiKeyLabel: 'API key',
+  codexApiKeyHelp:
+    'It starts with sk-. It is stored encrypted on this computer, and only its last 4 characters are shown afterwards.',
+  codexApiKeySave: 'Save key',
+  codexApiKeyEnding: 'API key …{tail}',
+  codexApiKeyEndingLabel: 'API key ends in',
+  codexApiKeyAdded:
+    'Saved {name} (API key …{tail}). Check that the last 4 characters match the key list on platform.openai.com. Codex keeps using the current account until you switch.',
+  codexApiKeyAddedNoTail:
+    'Saved {name}. Codex keeps using the current account until you switch.',
+  codexApiKeyExisting: 'That API key was already saved, so nothing changed.',
   codexLoginOpening: 'Opening your browser…',
   codexLoginWaiting: 'Waiting for you to finish in the browser…',
   codexLoginVerifying: 'Checking the account…',
@@ -482,7 +498,7 @@ export const en = {
   codexReason_unsupportedStore:
     'Codex stores its sign-in in a place PrimerSwitch can’t use yet. Nothing was changed.',
   codexReason_unsupportedAuth:
-    'This account uses an API key or another sign-in that can’t be switched.',
+    'This account uses a sign-in that PrimerSwitch can’t switch.',
   codexReason_policyRestricted:
     'Your organization’s Codex policy doesn’t allow account changes.',
   codexReason_externalCredentials:
@@ -518,4 +534,6 @@ export const en = {
   codexReason_noResetCredits: 'No resets are available for this account.',
   codexReason_resetUnconfirmed:
     'The reset result could not be confirmed. Check the previous reset to recover its result.',
+  codexReason_invalidApiKey:
+    'Enter a name of up to 60 characters and a valid OpenAI API key, which starts with sk-. Nothing was saved.',
 } as const;

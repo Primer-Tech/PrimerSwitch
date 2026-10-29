@@ -952,7 +952,8 @@ async fn unsupported_current_logins_and_targets_are_never_overwritten_or_selecte
     assert!(f.engine.switching.is_none());
     f.write_active(&auth("user-a", "ws-a", "initial"));
     f.engine.observe(&f.vault, 210).unwrap();
-    // An imported API key is kept but cannot be selected.
+    // An imported API key is kept and can be selected by hand (see the API-key tests
+    // below); agent identities, access tokens and Bedrock logins never can.
     let index = f
         .engine
         .adopt_or_import(
@@ -962,6 +963,8 @@ async fn unsupported_current_logins_and_targets_are_never_overwritten_or_selecte
         )
         .unwrap();
     let api = f.engine.saved.accounts[index].id.clone();
+    assert!(f.view(&api).switchable.enabled);
+    f.engine.saved.accounts[index].auth_kind = AuthKind::Unsupported;
     assert_eq!(
         f.view(&api).switchable.blocked_reason,
         Some(CodexReason::UnsupportedAuth)
@@ -1162,7 +1165,7 @@ async fn codex_switcher_accounts_are_imported_with_their_names_and_newer_tokens_
         .command(CodexCommand::ImportSwitcher, &f.vault, 300)
         .await
         .unwrap();
-    // a (active), b (updated in place), c (new, named), API key (new, not switchable).
+    // a (active), b (updated in place), c (new, named), API key (new, switchable by hand).
     assert_eq!(f.engine.saved.accounts.len(), 4);
     assert_eq!(
         tokens_of(&f.saved_bytes("ws-b")).0,
@@ -1915,7 +1918,7 @@ fn limited_unread_failed_or_unswitchable_accounts_are_never_next() {
     assert_eq!(f.next(&policy), None);
     f.engine.switching = None;
     assert_eq!(f.next(&policy), Some(b.clone()));
-    // An API-key login has no plan limits and cannot be selected.
+    // An API-key login has no plan limits and is never an automatic target.
     let index = f
         .engine
         .adopt_or_import(
@@ -3516,4 +3519,423 @@ async fn a_natural_return_survives_failed_outgoing_quota_but_keeps_target_and_ow
     assert_eq!(f.active(), auth("user-b", "ws-b", "saved"));
     assert!(f.factory.calls().is_empty());
     f.claude_untouched();
+}
+
+// API-key accounts: saved by name, selected only by hand, never by automation.
+const FAKE_KEY: &str = "sk-proj-SENTINEL-0123456789abcdef";
+fn key_file(key: &str) -> Vec<u8> {
+    api_key_auth_payload(key).unwrap()
+}
+impl Fixture {
+    async fn add_key(&mut self, name: &str, key: &str) -> Result<(), CodexReason> {
+        self.engine
+            .command(
+                CodexCommand::AddApiKey(name.into(), Zeroizing::new(key.into())),
+                &self.vault,
+                150,
+            )
+            .await
+            .map(|_| ())
+    }
+    fn key_id(&self, key: &str) -> String {
+        let wanted = key_file(key);
+        self.engine
+            .saved
+            .accounts
+            .iter()
+            .find(|a| a.auth_kind == AuthKind::ApiKey && same_api_key(&a.auth, &wanted))
+            .unwrap()
+            .id
+            .clone()
+    }
+    fn saved_by_id(&self, id: &str) -> Vec<u8> {
+        self.engine.saved.accounts[self.engine.account_index(id).unwrap()]
+            .auth
+            .clone()
+    }
+    fn vault_holds(&self, needle: &str) -> bool {
+        fs::read_dir(self._root.path().join("vault"))
+            .unwrap()
+            .flatten()
+            .any(|entry| {
+                fs::read(entry.path()).is_ok_and(|bytes| {
+                    bytes
+                        .windows(needle.len())
+                        .any(|window| window == needle.as_bytes())
+                })
+            })
+    }
+}
+
+#[tokio::test]
+async fn an_api_key_is_saved_by_name_without_selecting_it_or_touching_the_active_login() {
+    let mut f = Fixture::new();
+    let a = f.id_of("ws-a");
+    let active = f.active();
+    // Pasted whitespace around the key and the name is dropped.
+    f.add_key("  Work key ", &format!("  {FAKE_KEY}\r\n"))
+        .await
+        .unwrap();
+    let key = f.key_id(FAKE_KEY);
+    assert_eq!(f.engine.saved.accounts.len(), 2);
+    assert_eq!(f.engine.selected_id.as_deref(), Some(a.as_str()));
+    assert_eq!(f.active(), active);
+    let view = f.view(&key);
+    assert_eq!(view.name, "Work key");
+    assert_eq!(view.auth_kind, "apiKey");
+    assert_eq!(view.api_key_tail.as_deref(), Some("cdef"));
+    assert!(!view.selected && view.switchable.enabled && !view.needs_sign_in);
+    assert!(view.error.is_none() && view.quota.is_none());
+    assert!(view.email.is_none() && view.workspace_id.is_none());
+    assert_eq!(f.view(&a).api_key_tail, None);
+    // Saved as the exact file Codex writes for a key login, and encrypted at rest.
+    assert_eq!(f.saved_by_id(&key), key_file(FAKE_KEY));
+    assert!(!f.vault_holds("SENTINEL"));
+    reopen(&mut f, 160);
+    let key = f.key_id(FAKE_KEY);
+    assert_eq!(f.engine.saved.accounts.len(), 2);
+    assert_eq!(f.view(&key).name, "Work key");
+    // Only the last four characters cross into the snapshot, its JSON and its Debug.
+    let snapshot = f.engine.snapshot(false, 300, &CodexPolicy::default());
+    let json = serde_json::to_string(&snapshot).unwrap();
+    assert!(json.contains(r#""apiKeyTail":"cdef""#), "{json}");
+    for printed in [json, format!("{snapshot:?}")] {
+        assert!(!printed.contains("SENTINEL") && !printed.contains("sk-proj"));
+    }
+    // The same key again changes nothing, whatever the name; another key is another account.
+    f.add_key("Another name", FAKE_KEY).await.unwrap();
+    assert_eq!(f.engine.saved.accounts.len(), 2);
+    assert_eq!(f.view(&key).name, "Work key");
+    f.add_key("Second", "sk-proj-SENTINEL-0123456789abcdeg")
+        .await
+        .unwrap();
+    assert_eq!(f.engine.saved.accounts.len(), 3);
+    assert_eq!(f.engine.selected_id.as_deref(), Some(a.as_str()));
+    f.claude_untouched();
+}
+
+#[tokio::test]
+async fn invalid_names_and_keys_are_refused_without_echo_or_change() {
+    let mut f = Fixture::new();
+    let before = serde_json::to_vec(&f.engine.saved).unwrap();
+    let long = "n".repeat(61);
+    for (name, key) in [
+        ("", FAKE_KEY),
+        ("   ", FAKE_KEY),
+        (long.as_str(), FAKE_KEY),
+        ("bad\u{7}name", FAKE_KEY),
+        ("bad\nname", FAKE_KEY),
+        ("Name", ""),
+        ("Name", "sk-short"),
+        ("Name", "pk-proj-SENTINEL-0123456789abcdef"),
+        ("Name", "sk-proj-SENTINEL 0123456789abcdef"),
+        ("Name", "sk-proj-SENTINEL-0123456789abcd\u{e9}"),
+    ] {
+        assert_eq!(
+            f.add_key(name, key).await.err(),
+            Some(CodexReason::InvalidApiKey),
+            "{name:?}"
+        );
+    }
+    assert_eq!(serde_json::to_vec(&f.engine.saved).unwrap(), before);
+    assert_eq!(CodexReason::InvalidApiKey.to_string(), "invalidApiKey");
+    // The longest accepted name is 60 characters, counted as characters.
+    f.add_key(&"\u{e9}".repeat(60), FAKE_KEY).await.unwrap();
+    let key = f.key_id(FAKE_KEY);
+    assert_eq!(f.view(&key).name.chars().count(), 60);
+}
+
+#[tokio::test]
+async fn adding_a_key_is_blocked_like_importing_the_current_login() {
+    let mut f = Fixture::new();
+    let snapshot = f.engine.snapshot(false, 300, &CodexPolicy::default());
+    assert!(snapshot.capabilities.add_api_key.enabled);
+    f.engine.switching = Some(CodexSwitchView {
+        target_id: "x".into(),
+        stage: CodexSwitchStage::Restarting,
+        started_at: 1,
+    });
+    assert_eq!(
+        f.add_key("Key", FAKE_KEY).await.err(),
+        Some(CodexReason::Busy)
+    );
+    f.engine.switching = None;
+    // A configuration Codex stores outside a file is not usable.
+    f.engine.installation.as_mut().unwrap().qualified.context = None;
+    let snapshot = f.engine.snapshot(false, 300, &CodexPolicy::default());
+    assert_eq!(
+        snapshot.capabilities.add_api_key.blocked_reason,
+        Some(CodexReason::UnsupportedStore)
+    );
+    assert_eq!(
+        f.add_key("Key", FAKE_KEY).await.err(),
+        Some(CodexReason::UnsupportedStore)
+    );
+    assert_eq!(f.engine.saved.accounts.len(), 1);
+    // Not installed, unavailable vault and the read-only demo.
+    let blocked = |engine: &CodexEngine| {
+        engine
+            .snapshot(false, 300, &CodexPolicy::default())
+            .capabilities
+            .add_api_key
+            .blocked_reason
+    };
+    assert_eq!(
+        blocked(&CodexEngine::empty(false)),
+        Some(CodexReason::NotInstalled)
+    );
+    let mut unavailable = CodexEngine::empty(false);
+    unavailable.unavailable();
+    assert_eq!(blocked(&unavailable), Some(CodexReason::VaultUnavailable));
+    let mut demo = CodexEngine::demo(1000);
+    assert_eq!(blocked(&demo), Some(CodexReason::VaultUnavailable));
+    assert_eq!(
+        demo.command(
+            CodexCommand::AddApiKey("Key".into(), Zeroizing::new(FAKE_KEY.into())),
+            &f.vault,
+            1000
+        )
+        .await
+        .err(),
+        Some(CodexReason::VaultUnavailable)
+    );
+    assert_eq!(demo.saved.accounts.len(), 3);
+}
+
+#[tokio::test]
+async fn an_api_key_and_a_chatgpt_account_switch_both_ways_keeping_every_outgoing_login() {
+    let mut f = Fixture::new();
+    let a = f.id_of("ws-a");
+    f.add_key("Work key", FAKE_KEY).await.unwrap();
+    let key = f.key_id(FAKE_KEY);
+    // Codex refreshed a's token before the switch: the rotation is kept.
+    let rotated = auth("user-a", "ws-a", "rotated");
+    f.write_active(&rotated);
+    let outcome = f.switch(&key).await.unwrap();
+    assert!(outcome.daemon_restarted);
+    assert_eq!(outcome.error, None);
+    assert_eq!(f.active(), key_file(FAKE_KEY));
+    assert_eq!(f.engine.selected_id.as_deref(), Some(key.as_str()));
+    assert_eq!(f.saved_bytes("ws-a"), rotated);
+    assert_eq!(*f.daemon.calls.lock().unwrap(), vec!["state", "restart"]);
+    assert!(f.view(&key).selected && !f.view(&key).switchable.enabled);
+    assert!(f.view(&a).switchable.enabled);
+    // Back to ChatGPT: the key stays saved byte for byte, nothing is duplicated.
+    f.switch(&a).await.unwrap();
+    assert_eq!(f.active(), rotated);
+    assert_eq!(f.engine.selected_id.as_deref(), Some(a.as_str()));
+    assert_eq!(f.saved_by_id(&key), key_file(FAKE_KEY));
+    assert_eq!(f.engine.saved.accounts.len(), 2);
+    f.switch(&key).await.unwrap();
+    assert_eq!(f.active(), key_file(FAKE_KEY));
+    assert_eq!(f.engine.saved.accounts.len(), 2);
+    // A key has no plan limits to read, so no Codex client was ever started.
+    assert!(f.factory.calls().is_empty());
+    f.claude_untouched();
+}
+
+#[tokio::test]
+async fn an_external_key_login_is_followed_and_never_duplicated_or_lost() {
+    let mut f = Fixture::new();
+    let a = f.id_of("ws-a");
+    // `codex login --with-api-key` in a terminal.
+    let external: &[u8] =
+        br#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-proj-SENTINEL-externalkey-000000"}"#;
+    f.write_active(external);
+    f.engine.observe(&f.vault, NOW).unwrap();
+    assert_eq!(f.engine.saved.accounts.len(), 2);
+    let key = f.key_id("sk-proj-SENTINEL-externalkey-000000");
+    assert_eq!(f.engine.selected_id.as_deref(), Some(key.as_str()));
+    assert_eq!(f.saved_by_id(&key), external);
+    assert_eq!(f.view(&key).name, "Codex API key");
+    assert_eq!(f.view(&key).api_key_tail.as_deref(), Some("0000"));
+    assert_eq!(
+        f.engine.saved.return_hold_until,
+        Some(NOW + MANUAL_RETURN_HOLD)
+    );
+    // The same key in another layout is the same account.
+    let compact: &[u8] =
+        br#"{"OPENAI_API_KEY":"sk-proj-SENTINEL-externalkey-000000","auth_mode":"apikey"}"#;
+    f.write_active(compact);
+    f.engine.observe(&f.vault, NOW + 1).unwrap();
+    assert_eq!(f.engine.saved.accounts.len(), 2);
+    assert_eq!(f.saved_by_id(&key), compact);
+    f.add_key("Named later", "sk-proj-SENTINEL-externalkey-000000")
+        .await
+        .unwrap();
+    assert_eq!(f.engine.saved.accounts.len(), 2);
+    assert_eq!(f.view(&key).name, "Codex API key");
+    // The ChatGPT login stays saved; switching away and back keeps the key's file.
+    f.switch(&a).await.unwrap();
+    assert_eq!(f.active(), auth("user-a", "ws-a", "initial"));
+    f.switch(&key).await.unwrap();
+    assert_eq!(f.active(), compact);
+    // A key login the observer has not seen yet is saved as the outgoing login.
+    let late: &[u8] =
+        br#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-proj-SENTINEL-latekey-0000000"}"#;
+    f.write_active(late);
+    f.switch(&a).await.unwrap();
+    assert_eq!(f.engine.saved.accounts.len(), 3);
+    let late_id = f.key_id("sk-proj-SENTINEL-latekey-0000000");
+    f.switch(&late_id).await.unwrap();
+    assert_eq!(f.active(), late);
+    f.claude_untouched();
+}
+
+#[tokio::test]
+async fn deleting_a_key_follows_the_rules_for_every_account() {
+    let mut f = Fixture::new();
+    let a = f.id_of("ws-a");
+    f.add_key("First", FAKE_KEY).await.unwrap();
+    f.add_key("Second", "sk-proj-SENTINEL-0123456789abcdeg")
+        .await
+        .unwrap();
+    let first = f.key_id(FAKE_KEY);
+    let second = f.key_id("sk-proj-SENTINEL-0123456789abcdeg");
+    // A key that is not the active login can be deleted.
+    f.engine
+        .command(CodexCommand::Delete(second), &f.vault, 300)
+        .await
+        .unwrap();
+    assert_eq!(f.engine.saved.accounts.len(), 2);
+    assert_eq!(CodexEngine::load(&f.vault).saved.accounts.len(), 2);
+    // The active key cannot, like the active ChatGPT account; auth.json stays as it is.
+    f.switch(&first).await.unwrap();
+    assert_eq!(
+        f.engine
+            .command(CodexCommand::Delete(first.clone()), &f.vault, 310)
+            .await
+            .err(),
+        Some(CodexReason::ActiveAccount)
+    );
+    assert_eq!(f.active(), key_file(FAKE_KEY));
+    assert_eq!(f.engine.saved.accounts.len(), 2);
+    f.switch(&a).await.unwrap();
+    f.engine
+        .command(CodexCommand::Delete(first), &f.vault, 320)
+        .await
+        .unwrap();
+    assert_eq!(f.engine.saved.accounts.len(), 1);
+    assert_eq!(f.active(), auth("user-a", "ws-a", "initial"));
+}
+
+#[test]
+fn automation_never_picks_an_api_key_even_when_it_has_a_quota_and_a_return_marker() {
+    let mut f = Fixture::new();
+    let a = f.id_of("ws-a");
+    let b = f.add("user-b", "ws-b", "saved");
+    let policy = CodexPolicy::default();
+    let index = f
+        .engine
+        .adopt_or_import(
+            OpaqueAuth::parse(key_file(FAKE_KEY)).unwrap(),
+            CodexIdentityEvidence::ClaimsOnly,
+            NOW,
+        )
+        .unwrap();
+    let key = f.engine.saved.accounts[index].id.clone();
+    // The key has everything a ChatGPT target would need: a fresh, unlimited reading,
+    // preferences that make it the first choice and an observed spent window.
+    f.read(&key, main_quota(1, 1), NOW);
+    f.engine.saved.accounts[index].automation = AccountAutomation {
+        priority: Some(1),
+        return_on_five_hour_reset: true,
+        ..AccountAutomation::default()
+    };
+    f.engine.saved.accounts[index].preferred_return_reset_at = Some(NOW - 10);
+    f.read(&a, main_quota(97, 40), NOW);
+    f.read(&b, main_quota(100, 10), NOW);
+    assert!(f.view(&key).switchable.enabled);
+    assert_eq!(f.next(&policy), None);
+    assert!(f.order(&policy).is_empty());
+    // a is at its threshold and every ChatGPT account is limited: all limited, no switch.
+    assert!(matches!(
+        f.engine.automation(NOW, &policy),
+        CodexAutomation::Exhausted { .. }
+    ));
+    // With a usable ChatGPT account it is that account, never the key.
+    f.read(&b, main_quota(10, 10), NOW);
+    assert_eq!(f.next(&policy), Some(b.clone()));
+    assert_eq!(f.engine.automation(NOW, &policy), switch_to(&f, &b, 97));
+    // A natural return never targets it, and nothing is ever read for it in the background.
+    f.read(&a, main_quota(20, 20), NOW);
+    assert_eq!(f.engine.automation(NOW, &policy), CodexAutomation::Idle);
+    assert_ne!(
+        f.engine.due_quota(NOW + 100_000, &policy).as_deref(),
+        Some(key.as_str())
+    );
+    // A prepared plan that names the key is refused before anything is written.
+    let plan = CodexAutoSwitch {
+        previous_id: a.clone(),
+        target_id: key.clone(),
+        target_name: "Key".into(),
+        previous_name: "A".into(),
+        peak: Some(97),
+    };
+    f.read(&a, main_quota(97, 40), NOW);
+    let active = f.active();
+    for returning in [false, true] {
+        assert_eq!(
+            f.engine
+                .begin_automatic_switch(&plan, returning, &policy, &f.vault, NOW)
+                .err(),
+            Some(CodexReason::ExternalChange)
+        );
+    }
+    assert_eq!(f.active(), active);
+    assert!(f.daemon.calls.lock().unwrap().is_empty());
+    // Once a key is the active login, automation leaves it alone, whatever else is ready.
+    f.engine.saved.accounts[index].quota = None;
+    f.engine.selected_id = Some(key);
+    assert_eq!(f.engine.automation(NOW, &policy), CodexAutomation::Idle);
+}
+
+#[tokio::test]
+async fn refreshing_an_api_key_reads_nothing_and_leaves_no_error_or_sign_in_state() {
+    let mut f = Fixture::new();
+    let a = f.id_of("ws-a");
+    f.add_key("Work key", FAKE_KEY).await.unwrap();
+    let key = f.key_id(FAKE_KEY);
+    // "Refresh all" reads the ChatGPT account only.
+    f.factory
+        .enqueue(Plan::quota(Ok(quota(Some("ws-a"), 20, 30))));
+    let (factory, daemon) = (f.factory.clone(), f.daemon.clone());
+    let (_temp, handle) = runtime(&mut f, Settings::default()).await;
+    // Through the runtime handle, like the desktop commands.
+    let snapshot = handle
+        .codex_add_api_key("Second key", "sk-proj-SENTINEL-0123456789abcdeg".into())
+        .await
+        .unwrap();
+    assert_eq!(snapshot.accounts.len(), 3);
+    assert_eq!(snapshot.selected_id.as_deref(), Some(a.as_str()));
+    handle.codex_refresh_account(&key).await.unwrap();
+    let snapshot = handle.codex_refresh_all().await.unwrap();
+    assert_eq!(factory.calls(), vec!["start-Active", "quota", "shutdown"]);
+    assert!(snapshot.error.is_none());
+    // Switch to the key: the follow-up reading of the new active account is skipped too.
+    let snapshot = handle.codex_switch_account(&key).await.unwrap();
+    assert_eq!(snapshot.selected_id.as_deref(), Some(key.as_str()));
+    assert_eq!(f.active(), key_file(FAKE_KEY));
+    assert_eq!(*daemon.calls.lock().unwrap(), vec!["state", "restart"]);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    handle.codex_refresh_account(&key).await.unwrap();
+    handle.codex_tick().await;
+    let snapshot = handle.get_codex_snapshot();
+    assert!(snapshot.error.is_none());
+    assert_eq!(factory.calls().len(), 3);
+    let view = snapshot.accounts.iter().find(|v| v.id == key).unwrap();
+    assert!(view.selected && view.error.is_none() && !view.needs_sign_in);
+    assert!(view.quota.is_none() && view.quota_read_at.is_none());
+    assert_eq!(view.api_key_tail.as_deref(), Some("cdef"));
+    // A key is never read in the background either.
+    handle
+        .edit_codex_for_test(|engine, _| {
+            assert_ne!(
+                engine
+                    .due_quota(NOW + 1_000_000, &CodexPolicy::default())
+                    .as_deref(),
+                Some(key.as_str())
+            );
+        })
+        .await;
 }

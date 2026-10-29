@@ -37,11 +37,13 @@
   let active = $derived(view.active);
   let next = $derived(view.next);
   let caption = $derived(
-    !active || active.readAt === null
-      ? t($language, 'statusUnread')
-      : t($language, active.savedReading ? 'cachedAge' : 'updatedAge', {
-          age: age(active.readAt, now, $language),
-        }),
+    active?.apiKey
+      ? t($language, 'statusApiKeyDetail')
+      : !active || active.readAt === null
+        ? t($language, 'statusUnread')
+        : t($language, active.savedReading ? 'cachedAge' : 'updatedAge', {
+            age: age(active.readAt, now, $language),
+          }),
   );
 </script>
 
@@ -89,7 +91,11 @@
             >{t($language, 'signInAgain')}</button
           >{/if}
       </div>{/if}
-    <UsageMeters row={active} {now} threshold={view.threshold} />
+    {#if !active.apiKey}<UsageMeters
+        row={active}
+        {now}
+        threshold={view.threshold}
+      />{/if}
     {#if view.alert && active.status.kind !== 'signIn'}<div
         class="callout"
         class:danger={view.alertLimit === 'limited'}

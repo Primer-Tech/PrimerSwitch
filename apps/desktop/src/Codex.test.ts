@@ -15,6 +15,7 @@ import type { CodexSnapshot } from './lib/codex-types';
 import {
   codexAccount,
   codexAccounts,
+  codexApiKeyAccount,
   codexCapability,
   codexDemoSnapshot,
   codexMainLimit,
@@ -936,5 +937,239 @@ describe('Codex accounts page', () => {
     expect(
       call.mock.calls.every(([name]) => name === 'get_codex_snapshot'),
     ).toBe(true);
+  });
+});
+
+const FAKE_KEY = 'sk-proj-SENTINEL-0123456789abcdef';
+const withKey = (raw = codexSnapshot(), overrides = {}) => {
+  raw.accounts.push(codexApiKeyAccount('codex-key', overrides));
+  return raw;
+};
+async function openKeyDialog(locale: 'en' | 'ro' = 'en') {
+  const add = screen.getByRole('button', {
+    name: new RegExp(t(locale, 'addAccount')),
+  });
+  await fireEvent.click(add);
+  await fireEvent.click(
+    screen.getByRole('button', { name: t(locale, 'codexAddApiKey') }),
+  );
+  const dialog = await screen.findByRole('dialog');
+  return {
+    add,
+    dialog,
+    name: within(dialog).getByLabelText(
+      t(locale, 'codexApiKeyNameLabel'),
+    ) as HTMLInputElement,
+    key: within(dialog).getByLabelText(
+      t(locale, 'codexApiKeyLabel'),
+    ) as HTMLInputElement,
+    save: within(dialog).getByRole('button', {
+      name: t(locale, 'codexApiKeySave'),
+    }),
+  };
+}
+const noKey = () => {
+  expect(document.body.textContent).not.toContain('SENTINEL');
+  expect(document.body.innerHTML).not.toContain('SENTINEL');
+};
+describe('Codex API key accounts', () => {
+  it('adds an API key from a small dialog, trims it and never renders it', async () => {
+    const { call, codexController } = await setup();
+    const { add, dialog, name, key, save } = await openKeyDialog();
+    expect(within(dialog).getByRole('heading', { level: 2 })).toHaveTextContent(
+      'Add an OpenAI API key',
+    );
+    expect(dialog).toHaveTextContent('never switches to it on its own');
+    // A password field that browsers and spell checkers leave alone.
+    expect(key).toHaveAttribute('type', 'password');
+    expect(key).toHaveAttribute('autocomplete', 'off');
+    expect(key).toHaveAttribute('spellcheck', 'false');
+    expect(key).toHaveAccessibleDescription(t('en', 'codexApiKeyHelp'));
+    expect(name).toHaveAttribute('maxlength', '60');
+    expect(save).toBeDisabled();
+    await fireEvent.input(name, { target: { value: '  Work key ' } });
+    expect(save).toBeDisabled();
+    await fireEvent.input(key, { target: { value: `  ${FAKE_KEY}  ` } });
+    expect(save).toBeEnabled();
+    const pending = deferred();
+    call.mockReturnValueOnce(pending.promise);
+    await fireEvent.click(save);
+    expect(call).toHaveBeenCalledWith('codex_add_api_key', {
+      name: 'Work key',
+      key: FAKE_KEY,
+    });
+    // The key field is already empty while the native call runs.
+    expect(key.value).toBe('');
+    expect(
+      within(dialog).getByRole('button', { name: 'Saving…' }),
+    ).toBeDisabled();
+    noKey();
+    pending.resolve(withKey(codexSnapshot({ revision: 2 })));
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    const notice = (
+      await screen.findByText(/Saved Work key \(API key …cdef\)/)
+    ).closest('[role="status"]') as HTMLElement;
+    expect(notice).toHaveTextContent('platform.openai.com');
+    expect(notice).toHaveTextContent('until you switch');
+    // Focus goes back to the control that opened the dialog.
+    await waitFor(() => expect(add).toHaveFocus());
+    // The saved row: its ending, what it costs and a normal Switch button.
+    const saved = within(row('Work key'));
+    expect(saved.getByText('API key …cdef')).toBeVisible();
+    expect(saved.getByText('API key')).toBeVisible();
+    expect(
+      saved.getByText('Billed per token · no ChatGPT plan limits'),
+    ).toBeVisible();
+    expect(saved.getByRole('button', { name: 'Switch' })).toBeEnabled();
+    noKey();
+    expect(JSON.stringify(get(codexController))).not.toContain('SENTINEL');
+  });
+  it('clears the key after a failed save and shows only a generic error', async () => {
+    const { call, codexController } = await setup();
+    const { dialog, name, key, save } = await openKeyDialog();
+    await fireEvent.input(name, { target: { value: 'Work key' } });
+    await fireEvent.input(key, { target: { value: FAKE_KEY } });
+    call.mockRejectedValueOnce('invalidApiKey');
+    await fireEvent.click(save);
+    const alert = await within(dialog).findByRole('alert');
+    expect(alert).toHaveTextContent(t('en', 'codexReason_invalidApiKey'));
+    // The dialog stays open with the name kept and the key gone.
+    expect(screen.getByRole('dialog')).toBe(dialog);
+    expect(key.value).toBe('');
+    expect(name.value).toBe('Work key');
+    expect(
+      within(dialog).getByRole('button', { name: 'Save key' }),
+    ).toBeDisabled();
+    noKey();
+    // An error that echoes the key is never shown, only the generic failure.
+    await fireEvent.input(key, { target: { value: FAKE_KEY } });
+    call.mockRejectedValueOnce(new Error(`rejected ${FAKE_KEY}`));
+    await fireEvent.click(
+      within(dialog).getByRole('button', { name: 'Save key' }),
+    );
+    await waitFor(() =>
+      expect(within(dialog).getByRole('alert')).toHaveTextContent(
+        t('en', 'codexActionFailed'),
+      ),
+    );
+    expect(key.value).toBe('');
+    noKey();
+    expect(JSON.stringify(get(codexController))).not.toContain('SENTINEL');
+    expect(
+      call.mock.calls.filter(([command]) => command === 'codex_add_api_key'),
+    ).toHaveLength(2);
+  });
+  it('clears the key when the dialog is cancelled, escaped or closed', async () => {
+    const { call } = await setup();
+    const first = await openKeyDialog();
+    await fireEvent.input(first.name, { target: { value: 'Work key' } });
+    await fireEvent.input(first.key, { target: { value: FAKE_KEY } });
+    await fireEvent.click(
+      within(first.dialog).getByRole('button', { name: 'Cancel' }),
+    );
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    await waitFor(() => expect(first.add).toHaveFocus());
+    // Reopened, nothing of the earlier input is left.
+    const second = await openKeyDialog();
+    expect(second.name.value).toBe('');
+    expect(second.key.value).toBe('');
+    await fireEvent.input(second.key, { target: { value: FAKE_KEY } });
+    await fireEvent(second.dialog, new Event('cancel', { cancelable: true }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    const third = await openKeyDialog();
+    expect(third.key.value).toBe('');
+    await fireEvent.input(third.key, { target: { value: FAKE_KEY } });
+    await fireEvent.click(
+      within(third.dialog).getByRole('button', { name: 'Close' }),
+    );
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    expect((await openKeyDialog()).key.value).toBe('');
+    expect(
+      call.mock.calls.some(([command]) => command === 'codex_add_api_key'),
+    ).toBe(false);
+    noKey();
+  });
+  it('turns the entry off while storage or Codex cannot take a key', async () => {
+    const raw = codexSnapshot();
+    raw.capabilities.addApiKey = codexCapability('vaultUnavailable');
+    await setup(raw);
+    await fireEvent.click(screen.getByRole('button', { name: /Add account/ }));
+    expect(screen.getByRole('button', { name: 'Add API key…' })).toBeDisabled();
+    expect(
+      screen.getByRole('button', { name: 'Sign in with ChatGPT…' }),
+    ).toBeEnabled();
+  });
+  it('switches to the key like to any account and shows it without usage windows', async () => {
+    const { call } = await setup(withKey());
+    const result = withKey(switched('codex-key', 2));
+    result.accounts.forEach(
+      (account) => (account.selected = account.id === 'codex-key'),
+    );
+    call.mockResolvedValueOnce(result);
+    await fireEvent.click(
+      within(row('Work key')).getByRole('button', { name: 'Switch' }),
+    );
+    expect(call).toHaveBeenCalledWith('codex_switch_account', {
+      id: 'codex-key',
+    });
+    expect(
+      await screen.findByText(
+        'Codex now uses Work key. Open terminals reconnect automatically.',
+      ),
+    ).toBeVisible();
+    const card = activeCard();
+    expect(card.getByRole('heading', { name: 'Work key' })).toBeVisible();
+    expect(card.getByText('API key …cdef')).toBeVisible();
+    expect(
+      card.getByText('API key, billed per token, no ChatGPT plan limits.'),
+    ).toBeVisible();
+    expect(card.queryByRole('meter')).toBeNull();
+    expect(card.queryByRole('button', { name: /^Refresh/ })).toBeNull();
+    expect(card.queryByText('Not checked yet')).toBeNull();
+    // Back to ChatGPT with the same button on another row.
+    expect(
+      within(row('studio@example.invalid')).getByRole('button', {
+        name: 'Switch',
+      }),
+    ).toBeEnabled();
+  });
+  it('shows the key ending and no usage in details, and cannot refresh it', async () => {
+    const { call } = await setup(withKey());
+    const menu = within(row('Work key')).getByRole('button', {
+      name: 'More actions for Work key',
+    });
+    await fireEvent.click(menu);
+    const items = within(
+      document.getElementById(menu.getAttribute('aria-controls')!)!,
+    );
+    expect(items.getByRole('button', { name: 'Refresh' })).toBeDisabled();
+    expect(items.getByRole('button', { name: 'Delete' })).toBeEnabled();
+    await fireEvent.click(items.getByRole('button', { name: 'Details' }));
+    const dialog = screen.getByRole('dialog');
+    expect(dialog).toHaveTextContent('API key ends in');
+    expect(dialog).toHaveTextContent('…cdef');
+    expect(dialog).toHaveTextContent(t('en', 'identityApiKey'));
+    expect(dialog).toHaveTextContent('ChatGPT plan limits');
+    expect(within(dialog).queryByRole('meter')).toBeNull();
+    expect(within(dialog).queryByText('Checked')).toBeNull();
+    expect(
+      within(dialog).queryByRole('button', { name: /^Refresh/ }),
+    ).toBeNull();
+    expect(
+      call.mock.calls.some(([command]) => command === 'codex_refresh_account'),
+    ).toBe(false);
+    noKey();
+  });
+  it('offers the same dialog in Romanian', async () => {
+    await setup(codexSnapshot(), 'ro');
+    const { dialog, name, key, save } = await openKeyDialog('ro');
+    expect(within(dialog).getByRole('heading', { level: 2 })).toHaveTextContent(
+      'Adaugă o cheie API OpenAI',
+    );
+    expect(name).toBeVisible();
+    expect(key).toHaveAttribute('type', 'password');
+    expect(save).toHaveTextContent('Salvează cheia');
+    expect(dialog).toHaveTextContent('Începe cu sk-');
+    expect(dialog).toHaveTextContent('o alegi tu cu Comută');
   });
 });

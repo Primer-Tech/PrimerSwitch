@@ -52,7 +52,13 @@ no authenticated provider run was used for release verification.
 
 - **Sign in with ChatGPT…** opens the browser login in a private, temporary Codex home, so adding an account never changes the active one.
 - **Import current Codex login** saves whatever `codex login` produced. PrimerSwitch also does this by itself: when it sees a login it does not know in `auth.json`, it keeps it as a new account.
-- **Import from Codex Switcher** reads `~/.codex-switcher/accounts.json` from lampese's Codex Switcher (store version 1) and saves its ChatGPT accounts with their names (API-key entries are kept but cannot be selected). If an account exists in both, the copy whose token was issued later wins. Close Codex Switcher afterwards: it also refreshes tokens in the background and force-closes `codex.exe` processes when it switches, so running both makes them invalidate each other's sign-ins.
+- **Import from Codex Switcher** reads `~/.codex-switcher/accounts.json` from lampese's Codex Switcher (store version 1) and saves its ChatGPT accounts with their names (its API-key entries are kept as API-key accounts). If an account exists in both, the copy whose token was issued later wins. Close Codex Switcher afterwards: it also refreshes tokens in the background and force-closes `codex.exe` processes when it switches, so running both makes them invalidate each other's sign-ins.
+
+- **Add API key…** saves an OpenAI API key under a name you choose. The key is typed into a password field, goes straight to the encrypted vault and never comes back to the window; the list shows only its last four characters. Saving does not switch to it.
+
+## API-key accounts
+
+An API-key account is switched like any other: **Switch** writes the key to `auth.json` in the same way as a ChatGPT sign-in (the outgoing login is kept first), then restarts the Codex daemon. Switch back to a ChatGPT account the same way. Use is billed per token on your OpenAI API account, outside any ChatGPT plan, so there are no plan limits to show: the account has no usage windows, is never read, and **Refresh** is off for it. Only you can choose it. Automatic switching and preferred returns never select an API key, and an API key is never a source of headroom. A key from a `codex login --with-api-key` is adopted the same way as an unknown ChatGPT login, without a duplicate when the key is already saved. Delete removes the saved key; an API-key login that is still active in `auth.json` stays until you switch.
 
 ## Usage readings
 

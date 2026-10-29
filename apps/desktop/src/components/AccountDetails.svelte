@@ -59,7 +59,7 @@
       <StatusLabel status={row.status} />
     </div>
   </div>
-  <UsageMeters {row} {now} {threshold} />
+  {#if !row.apiKey}<UsageMeters {row} {now} {threshold} />{/if}
   {#each row.notes as note, index (index)}<p
       class="note"
       class:warning-text={note.tone === 'warn'}
@@ -77,18 +77,18 @@
         <dd>{row.workspaceLabel}</dd>
       </div>{/if}
     {@render facts?.()}
-    <div>
-      <dt>{t($language, 'detailsChecked')}</dt>
-      <dd class:warning-text={row.savedReading && row.readAt !== null}>
-        {row.readAt === null
-          ? t($language, 'statusUnread')
-          : row.savedReading
-            ? t($language, 'cachedAge', {
-                age: age(row.readAt, now, $language),
-              })
-            : age(row.readAt, now, $language)}
-      </dd>
-    </div>
+    {#if !row.apiKey}<div>
+        <dt>{t($language, 'detailsChecked')}</dt>
+        <dd class:warning-text={row.savedReading && row.readAt !== null}>
+          {row.readAt === null
+            ? t($language, 'statusUnread')
+            : row.savedReading
+              ? t($language, 'cachedAge', {
+                  age: age(row.readAt, now, $language),
+                })
+              : age(row.readAt, now, $language)}
+        </dd>
+      </div>{/if}
   </dl>
   {@render extra?.()}
   <AccountAutomationEditor

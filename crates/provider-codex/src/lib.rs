@@ -8,7 +8,8 @@ mod wire;
 
 pub use auth::{
     AuthInspection, AuthKind, OpaqueAuth, UnverifiedRoutingClaims, api_key_auth_payload,
-    chatgpt_auth_payload, merge_rotated_tokens, normalize_hybrid,
+    api_key_tail, chatgpt_auth_payload, merge_rotated_tokens, normalize_hybrid, same_api_key,
+    validate_api_key,
 };
 pub use client::{
     BrowserLoginChallenge, CancelOutcome, CodexClient, CodexContext, CodexService,
@@ -90,6 +91,8 @@ pub enum CodexError {
     IdentityMismatch,
     #[error("The Codex background server could not be restarted.")]
     DaemonUnavailable,
+    #[error("The API key is not in the expected format.")]
+    InvalidApiKey,
 }
 
 #[cfg(test)]

@@ -14,7 +14,7 @@ The screenshot shows the implemented interface with explicitly marked, read-only
 
 ## Features
 
-The [Codex 0.160.0 adapter](docs/migration/CODEX_USAGE.md) supports isolated managed browser login, encrypted saved accounts, current-login import, guarded manual and automatic selection, and native quota windows. Codex FILE-mode ChatGPT support has a pinned compatibility gate; API-key selection and other storage modes remain separate work.
+The [Codex 0.160.0 adapter](docs/migration/CODEX_USAGE.md) supports isolated managed browser login, encrypted saved accounts, current-login import, guarded manual and automatic selection, and native quota windows. Codex FILE-mode ChatGPT support has a pinned compatibility gate; Manual selection of a saved OpenAI API key is supported (billed per token, never chosen automatically); other storage modes remain separate work.
 
 - Browser sign-in with PKCE, import of the current Claude CLI login, and previewed legacy account import.
 - Manual switching with token-owner verification and encrypted recovery journals.

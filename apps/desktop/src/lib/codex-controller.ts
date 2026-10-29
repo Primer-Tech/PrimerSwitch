@@ -33,6 +33,8 @@ export type CodexNotice =
   | { kind: 'deleteComplete' }
   | { kind: 'importedCurrent'; added: number }
   | { kind: 'importedSwitcher'; added: number }
+  | { kind: 'apiKeyAdded'; accountId: string }
+  | { kind: 'apiKeyExisting' }
   | {
       kind: 'switched';
       accountId: string;
@@ -45,6 +47,7 @@ export type CodexPending =
   | 'codex_discover'
   | 'codex_import_current'
   | 'codex_import_switcher'
+  | 'codex_add_api_key'
   | 'codex_refresh_account'
   | 'codex_consume_reset'
   | 'codex_refresh_all'
@@ -247,6 +250,49 @@ export function createCodexController(bridge: CodexBridge = codexNativeBridge) {
         set({ notice: { kind: 'importedCurrent', added } });
       else if (command === 'codex_import_switcher')
         set({ notice: { kind: 'importedSwitcher', added } });
+      return true;
+    } catch (error) {
+      set({ error: failure(error) });
+      void read();
+      return false;
+    } finally {
+      set({ pending: null, pendingId: null });
+    }
+  }
+  /**
+   * Saves an OpenAI API key under `name`. The key goes to native code once and is never
+   * kept here: not in the state, a notice or an error. The caller clears its own copy.
+   */
+  async function addApiKey(name: string, key: string): Promise<boolean> {
+    const snapshot = state.snapshot;
+    if (
+      blocked() ||
+      !snapshot?.capabilities.addApiKey.enabled ||
+      !name.trim() ||
+      !key.trim()
+    )
+      return false;
+    const known = new Set(snapshot.accounts.map((a) => a.id));
+    set({
+      pending: 'codex_add_api_key',
+      pendingId: null,
+      error: null,
+      notice: null,
+    });
+    try {
+      const result = accept(
+        await bridge.call('codex_add_api_key', { name, key }),
+      );
+      if (result.error) return false;
+      const added = result.accounts.find(
+        (a) => a.authKind === 'apiKey' && !known.has(a.id),
+      );
+      // The same key again adds no account: nothing changed.
+      set({
+        notice: added
+          ? { kind: 'apiKeyAdded', accountId: added.id }
+          : { kind: 'apiKeyExisting' },
+      });
       return true;
     } catch (error) {
       set({ error: failure(error) });
@@ -469,6 +515,7 @@ export function createCodexController(bridge: CodexBridge = codexNativeBridge) {
     discover: () => action('codex_discover'),
     importCurrent: () => action('codex_import_current'),
     importSwitcher: () => action('codex_import_switcher'),
+    addApiKey,
     refreshAccount: (id: string) => action('codex_refresh_account', { id }),
     refreshAll: () => action('codex_refresh_all'),
     deleteAccount: (id: string) => action('codex_delete_account', { id }),

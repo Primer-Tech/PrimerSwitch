@@ -77,6 +77,26 @@ export function codexAccount(
     ...overrides,
   };
 }
+/** A saved OpenAI API key (fictional): switchable by hand, with no plan limits to read. */
+export function codexApiKeyAccount(
+  id = 'codex-key',
+  overrides: Partial<CodexAccount> = {},
+): CodexAccount {
+  return codexAccount(id, {
+    name: 'Work key',
+    email: null,
+    workspaceId: null,
+    authKind: 'apiKey',
+    apiKeyTail: 'cdef',
+    planType: null,
+    identityEvidence: 'claimsOnly',
+    identityVerified: false,
+    quota: null,
+    quotaReadAt: null,
+    quotaState: 'unread',
+    ...overrides,
+  });
+}
 /**
  * Three realistic accounts: the active Pro one around 40% / 35% with a code-review
  * limit and credits, a Plus one at its 5-hour limit (frees in about 2h 10m), and a
@@ -214,6 +234,7 @@ export function codexSnapshot(
       loginBrowser: codexCapability(),
       importCurrent: codexCapability(),
       importSwitcher: codexCapability('switcherUnavailable'),
+      addApiKey: codexCapability(),
       refreshQuota: codexCapability(),
       switchAccount: codexCapability(),
       deleteSaved: codexCapability(),
@@ -244,6 +265,7 @@ export function codexDemoSnapshot(
       loginBrowser: codexCapability(),
       importCurrent: codexCapability(),
       importSwitcher: codexCapability(),
+      addApiKey: codexCapability(),
       refreshQuota: codexCapability(),
       switchAccount: codexCapability(),
       deleteSaved: codexCapability(),

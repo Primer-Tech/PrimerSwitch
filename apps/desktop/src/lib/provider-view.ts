@@ -242,6 +242,11 @@ export interface AccountRowView {
   readAt: number | null;
   savedReading: boolean;
   credits: string | null;
+  /**
+   * An API key account: billed per token, with no plan windows to show. `tail` is the
+   * last four characters, to compare with the provider's key list.
+   */
+  apiKey?: { tail: string | null } | null;
   /** Plain-words verification of the saved sign-in. */
   identity: string;
   identityOk: boolean;

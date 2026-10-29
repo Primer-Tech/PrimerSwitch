@@ -124,7 +124,8 @@ The [future provider plan](FUTURE_CODEX.md) defines C00–C04 gates. Add test gr
 | C-PROTOCOL | Version-generated schema, initialization order, login cancellation/completion, async notifications, ID mismatch, bounded messages, process exit/restart and no-refresh account read |
 | C-STORAGE | File/keyring/auto/ephemeral, managed method/workspace/store restrictions, private-home isolation, concurrent refreshed cache, no global logout before switch, preservation of config/profiles/MCP/history |
 | C-IMPORT | Exact current switcher format once known, duplicate/workspace identity, newer rotation retained, corrupted source retained, idempotent merge |
-| C-QUOTA | Dynamic limit buckets, optional primary/secondary, missing/unknown windows, credits count vs partial detail list, API-key unsupported quota state, read/events without dummy inference |
+| C-QUOTA | Dynamic limit buckets, optional primary/secondary, missing/unknown windows, credits count vs partial detail list, API-key accounts have no quota read and no usage state, read/events without dummy inference |
+| C-APIKEY | Strict key validation without echo, byte-exact `auth.json` write for both directions with the outgoing login kept, no automatic selection or quota read for a key, external key login adopted without a duplicate, key never in snapshots, logs, Debug or the dialog after save, failure or cancel |
 | C-ADOPTION | Owned sidecar vs global CLI vs already-running IDE/desktop scope; labeled isolated launch; native evidence per surface |
 | C-RESET | Future separate feature only: UUID replay/lost reply/restart/already-completed result, opaque credit IDs, reread quotas, no inherited default-on Claude redemption |
 

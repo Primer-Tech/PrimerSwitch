@@ -48,6 +48,11 @@ const ERROR_RETRY: i64 = 900;
 const SIGN_IN_RETRY: i64 = 6 * 3600;
 const FRESH_SECONDS: i64 = 900;
 const RETURN_RETRY: i64 = 120;
+/// How old a "limited" reading of another ChatGPT account may be when it is the proof
+/// that a billed API key is the only way to keep working: one hourly read of an
+/// inactive account (`INACTIVE_QUOTA_INTERVAL`) plus the retry floor after a failed
+/// attempt (`ERROR_RETRY`). A healthy scheduler never lets a reading get older.
+const FALLBACK_PROOF_MAX_AGE: i64 = INACTIVE_QUOTA_INTERVAL + ERROR_RETRY;
 const MANUAL_RETURN_HOLD: i64 = 900;
 /// Leave a nearly expired active token to Codex's own refresh in the background.
 const ACTIVE_EXPIRY_MARGIN: i64 = 600;
@@ -1311,9 +1316,11 @@ impl CodexEngine {
         else {
             return KeyFallback::No;
         };
-        // A reading proves "limited" only until its window reopens: read that account
-        // again before any money is spent.
-        if let Some(recovering) = self
+        // Money is only spent on current proof. The active account's reading may be fresh
+        // while its window has reopened since; every other ChatGPT account needs a
+        // verified reading of this process (see `limit_proven`). Whatever lacks proof is
+        // read first: never engage on it, never claim "all limited" because of it.
+        let mut unproven: Vec<&SavedAccount> = self
             .saved
             .accounts
             .iter()
@@ -1321,14 +1328,20 @@ impl CodexEngine {
                 a.id != active.id
                     && a.auth_kind == AuthKind::ManagedChatgpt
                     && a.automation.enabled
-                    && reset_passed(a, now)
+                    && !self.limit_proven(a, now)
             })
-            .min_by_key(|a| (a.quota_read_at.unwrap_or(i64::MIN), &a.id))
-        {
-            return if self.recovery_read_due(recovering, now) {
-                KeyFallback::Refresh(recovering.id.clone())
-            } else {
-                KeyFallback::Wait
+            .collect();
+        unproven.sort_by_key(|a| (a.quota_read_at.unwrap_or(i64::MIN), &a.id));
+        if reset_passed(active, now) {
+            unproven.insert(0, active);
+        }
+        if !unproven.is_empty() {
+            return match unproven
+                .into_iter()
+                .find(|a| self.recovery_read_due(a, now))
+            {
+                Some(due) => KeyFallback::Refresh(due.id.clone()),
+                None => KeyFallback::Wait,
             };
         }
         KeyFallback::Engage(CodexAutoSwitch {
@@ -1340,9 +1353,26 @@ impl CodexEngine {
             kind: CodexAutoKind::KeyFallback,
         })
     }
+    /// A reading of another ChatGPT account that is good enough to bill a key on: it was
+    /// read in this process with a reply that names the account, no attempt failed after
+    /// it (also not one made before a restart, which `account_errors` forgets), it is not
+    /// older than `FALLBACK_PROOF_MAX_AGE` and the window it reports has not reopened.
+    fn limit_proven(&self, account: &SavedAccount, now: i64) -> bool {
+        let failed_since_read = account
+            .last_attempt_at
+            .is_some_and(|attempt| account.quota_read_at.is_none_or(|read| attempt > read));
+        self.verified_now.contains(&account.id)
+            && !self.account_errors.contains_key(&account.id)
+            && !failed_since_read
+            && account
+                .quota_read_at
+                .is_some_and(|read| now >= read && now - read <= FALLBACK_PROOF_MAX_AGE)
+            && !reset_passed(account, now)
+    }
     /// Leaving the fallback key: the key is the active login with the fallback setting
     /// on, the manual hold has passed and a ChatGPT account has headroom (the same
-    /// ranking as ordinary switching). A stale reading of the best account is read again.
+    /// ranking as ordinary switching), walked in order: a candidate whose reading is stale
+    /// or unverified is read again when that is due and skipped otherwise.
     fn key_return(&self, active: &SavedAccount, now: i64, policy: &CodexPolicy) -> CodexAutomation {
         if !policy.auto_switch
             || active.auth_kind != AuthKind::ApiKey
@@ -1354,22 +1384,26 @@ impl CodexEngine {
         {
             return CodexAutomation::Idle;
         }
-        match self.next_candidate(policy) {
-            Some(target) if self.quota_state(target, now) == CodexQuotaState::Fresh => {
-                CodexAutomation::Return(CodexAutoSwitch {
+        // Walk the ranking: the first candidate with a fresh reading (which is also a
+        // verified one, see `quota_state`) takes the return. One that does not qualify is
+        // read again when that is due, and otherwise skipped, so a candidate that cannot
+        // be verified never keeps a better-placed one from taking over while a key bills.
+        for target in self.ranked_candidates(policy) {
+            if self.quota_state(target, now) == CodexQuotaState::Fresh {
+                return CodexAutomation::Return(CodexAutoSwitch {
                     previous_id: active.id.clone(),
                     target_id: target.id.clone(),
                     target_name: target.name.clone(),
                     previous_name: active.name.clone(),
                     peak: None,
                     kind: CodexAutoKind::KeyReturn,
-                })
+                });
             }
-            Some(target) if self.recovery_read_due(target, now) => {
-                CodexAutomation::Refresh(target.id.clone())
+            if self.recovery_read_due(target, now) {
+                return CodexAutomation::Refresh(target.id.clone());
             }
-            _ => CodexAutomation::Idle,
         }
+        CodexAutomation::Idle
     }
     /// Returning is opt-in, only to an explicitly higher priority, and requires an
     /// observed natural reset plus a fresh backend-identified recovery reading.
@@ -2456,7 +2490,13 @@ impl CodexEngine {
             return Err(reason);
         }
         self.saved.accounts[index].fallback = enabled;
-        self.save(vault)
+        if let Err(error) = self.save(vault) {
+            // The scheduler must not act on, and a retry must not skip, a setting that
+            // was never written.
+            self.saved.accounts[index].fallback = !enabled;
+            return Err(error);
+        }
+        Ok(())
     }
     /// Import every account saved by lampese "Codex Switcher". For an account that is
     /// already saved here, the copy whose id_token was issued later wins.

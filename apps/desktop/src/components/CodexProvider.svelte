@@ -386,10 +386,18 @@
         key: 'fallback',
         tone: 'warn',
         role: 'status',
-        text: t($language, 'codexFallbackBanner', {
-          name: engagedKey.name,
-          time: codexClock(engaged.since, $language),
-        }),
+        // With automatic switching off nothing returns by itself: say so, and keep the
+        // billing warning and the way back.
+        text: t(
+          $language,
+          automation?.autoSwitchEnabled === false
+            ? 'codexFallbackBannerPaused'
+            : 'codexFallbackBanner',
+          {
+            name: engagedKey.name,
+            time: codexClock(engaged.since, $language),
+          },
+        ),
         action:
           back && back.authKind === 'chatgpt' && back.switchable.enabled
             ? {

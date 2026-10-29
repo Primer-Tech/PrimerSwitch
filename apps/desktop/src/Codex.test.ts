@@ -1594,4 +1594,47 @@ describe('Codex automatic API-key fallback', () => {
       consent.getByText(t('en', 'codexFallbackFlexWarning')),
     ).toBeVisible();
   });
+  it('keeps the billing banner but promises no return while automatic switching is off', async () => {
+    const since = 1_700_000_000;
+    const { call } = await setup(engaged(codexSnapshot(), since), 'en', {
+      autoSwitchEnabled: false,
+    });
+    const paused = screen.getByText(
+      `Using API key Work key (billed per token) since ${codexClock(since, 'en')}. Automatic switching is off, so PrimerSwitch will not return by itself. Turn it on in the automation settings, or switch back yourself.`,
+    );
+    expect(paused).toBeVisible();
+    expect(screen.queryByText(/returns automatically/)).toBeNull();
+    // The way back stays.
+    const back = screen.getByRole('button', { name: 'Switch back now' });
+    expect(back).toBeEnabled();
+    call.mockResolvedValueOnce(
+      withKey(switched('codex-research', 3), { fallback: true }),
+    );
+    await fireEvent.click(back);
+    expect(call).toHaveBeenLastCalledWith('codex_switch_account', {
+      id: 'codex-research',
+    });
+    noKey();
+  });
+  it('promises the automatic return while automatic switching is on, and says the paused text in Romanian', async () => {
+    const since = 1_700_000_000;
+    await setup(engaged(codexSnapshot(), since), 'en', {
+      autoSwitchEnabled: true,
+    });
+    expect(
+      screen.getByText(/PrimerSwitch returns automatically/),
+    ).toBeVisible();
+    expect(screen.queryByText(/will not return by itself/)).toBeNull();
+    cleanup();
+    await setup(engaged(codexSnapshot(), since), 'ro', {
+      autoSwitchEnabled: false,
+    });
+    expect(
+      screen.getByText(
+        `Se folosește cheia API Work key (facturată per token) din ${codexClock(since, 'ro')}. Comutarea automată este oprită, așa că PrimerSwitch nu va reveni singur. Pornește-o din setările de automatizare sau revino tu.`,
+      ),
+    ).toBeVisible();
+    expect(screen.queryByText(/revine automat/)).toBeNull();
+    expect(screen.getByRole('button', { name: 'Revino acum' })).toBeEnabled();
+  });
 });

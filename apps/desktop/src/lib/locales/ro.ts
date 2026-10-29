@@ -582,5 +582,7 @@ export const ro: Record<keyof typeof en, string> = {
     'O sesiune Codex pornită cât timp această cheie este activă cu Flex eșuează pe ChatGPT după revenirea automată, până pornești una nouă.',
   codexFallbackBanner:
     'Se folosește cheia API {name} (facturată per token) din {time}, pentru că toate conturile ChatGPT sunt la limită. PrimerSwitch revine automat când unul se reface.',
+  codexFallbackBannerPaused:
+    'Se folosește cheia API {name} (facturată per token) din {time}. Comutarea automată este oprită, așa că PrimerSwitch nu va reveni singur. Pornește-o din setările de automatizare sau revino tu.',
   codexFallbackSwitchBack: 'Revino acum',
 };

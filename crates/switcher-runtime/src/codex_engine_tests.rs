@@ -6234,3 +6234,302 @@ async fn the_runtime_handle_saves_the_fallback_setting_for_keys_only() {
             .fallback
     );
 }
+
+// Review pass 1 of the fallback: proof of the limits, the return walk and the setting save.
+impl Fixture {
+    /// Undo `break_vault`: the record that was moved aside is the vault record again.
+    fn fix_vault(&self) {
+        let record = self._root.path().join("vault/codex-state.vault");
+        fs::remove_dir(&record).unwrap();
+        fs::rename(self._root.path().join("vault/kept.vault"), &record).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn the_active_account_that_reopened_is_read_again_before_any_money_is_spent() {
+    let (mut f, a, _b, key) = exhausted_world(false).await;
+    let policy = CodexPolicy::default();
+    // a was read at its limit a moment ago, but its window reopened after that reading
+    // (which is still fresh): it may have recovered.
+    f.read(&a, main_quota_at(100, NOW - 40, 40, NOW + 86400), NOW - 200);
+    let active = f.engine.selected().unwrap();
+    assert_eq!(f.engine.quota_state(active, NOW), CodexQuotaState::Fresh);
+    assert_eq!(
+        f.engine.automation(NOW, &policy),
+        CodexAutomation::Refresh(a.clone())
+    );
+    // Read a moment ago: look again later, and meanwhile neither the key nor "all limited".
+    let index = f.engine.account_index(&a).unwrap();
+    f.engine.saved.accounts[index].last_attempt_at = Some(NOW - 30);
+    assert_eq!(f.engine.automation(NOW, &policy), CodexAutomation::Idle);
+    // The new reading says a is still limited, until later: now the key is allowed.
+    f.read(&a, main_quota_at(100, NOW + 3000, 40, NOW + 86400), NOW);
+    let plan = plan_of(f.engine.automation(NOW, &policy));
+    assert_eq!(plan.kind, CodexAutoKind::KeyFallback);
+    assert_eq!(plan.target_id, key);
+    // The write guard asks the same question: the same reopened reading aborts the plan.
+    f.read(&a, main_quota_at(100, NOW - 40, 40, NOW + 86400), NOW - 200);
+    assert_refused(&mut f, &plan, &policy, NOW, &a);
+    f.claude_untouched();
+}
+
+#[tokio::test]
+async fn a_limit_is_proven_by_a_current_verified_reading_with_no_failure_after_it() {
+    let policy = CodexPolicy::default();
+    let limited = |reset: i64| main_quota_at(100, reset, 60, NOW + 86400);
+    // After a restart the old readings are not proof: nothing is verified or tried yet.
+    let (mut f, a, b, key) = exhausted_world(false).await;
+    f.engine.save(&f.vault).unwrap();
+    reopen(&mut f, NOW);
+    f.read(&a, main_quota(97, 40), NOW);
+    assert_eq!(
+        f.engine.automation(NOW, &policy),
+        CodexAutomation::Refresh(b.clone())
+    );
+    // The ordinary all-limited notice is unchanged by the stricter proof.
+    f.set_fallback(&key, false).await.unwrap();
+    assert!(matches!(
+        f.engine.automation(NOW, &policy),
+        CodexAutomation::Exhausted { .. }
+    ));
+    f.set_fallback(&key, true).await.unwrap();
+    // Read again with a reply that names the account: proven, the key is allowed.
+    f.read(&b, limited(NOW + 7200), NOW);
+    let plan = plan_of(f.engine.automation(NOW, &policy));
+    assert_eq!(plan.kind, CodexAutoKind::KeyFallback);
+    // A read that failed after the limited reading, then a restart (the in-memory error
+    // is forgotten): the old percentage proves nothing. Not repeated at once, then retried.
+    f.read(&b, limited(NOW + 7200), NOW - 2000);
+    let index = f.engine.account_index(&b).unwrap();
+    f.engine.saved.accounts[index].last_attempt_at = Some(NOW - 100);
+    assert!(f.engine.account_errors.is_empty());
+    assert_eq!(f.engine.automation(NOW, &policy), CodexAutomation::Idle);
+    assert_refused(&mut f, &plan, &policy, NOW, &a);
+    f.engine.saved.last_auto_switch_at = None;
+    f.engine.saved.accounts[index].last_attempt_at = Some(NOW - ERROR_RETRY);
+    assert_eq!(
+        f.engine.automation(NOW, &policy),
+        CodexAutomation::Refresh(b.clone())
+    );
+    // A good read ends it.
+    f.read(&b, limited(NOW + 7200), NOW);
+    assert_eq!(
+        plan_of(f.engine.automation(NOW, &policy)).kind,
+        CodexAutoKind::KeyFallback
+    );
+    // A reply that did not name the account is not verified: not proof either.
+    f.read(&b, limited(NOW + 7200), NOW - 60);
+    f.engine.verified_now.remove(&b);
+    assert_eq!(f.engine.automation(NOW, &policy), CodexAutomation::Idle);
+    assert_refused(&mut f, &plan, &policy, NOW, &a);
+    f.engine.saved.last_auto_switch_at = None;
+    f.read(&b, limited(NOW + 7200), NOW - 600);
+    f.engine.verified_now.remove(&b);
+    assert_eq!(
+        f.engine.automation(NOW, &policy),
+        CodexAutomation::Refresh(b.clone())
+    );
+    // A reading older than the polling cadence allows is read again; its last good age
+    // is still enough.
+    f.read(&b, limited(NOW + 7200), NOW - FALLBACK_PROOF_MAX_AGE - 1);
+    assert_eq!(
+        f.engine.automation(NOW, &policy),
+        CodexAutomation::Refresh(b.clone())
+    );
+    f.read(&b, limited(NOW + 7200), NOW - FALLBACK_PROOF_MAX_AGE);
+    assert_eq!(
+        plan_of(f.engine.automation(NOW, &policy)).kind,
+        CodexAutoKind::KeyFallback
+    );
+    // The bound is one hourly read of an inactive account plus the retry floor.
+    assert_eq!(FALLBACK_PROOF_MAX_AGE, 4500);
+    // A reading from the future (the clock moved back) proves nothing, and is not read
+    // again at once either.
+    f.read(&b, limited(NOW + 7200), NOW + 100);
+    assert_eq!(f.engine.automation(NOW, &policy), CodexAutomation::Idle);
+    f.claude_untouched();
+}
+
+#[tokio::test]
+async fn the_oldest_unproven_account_that_is_due_is_read_first() {
+    let (mut f, a, b, _key) = exhausted_world(false).await;
+    let policy = CodexPolicy::default();
+    let c = f.add("user-c", "ws-c", "saved");
+    let limited = || main_quota_at(100, NOW + 7200, 60, NOW + 86400);
+    // b is the older proof but failed a moment ago (retried after the long floor); c was
+    // never read in this process and is due: it is not held back behind b.
+    f.read(&b, limited(), NOW - 2000);
+    let index = f.engine.account_index(&b).unwrap();
+    f.engine.saved.accounts[index].last_attempt_at = Some(NOW - 100);
+    f.read(&c, limited(), NOW - 1000);
+    f.engine.verified_now.remove(&c);
+    assert_eq!(
+        f.engine.automation(NOW, &policy),
+        CodexAutomation::Refresh(c.clone())
+    );
+    // Both just tried: wait, nothing engages, nothing is announced.
+    let index = f.engine.account_index(&c).unwrap();
+    f.engine.saved.accounts[index].last_attempt_at = Some(NOW - 30);
+    assert_eq!(f.engine.automation(NOW, &policy), CodexAutomation::Idle);
+    // The oldest due account goes first when both are due (c holds the older reading).
+    f.read(&c, limited(), NOW - 3000);
+    f.engine.verified_now.remove(&c);
+    f.read(&b, limited(), NOW - 2000);
+    f.engine.verified_now.remove(&b);
+    assert_eq!(
+        f.engine.automation(NOW, &policy),
+        CodexAutomation::Refresh(c.clone())
+    );
+    let _ = a;
+}
+
+/// The key is the active login after an automatic fallback; `b` ranks first and `c`
+/// second for the return, both with fresh, verified headroom at `later`.
+async fn engaged_with_two_candidates() -> (Fixture, String, String, String, String, i64) {
+    let (mut f, a, b, key) = exhausted_world(false).await;
+    let plan = plan_of(f.engine.automation(NOW, &CodexPolicy::default()));
+    f.auto_switch(&plan, NOW).await.unwrap();
+    f.daemon.calls.lock().unwrap().clear();
+    let c = f.add("user-c", "ws-c", "saved");
+    let later = NOW + AUTO_SWITCH_COOLDOWN;
+    f.read(&a, main_quota(97, 40), later);
+    f.read(&b, main_quota(5, 10), later);
+    f.read(&c, main_quota(20, 10), later);
+    assert_eq!(
+        f.engine
+            .ranked_candidates(&CodexPolicy::default())
+            .iter()
+            .map(|a| a.id.clone())
+            .collect::<Vec<_>>(),
+        vec![b.clone(), c.clone()]
+    );
+    (f, a, b, c, key, later)
+}
+
+#[tokio::test]
+async fn the_return_skips_a_candidate_that_cannot_be_verified_instead_of_waiting_on_it() {
+    let (mut f, _a, b, c, key, later) = engaged_with_two_candidates().await;
+    let policy = CodexPolicy::default();
+    // The best candidate is read, but the reply did not name its account: not verified.
+    // Ranked first, it just got its read: the next ranked account takes the return.
+    f.read(&b, main_quota(5, 10), later - 30);
+    f.engine.verified_now.remove(&b);
+    let CodexAutomation::Return(plan) = f.engine.automation(later, &policy) else {
+        panic!("expected a return");
+    };
+    assert_eq!(
+        (plan.kind, plan.target_id.as_str()),
+        (CodexAutoKind::KeyReturn, c.as_str())
+    );
+    // Due again: it is read first, as the best-placed account.
+    f.read(&b, main_quota(5, 10), later - 1000);
+    f.engine.verified_now.remove(&b);
+    assert_eq!(
+        f.engine.automation(later, &policy),
+        CodexAutomation::Refresh(b.clone())
+    );
+    // Verified again: it takes the return.
+    f.read(&b, main_quota(5, 10), later);
+    assert_eq!(f.engine.automation(later, &policy), key_return_to(&f, &b));
+    // Nobody is verified: never a return; read the best one when due, else wait.
+    for (id, used) in [(&b, 5), (&c, 20)] {
+        f.read(id, main_quota(used, 10), later - 30);
+        f.engine.verified_now.remove(id);
+    }
+    assert_eq!(f.engine.automation(later, &policy), CodexAutomation::Idle);
+    for (id, used) in [(&b, 5), (&c, 20)] {
+        f.read(id, main_quota(used, 10), later - 1000);
+        f.engine.verified_now.remove(id);
+    }
+    assert_eq!(
+        f.engine.automation(later, &policy),
+        CodexAutomation::Refresh(b.clone())
+    );
+    // A due account further down the ranking is read when the better ones are not due.
+    f.read(&b, main_quota(5, 10), later - 30);
+    f.engine.verified_now.remove(&b);
+    assert_eq!(
+        f.engine.automation(later, &policy),
+        CodexAutomation::Refresh(c.clone())
+    );
+    let _ = key;
+}
+
+#[tokio::test]
+async fn a_return_whose_target_lost_its_verification_is_refused_by_the_write_guard() {
+    let (mut f, _a, b, c, key, later) = engaged_with_two_candidates().await;
+    let policy = CodexPolicy::default();
+    // The plan was made for b; b then loses its verification (a later reply without an
+    // account id), and c is the one that qualifies now: the plan is stale.
+    let plan = plan_of(f.engine.automation(later, &policy));
+    assert_eq!(plan.target_id, b);
+    f.read(&b, main_quota(5, 10), later - 30);
+    f.engine.verified_now.remove(&b);
+    assert_refused(&mut f, &plan, &policy, later, &key);
+    // Nobody qualifies any more: refused as well.
+    f.read(&c, main_quota(20, 10), later - 30);
+    f.engine.verified_now.remove(&c);
+    assert_refused(&mut f, &plan, &policy, later, &key);
+    f.claude_untouched();
+}
+
+#[tokio::test]
+async fn a_failed_save_of_the_fallback_setting_changes_nothing_and_a_retry_writes_again() {
+    let (mut f, _a, _b, key) = exhausted_world(false).await;
+    let policy = CodexPolicy::default();
+    let on = |f: &Fixture| {
+        let index = f.engine.account_index(&key).unwrap();
+        f.engine.saved.accounts[index].fallback
+    };
+    f.set_fallback(&key, false).await.unwrap();
+    // Turning it on while the state cannot be written: still off in memory, so the
+    // scheduler does not act on it (the setting is changed on the engine itself here,
+    // without the command wrapper that restores a checkpoint).
+    f.break_vault();
+    assert_eq!(
+        f.engine.set_api_key_fallback(&key, true, &f.vault).err(),
+        Some(CodexReason::VaultUnavailable)
+    );
+    assert!(!on(&f));
+    let seen = f.engine.automation(NOW, &policy);
+    assert!(
+        matches!(seen, CodexAutomation::Exhausted { .. }),
+        "{seen:?}"
+    );
+    // The same request again is written, not answered with "nothing to do".
+    f.fix_vault();
+    assert!(!f.saved_state().accounts.iter().any(|a| a.fallback));
+    f.engine.set_api_key_fallback(&key, true, &f.vault).unwrap();
+    assert!(on(&f) && f.saved_state().accounts.iter().any(|a| a.fallback));
+    // Turning it off while the state cannot be written: still on in memory and on disk.
+    f.break_vault();
+    assert_eq!(
+        f.engine.set_api_key_fallback(&key, false, &f.vault).err(),
+        Some(CodexReason::VaultUnavailable)
+    );
+    assert!(on(&f));
+    f.fix_vault();
+    assert!(f.saved_state().accounts.iter().any(|a| a.fallback));
+    f.engine
+        .set_api_key_fallback(&key, false, &f.vault)
+        .unwrap();
+    assert!(!on(&f) && !f.saved_state().accounts.iter().any(|a| a.fallback));
+}
+
+#[tokio::test]
+async fn through_the_command_a_failed_save_leaves_the_setting_unchanged_and_the_scheduler_off() {
+    let (mut f, _a, _b, key) = exhausted_world(false).await;
+    f.set_fallback(&key, false).await.unwrap();
+    f.break_vault();
+    assert_eq!(
+        f.set_fallback(&key, true).await.err(),
+        Some(CodexReason::VaultUnavailable)
+    );
+    let index = f.engine.account_index(&key).unwrap();
+    assert!(!f.engine.saved.accounts[index].fallback);
+    // The engine is read-only now: no automatic switch of any kind.
+    assert_eq!(
+        f.engine.automation(NOW, &CodexPolicy::default()),
+        CodexAutomation::Idle
+    );
+}

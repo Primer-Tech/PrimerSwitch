@@ -564,5 +564,7 @@ export const en = {
     'A Codex session started while this key is active with Flex fails on ChatGPT after the automatic return until you start a new one.',
   codexFallbackBanner:
     'Using API key {name} (billed per token) since {time} because every ChatGPT account is at its limit. PrimerSwitch returns automatically when one recovers.',
+  codexFallbackBannerPaused:
+    'Using API key {name} (billed per token) since {time}. Automatic switching is off, so PrimerSwitch will not return by itself. Turn it on in the automation settings, or switch back yourself.',
   codexFallbackSwitchBack: 'Switch back now',
 } as const;

@@ -42,12 +42,15 @@ export type CodexNotice =
       daemonRestarted: boolean;
       otherClients: number;
       warning: CodexReason | null;
+      /** The switch turned Flex on or off again, to tell the owner what it means. */
+      flex: 'on' | 'off' | null;
     };
 export type CodexPending =
   | 'codex_discover'
   | 'codex_import_current'
   | 'codex_import_switcher'
   | 'codex_add_api_key'
+  | 'codex_set_api_key_flex'
   | 'codex_refresh_account'
   | 'codex_consume_reset'
   | 'codex_refresh_all'
@@ -82,6 +85,7 @@ type SnapshotCommand =
   | 'codex_refresh_all'
   | 'codex_delete_account'
   | 'codex_update_account_automation'
+  | 'codex_set_api_key_flex'
   | 'codex_resume_automatic_returns';
 const capabilityFor = {
   codex_discover: null,
@@ -91,6 +95,7 @@ const capabilityFor = {
   codex_refresh_all: 'refreshQuota',
   codex_delete_account: 'deleteSaved',
   codex_update_account_automation: null,
+  codex_set_api_key_flex: null,
   codex_resume_automatic_returns: 'switchAccount',
 } as const satisfies Record<
   SnapshotCommand,
@@ -231,6 +236,12 @@ export function createCodexController(bridge: CodexBridge = codexNativeBridge) {
       if (!account) return false;
       if (command === 'codex_refresh_account' && account.authKind !== 'chatgpt')
         return false;
+      // Flex is a setting of an API key, and only while the native side allows it.
+      if (
+        command === 'codex_set_api_key_flex' &&
+        (account.authKind !== 'apiKey' || !account.flex?.enabled)
+      )
+        return false;
       // The account Codex is signed in with cannot be removed; switch away first.
       if (
         command === 'codex_delete_account' &&
@@ -342,6 +353,7 @@ export function createCodexController(bridge: CodexBridge = codexNativeBridge) {
           daemonRestarted: outcome.daemonRestarted,
           otherClients: outcome.otherClients,
           warning: outcome.error,
+          flex: outcome.flex ?? null,
         },
       });
       return true;
@@ -516,6 +528,8 @@ export function createCodexController(bridge: CodexBridge = codexNativeBridge) {
     importCurrent: () => action('codex_import_current'),
     importSwitcher: () => action('codex_import_switcher'),
     addApiKey,
+    setApiKeyFlex: (id: string, enabled: boolean) =>
+      action('codex_set_api_key_flex', { id, enabled }),
     refreshAccount: (id: string) => action('codex_refresh_account', { id }),
     refreshAll: () => action('codex_refresh_all'),
     deleteAccount: (id: string) => action('codex_delete_account', { id }),

@@ -140,6 +140,16 @@ impl RuntimeHandle {
         self.codex_snapshot_command(CodexCommand::AddApiKey(name.into(), key))
             .await
     }
+    /// Turn Flex processing on or off for a saved API key (see `CodexEngine::set_api_key_flex`).
+    pub async fn codex_set_api_key_flex(
+        &self,
+        id: &str,
+        enabled: bool,
+    ) -> Result<CodexSnapshot, CodexReason> {
+        let _job = self.codex_job_lock().await?;
+        self.codex_snapshot_command(CodexCommand::SetApiKeyFlex(id.into(), enabled))
+            .await
+    }
     pub async fn codex_delete_account(&self, id: &str) -> Result<CodexSnapshot, CodexReason> {
         let _job = self.codex_job_lock().await?;
         self.codex_snapshot_command(CodexCommand::Delete(id.into()))
@@ -628,6 +638,7 @@ mod tests {
             daemon_restarted,
             other_clients: 0,
             error,
+            flex: None,
         }
     }
     #[test]

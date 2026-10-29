@@ -536,4 +536,18 @@ export const en = {
     'The reset result could not be confirmed. Check the previous reset to recover its result.',
   codexReason_invalidApiKey:
     'Enter a name of up to 60 characters and a valid OpenAI API key, which starts with sk-. Nothing was saved.',
+  codexReason_flexUnsupportedVersion:
+    'Flex needs Codex 0.163.0 or newer. Update Codex to use it.',
+  codexReason_flexConfigFailed:
+    "Flex could not be turned on because Codex's config.toml could not be updated. Nothing was changed.",
+  codexReason_flexRestoreFailed:
+    "Flex is still set in Codex's config.toml. A session started now can fail on ChatGPT with 'Unsupported service_tier: flex'. PrimerSwitch tries again every minute.",
+  codexFlexLabel: 'Use Flex processing',
+  codexFlexHelp:
+    'Cheaper, but slower, and a request can fail when Flex capacity is full; Codex does not retry that error. Only for this API key. Sessions that are already open keep their current tier.',
+  codexFlexTag: 'Flex',
+  codexFlexOn:
+    'Flex is on. New Codex sessions use Flex; sessions that are already open keep their tier.',
+  codexFlexOff:
+    "Flex is off again. A session started while Flex was on can fail on ChatGPT with 'Unsupported service_tier: flex'; start a new session.",
 } as const;

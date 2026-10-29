@@ -1,9 +1,11 @@
 //! Opaque FILE-mode Codex storage (Codex >= 0.160.0). No network or Codex execution.
+mod config_flex;
 mod context;
 mod generation;
 mod process;
 mod store;
 
+pub use config_flex::{CodexConfigFlex, FlexMark};
 pub use context::{
     CodexContextEvidence, CodexFileContext, CodexPolicyState, CodexProviderMode, CodexSourceRole,
     CodexStorageMode, CodexWatchedSource, create_private_context, read_private_auth,

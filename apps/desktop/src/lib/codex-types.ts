@@ -29,6 +29,9 @@ export const codexReasonSchema = z.enum([
   'resetUnconfirmed',
   'invalidAutomation',
   'invalidApiKey',
+  'flexUnsupportedVersion',
+  'flexConfigFailed',
+  'flexRestoreFailed',
 ]);
 export type CodexReason = z.infer<typeof codexReasonSchema>;
 export const codexResetOutcomeSchema = z.enum([
@@ -94,6 +97,10 @@ export const codexAccountSchema = z
     identityVerified: z.boolean(),
     selected: z.boolean(),
     switchable: codexCapabilitySchema,
+    /** API key only: Codex's service tier is Flex while this key is the active login. */
+    useFlex: z.boolean().optional(),
+    /** Whether the Flex setting can be changed now, and why not. */
+    flex: codexCapabilitySchema.optional(),
     quota: z
       .object({
         ordinaryUsageAllowed: z.boolean().nullable(),
@@ -152,6 +159,8 @@ const lastSwitchSchema = z
     daemonRestarted: z.boolean(),
     otherClients: z.number().int().nonnegative(),
     error: codexReasonSchema.nullable(),
+    /** The switch turned Flex on (to a Flex key) or off again (away from one). */
+    flex: z.enum(['on', 'off']).nullable().optional(),
   })
   .strict();
 const environmentSchema = z

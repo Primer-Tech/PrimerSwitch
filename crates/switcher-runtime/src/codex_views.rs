@@ -36,6 +36,13 @@ pub enum CodexReason {
     NoResetCredits,
     /// An uncertain redemption must be retried with its original durable key.
     ResetUnconfirmed,
+    /// This Codex is older than 0.163.0, the first version Flex was verified on.
+    FlexUnsupportedVersion,
+    /// `service_tier` could not be set in Codex's config.toml, so nothing was switched.
+    FlexConfigFailed,
+    /// `service_tier` could not be put back; it is retried, and a session started now can
+    /// fail on a ChatGPT login.
+    FlexRestoreFailed,
 }
 impl std::fmt::Display for CodexReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -175,6 +182,10 @@ pub struct CodexAccountView {
     pub identity_verified: bool,
     pub selected: bool,
     pub switchable: CodexCapability,
+    /// The API key uses Flex processing while it is the active login.
+    pub use_flex: bool,
+    /// Whether the Flex setting of this account can be changed now, and why not.
+    pub flex: CodexCapability,
     pub quota: Option<CodexQuotaView>,
     pub quota_read_at: Option<i64>,
     pub quota_state: CodexQuotaState,
@@ -260,6 +271,15 @@ pub struct CodexLastSwitchView {
     /// Codex processes with their own login that keep the previous account.
     pub other_clients: u32,
     pub error: Option<CodexReason>,
+    /// The switch turned Flex on (to a Flex key) or off again (away from one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flex: Option<CodexFlexChange>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CodexFlexChange {
+    On,
+    Off,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

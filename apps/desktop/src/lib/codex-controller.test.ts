@@ -340,6 +340,7 @@ describe('Codex one-call switching', () => {
       daemonRestarted: true,
       otherClients: 2,
       warning: null,
+      flex: null,
     });
     expect(get(c).snapshot?.selectedId).toBe('codex-research');
     expect(get(c).snapshot?.switching).toBeNull();
@@ -589,6 +590,97 @@ describe('Codex API keys', () => {
     };
     extra.accounts[3].apiKey = FAKE_KEY;
     expect(codexSnapshotSchema.safeParse(extra).success).toBe(false);
+  });
+});
+describe('Codex Flex processing', () => {
+  const withKey = (overrides = {}, revision = 1) => {
+    const raw = codexSnapshot({ revision });
+    raw.accounts.push(codexApiKeyAccount('codex-key', overrides));
+    return raw;
+  };
+  it('turns Flex on or off for an API key in one native call', async () => {
+    const { c, call } = setup(withKey());
+    await c.start();
+    call.mockResolvedValueOnce(withKey({ useFlex: true }, 2));
+    expect(await c.setApiKeyFlex('codex-key', true)).toBe(true);
+    expect(call).toHaveBeenLastCalledWith('codex_set_api_key_flex', {
+      id: 'codex-key',
+      enabled: true,
+    });
+    expect(get(c).snapshot?.accounts[3].useFlex).toBe(true);
+    expect(get(c).pending).toBeNull();
+    call.mockResolvedValueOnce(withKey({ useFlex: false }, 3));
+    expect(await c.setApiKeyFlex('codex-key', false)).toBe(true);
+    expect(call).toHaveBeenLastCalledWith('codex_set_api_key_flex', {
+      id: 'codex-key',
+      enabled: false,
+    });
+  });
+  it('is refused for a ChatGPT account, an unknown account or a blocked option', async () => {
+    const { c, call } = setup(
+      withKey({ flex: codexCapability('flexUnsupportedVersion') }),
+    );
+    await c.start();
+    const before = call.mock.calls.length;
+    expect(await c.setApiKeyFlex('codex-key', true)).toBe(false);
+    expect(await c.setApiKeyFlex('codex-studio', true)).toBe(false);
+    expect(await c.setApiKeyFlex('missing', true)).toBe(false);
+    expect(call.mock.calls.length).toBe(before);
+  });
+  it('shows a stable reason when the native side refuses, and keeps the old setting', async () => {
+    const { c, call } = setup(withKey());
+    await c.start();
+    call.mockRejectedValueOnce('flexConfigFailed');
+    expect(await c.setApiKeyFlex('codex-key', true)).toBe(false);
+    expect(get(c).error).toBe('flexConfigFailed');
+    expect(get(c).snapshot?.accounts[3].useFlex).toBe(false);
+    call.mockRejectedValueOnce(new Error('could not write the codex config'));
+    expect(await c.setApiKeyFlex('codex-key', true)).toBe(false);
+    expect(get(c).error).toBe('actionFailed');
+  });
+  it('carries what a switch did to Flex into its notice', async () => {
+    const { c, call, event } = setup(withKey({ useFlex: true }));
+    await c.start();
+    let revision = 1;
+    for (const flex of ['on', 'off', null] as const) {
+      // ChatGPT is active before each switch to the key.
+      event(withKey({ useFlex: true }, (revision += 2)));
+      const raw = withKey({ useFlex: true }, revision + 1);
+      raw.selectedId = 'codex-key';
+      raw.accounts.forEach((a) => (a.selected = a.id === 'codex-key'));
+      raw.lastSwitch = {
+        accountId: 'codex-key',
+        at: Math.floor(Date.now() / 1000),
+        daemonRestarted: true,
+        otherClients: 0,
+        error: flex === null ? 'flexRestoreFailed' : null,
+        ...(flex ? { flex } : {}),
+      };
+      call.mockResolvedValueOnce(raw);
+      expect(await c.switchAccount(get(c).snapshot!.accounts[3])).toBe(true);
+      expect(get(c).notice).toMatchObject({
+        kind: 'switched',
+        flex,
+        warning: flex === null ? 'flexRestoreFailed' : null,
+      });
+    }
+  });
+  it('accepts the Flex fields and rejects unknown ones', () => {
+    const raw = withKey({ useFlex: true });
+    raw.lastSwitch = {
+      accountId: 'codex-key',
+      at: 1,
+      daemonRestarted: true,
+      otherClients: 0,
+      error: null,
+      flex: 'on',
+    };
+    expect(codexSnapshotSchema.safeParse(raw).success).toBe(true);
+    const unknown = structuredClone(raw) as unknown as {
+      lastSwitch: Record<string, unknown>;
+    };
+    unknown.lastSwitch.flex = 'fast';
+    expect(codexSnapshotSchema.safeParse(unknown).success).toBe(false);
   });
 });
 describe('Codex managed browser sign-in', () => {

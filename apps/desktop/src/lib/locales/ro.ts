@@ -554,4 +554,18 @@ export const ro: Record<keyof typeof en, string> = {
     'Rezultatul resetării nu a putut fi confirmat. Verifică resetarea anterioară pentru a recupera rezultatul.',
   codexReason_invalidApiKey:
     'Introdu un nume de cel mult 60 de caractere și o cheie API OpenAI validă, care începe cu sk-. Nu s-a salvat nimic.',
+  codexReason_flexUnsupportedVersion:
+    'Flex necesită Codex 0.163.0 sau mai nou. Actualizează Codex ca să-l folosești.',
+  codexReason_flexConfigFailed:
+    'Flex nu a putut fi activat, pentru că fișierul config.toml al Codex nu a putut fi actualizat. Nu s-a schimbat nimic.',
+  codexReason_flexRestoreFailed:
+    "Flex este încă setat în config.toml al Codex. O sesiune pornită acum poate eșua pe ChatGPT cu 'Unsupported service_tier: flex'. PrimerSwitch încearcă din nou în fiecare minut.",
+  codexFlexLabel: 'Folosește procesarea Flex',
+  codexFlexHelp:
+    'Mai ieftin, dar mai lent, iar o cerere poate eșua când capacitatea Flex este plină; Codex nu reîncearcă această eroare. Doar pentru această cheie API. Sesiunile deja deschise își păstrează nivelul curent.',
+  codexFlexTag: 'Flex',
+  codexFlexOn:
+    'Flex este activ. Sesiunile Codex noi folosesc Flex; sesiunile deja deschise își păstrează nivelul.',
+  codexFlexOff:
+    "Flex este dezactivat din nou. O sesiune pornită cât timp Flex era activ poate eșua pe ChatGPT cu 'Unsupported service_tier: flex'; pornește o sesiune nouă.",
 };

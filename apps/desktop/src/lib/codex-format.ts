@@ -35,6 +35,9 @@ const reasonKeys: Record<CodexReason, MessageKey> = {
   resetUnavailable: 'codexReason_resetUnavailable',
   noResetCredits: 'codexReason_noResetCredits',
   resetUnconfirmed: 'codexReason_resetUnconfirmed',
+  flexUnsupportedVersion: 'codexReason_flexUnsupportedVersion',
+  flexConfigFailed: 'codexReason_flexConfigFailed',
+  flexRestoreFailed: 'codexReason_flexRestoreFailed',
 };
 export function codexResetOutcome(
   outcome: CodexResetOutcome,

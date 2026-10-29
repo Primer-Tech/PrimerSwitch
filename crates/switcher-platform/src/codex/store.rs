@@ -248,7 +248,7 @@ fn validate_auth(bytes: &[u8]) -> CodexResult<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::codex::{
         CodexContextEvidence, CodexPolicyState, CodexProviderMode, CodexSourceRole,

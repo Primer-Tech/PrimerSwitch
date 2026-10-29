@@ -1,4 +1,5 @@
 import {
+  cleanup,
   fireEvent,
   render,
   screen,
@@ -1171,5 +1172,173 @@ describe('Codex API key accounts', () => {
     expect(save).toHaveTextContent('Salvează cheia');
     expect(dialog).toHaveTextContent('Începe cu sk-');
     expect(dialog).toHaveTextContent('o alegi tu cu Comută');
+  });
+});
+
+async function openDetails(name: string, locale: 'en' | 'ro' = 'en') {
+  const menu = within(row(name)).getByRole('button', {
+    name: t(locale, 'moreLabel', { name }),
+  });
+  await fireEvent.click(menu);
+  const items = within(
+    document.getElementById(menu.getAttribute('aria-controls')!)!,
+  );
+  await fireEvent.click(
+    items.getByRole('button', { name: t(locale, 'viewDetails') }),
+  );
+  return within(screen.getByRole('dialog'));
+}
+describe('Codex Flex processing', () => {
+  it('turns Flex on for an API key from its details, with the cost and session warning', async () => {
+    const { call } = await setup(withKey());
+    const dialog = await openDetails('Work key');
+    const toggle = dialog.getByRole('switch', { name: /Use Flex processing/ });
+    expect(toggle).not.toBeChecked();
+    expect(toggle).toBeEnabled();
+    const help = dialog.getByText(/Cheaper, but slower/);
+    expect(help).toHaveTextContent('a request can fail when Flex capacity');
+    expect(help).toHaveTextContent('Codex does not retry that error');
+    expect(help).toHaveTextContent('Only for this API key');
+    expect(help).toHaveTextContent(
+      'Sessions that are already open keep their current tier.',
+    );
+    expect(toggle).toHaveAccessibleDescription(help.textContent!);
+    call.mockResolvedValueOnce(
+      withKey(codexSnapshot({ revision: 2 }), { useFlex: true }),
+    );
+    await fireEvent.click(toggle);
+    expect(call).toHaveBeenLastCalledWith('codex_set_api_key_flex', {
+      id: 'codex-key',
+      enabled: true,
+    });
+    await waitFor(() =>
+      expect(
+        dialog.getByRole('switch', { name: /Use Flex processing/ }),
+      ).toBeChecked(),
+    );
+    // The key's row says it uses Flex.
+    expect(
+      within(row('Work key')).getByText('API key …cdef · Flex'),
+    ).toBeVisible();
+    // And off again.
+    call.mockResolvedValueOnce(withKey(codexSnapshot({ revision: 3 })));
+    await fireEvent.click(
+      dialog.getByRole('switch', { name: /Use Flex processing/ }),
+    );
+    expect(call).toHaveBeenLastCalledWith('codex_set_api_key_flex', {
+      id: 'codex-key',
+      enabled: false,
+    });
+    noKey();
+  });
+  it('shows no Flex option for a ChatGPT account', async () => {
+    await setup(withKey());
+    const dialog = await openDetails('studio@example.invalid');
+    expect(dialog.queryByRole('switch', { name: /Flex/ })).toBeNull();
+    expect(dialog.queryByText(/Cheaper, but slower/)).toBeNull();
+  });
+  it('explains why the option or the switch is blocked', async () => {
+    const raw = withKey(codexSnapshot(), {
+      flex: codexCapability('flexUnsupportedVersion'),
+    });
+    await setup(raw);
+    const dialog = await openDetails('Work key');
+    expect(
+      dialog.getByRole('switch', { name: /Use Flex processing/ }),
+    ).toBeDisabled();
+    expect(
+      dialog.getByText(
+        'Flex needs Codex 0.163.0 or newer. Update Codex to use it.',
+      ),
+    ).toBeVisible();
+  });
+  it('keeps a Flex key that cannot be set from being switched to, and lets Flex be turned off', async () => {
+    const raw = withKey(codexSnapshot(), {
+      useFlex: true,
+      switchable: codexCapability('flexUnsupportedVersion'),
+    });
+    const { call } = await setup(raw);
+    expect(
+      within(row('Work key')).getByRole('button', { name: 'Switch' }),
+    ).toBeDisabled();
+    const dialog = await openDetails('Work key');
+    const toggle = dialog.getByRole('switch', { name: /Use Flex processing/ });
+    expect(toggle).toBeChecked();
+    expect(toggle).toBeEnabled();
+    call.mockResolvedValueOnce(withKey(codexSnapshot({ revision: 2 })));
+    await fireEvent.click(toggle);
+    expect(call).toHaveBeenLastCalledWith('codex_set_api_key_flex', {
+      id: 'codex-key',
+      enabled: false,
+    });
+  });
+  it('shows a stable reason when the config cannot be changed and keeps the setting off', async () => {
+    const { call } = await setup(withKey());
+    const dialog = await openDetails('Work key');
+    call.mockRejectedValueOnce('flexConfigFailed');
+    await fireEvent.click(
+      dialog.getByRole('switch', { name: /Use Flex processing/ }),
+    );
+    expect(
+      await screen.findByText(
+        /Flex could not be turned on because Codex's config\.toml/,
+      ),
+    ).toBeVisible();
+    await waitFor(() =>
+      expect(
+        dialog.getByRole('switch', { name: /Use Flex processing/ }),
+      ).not.toBeChecked(),
+    );
+    noKey();
+  });
+  it('tells the owner what a switch did to Flex, in English and Romanian', async () => {
+    for (const [locale, on, off] of [
+      [
+        'en',
+        'Flex is on. New Codex sessions use Flex; sessions that are already open keep their tier.',
+        "Flex is off again. A session started while Flex was on can fail on ChatGPT with 'Unsupported service_tier: flex'; start a new session.",
+      ],
+      [
+        'ro',
+        'Flex este activ. Sesiunile Codex noi folosesc Flex; sesiunile deja deschise își păstrează nivelul.',
+        "Flex este dezactivat din nou. O sesiune pornită cât timp Flex era activ poate eșua pe ChatGPT cu 'Unsupported service_tier: flex'; pornește o sesiune nouă.",
+      ],
+    ] as const) {
+      const { call } = await setup(
+        withKey(codexSnapshot(), { useFlex: true }),
+        locale,
+      );
+      call.mockResolvedValueOnce(
+        withKey(switched('codex-key', 2, { flex: 'on' }), { useFlex: true }),
+      );
+      await fireEvent.click(
+        within(row('Work key')).getByRole('button', {
+          name: t(locale, 'switch'),
+        }),
+      );
+      expect(await screen.findByText(on)).toBeVisible();
+      call.mockResolvedValueOnce(
+        withKey(switched('codex-studio', 3, { flex: 'off' }), {
+          useFlex: true,
+        }),
+      );
+      await fireEvent.click(
+        within(row('studio@example.invalid')).getByRole('button', {
+          name: t(locale, 'switch'),
+        }),
+      );
+      expect(await screen.findByText(off)).toBeVisible();
+      cleanup();
+      language.set('en');
+    }
+  });
+  it('warns while a restore is pending and never shows a secret', async () => {
+    const raw = withKey(codexSnapshot());
+    raw.warnings = ['flexRestoreFailed'];
+    await setup(raw);
+    expect(
+      await screen.findByText(t('en', 'codexReason_flexRestoreFailed')),
+    ).toBeVisible();
+    noKey();
   });
 });

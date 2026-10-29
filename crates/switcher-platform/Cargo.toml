@@ -14,6 +14,8 @@ zeroize.workspace = true
 fs2.workspace = true
 tempfile.workspace = true
 chacha20poly1305 = "0.10.1"
+# Reads config.toml with source spans only; the file is edited as bytes, never re-serialized.
+toml_edit = { version = "=0.25.15", default-features = false, features = ["parse"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_System_Memory", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_Storage_FileSystem", "Wdk_System_Threading", "Win32_System_Diagnostics_Debug"] }

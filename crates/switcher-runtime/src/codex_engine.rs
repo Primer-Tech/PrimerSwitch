@@ -236,6 +236,12 @@ struct SavedAccount {
     preferred_return_reset_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     preferred_return_handled_reset_at: Option<i64>,
+    /// API key only: Codex's `service_tier` is "flex" while this key is the active login.
+    #[serde(default, skip_serializing_if = "is_false")]
+    use_flex: bool,
+}
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 impl Drop for SavedAccount {
     fn drop(&mut self) {
@@ -300,6 +306,10 @@ struct Saved {
     return_hold_until: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_auto_switch_at: Option<i64>,
+    /// Set while PrimerSwitch has put `service_tier = "flex"` into Codex's config.toml:
+    /// what to put back, kept across restarts so a crash never leaves Flex on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    flex_applied: Option<FlexMark>,
 }
 impl Default for Saved {
     fn default() -> Self {
@@ -308,6 +318,7 @@ impl Default for Saved {
             accounts: Vec::new(),
             return_hold_until: None,
             last_auto_switch_at: None,
+            flex_applied: None,
         }
     }
 }
@@ -629,6 +640,8 @@ pub(crate) enum CodexCommand {
     ImportSwitcher,
     /// Display name and the typed key; the key is wiped when the command is dropped.
     AddApiKey(String, Zeroizing<String>),
+    /// Turn Flex processing on or off for one saved API key.
+    SetApiKeyFlex(String, bool),
     Delete(String),
     UpdateAccountAutomation(String, AccountAutomationView),
     ResumeAutomaticReturns,
@@ -662,6 +675,10 @@ pub(crate) struct CodexEngine {
     demo: bool,
     switching: Option<CodexSwitchView>,
     last_switch: Option<CodexLastSwitchView>,
+    /// Flex change made by the switch in progress, reported with its outcome.
+    flex_notice: Option<CodexFlexChange>,
+    /// Why the last attempt to turn Flex on for the active Flex key failed.
+    flex_apply_failed: Option<CodexReason>,
     environment: CodexEnvironmentView,
     switcher_available: bool,
     discovered_at: Option<i64>,
@@ -724,6 +741,8 @@ impl CodexEngine {
             demo,
             switching: None,
             last_switch: None,
+            flex_notice: None,
+            flex_apply_failed: None,
             environment: CodexEnvironmentView::default(),
             switcher_available: false,
             discovered_at: None,
@@ -798,6 +817,7 @@ impl CodexEngine {
                 automation: AccountAutomation::default(),
                 preferred_return_reset_at: None,
                 preferred_return_handled_reset_at: None,
+                use_flex: false,
             });
             engine.verified_now.insert(id);
         }
@@ -896,8 +916,9 @@ impl CodexEngine {
             } else if account.auth_kind == AuthKind::Unsupported {
                 Some(CodexReason::UnsupportedAuth)
             } else if account.auth_kind == AuthKind::ApiKey {
-                // A key has no sign-in to expire and no workspace to verify.
-                None
+                // A key has no sign-in to expire and no workspace to verify. A Flex key
+                // is only switched to when Flex can be set: never at the standard tier.
+                account.use_flex.then(|| self.flex_block()).flatten()
             } else if account.needs_sign_in {
                 Some(CodexReason::SignInRequired)
             } else if !account.binding.complete() {
@@ -907,6 +928,121 @@ impl CodexEngine {
             }
         });
         reason.map_or_else(CodexCapability::allowed, CodexCapability::blocked)
+    }
+    /// Why Flex cannot be set now: no qualified Codex home, or a Codex older than the
+    /// first version it was verified on.
+    fn flex_block(&self) -> Option<CodexReason> {
+        self.store().err().or_else(|| {
+            self.installation
+                .as_ref()
+                .is_some_and(|installation| !supports_flex(&installation.version))
+                .then_some(CodexReason::FlexUnsupportedVersion)
+        })
+    }
+    /// Whether the Flex setting of `account` can be changed. Turning it off is always
+    /// possible; turning it on needs [`Self::flex_block`] to be clear.
+    fn flex_capability(&self, account: &SavedAccount) -> CodexCapability {
+        let reason = self.common_block().or_else(|| {
+            if self.switching.is_some() {
+                Some(CodexReason::SwitchInProgress)
+            } else if account.auth_kind != AuthKind::ApiKey {
+                Some(CodexReason::UnsupportedAuth)
+            } else if account.use_flex {
+                None
+            } else {
+                self.flex_block()
+            }
+        });
+        reason.map_or_else(CodexCapability::allowed, CodexCapability::blocked)
+    }
+    /// The active login is an API key that uses Flex.
+    fn flex_wanted(&self) -> bool {
+        self.selected()
+            .is_some_and(|account| account.auth_kind == AuthKind::ApiKey && account.use_flex)
+    }
+    /// Flex is set but the active login is not a Flex key: ChatGPT rejects it.
+    fn flex_restore_pending(&self) -> bool {
+        self.saved.flex_applied.is_some() && !self.flex_wanted()
+    }
+    fn flex_config(&self) -> Result<CodexConfigFlex, CodexReason> {
+        Ok(CodexConfigFlex::new(self.store()?.context().clone()))
+    }
+    /// Set `service_tier = "flex"` and record what to put back, durably, before anything
+    /// depends on it. Does nothing while this app's own setting is still in place.
+    fn apply_flex(&mut self, vault: &Vault) -> Result<(), CodexReason> {
+        let config = self
+            .flex_config()
+            .map_err(|_| CodexReason::FlexConfigFailed)?;
+        if self.saved.flex_applied.is_some()
+            && config
+                .current()
+                .is_ok_and(|value| value.as_deref() == Some("flex"))
+        {
+            return Ok(());
+        }
+        let mark = config
+            .apply(vault)
+            .map_err(|_| CodexReason::FlexConfigFailed)?;
+        let before = self.saved.flex_applied.replace(mark.clone());
+        if let Err(error) = self.save(vault) {
+            // Without a durable mark Flex would outlive a crash: undo it.
+            self.saved.flex_applied = before;
+            let _ = config.restore(&mark, vault);
+            return Err(error);
+        }
+        // The new file is a normal Codex config: take it as the qualified state.
+        let _ = self.requalify();
+        Ok(())
+    }
+    /// Put the saved `service_tier` back unless the owner changed it since. A failure
+    /// keeps the mark, so it is retried. Returns whether Flex is off in the file now.
+    fn restore_flex(&mut self, vault: &Vault) -> Result<bool, CodexReason> {
+        let Some(mark) = self.saved.flex_applied.clone() else {
+            return Ok(false);
+        };
+        let off = self
+            .flex_config()
+            .ok()
+            .and_then(|config| config.restore(&mark, vault).ok())
+            .ok_or(CodexReason::FlexRestoreFailed)?;
+        self.saved.flex_applied = None;
+        self.save(vault)?;
+        let _ = self.requalify();
+        Ok(off)
+    }
+    /// Make config.toml agree with the active login: Flex is on exactly while a Flex key
+    /// is active. Runs at startup, after every observed change of the login (also one
+    /// made outside the app), after a toggle and as the retry of a failed restore.
+    fn reconcile_flex(&mut self, vault: &Vault) -> Result<(), CodexReason> {
+        if self.demo || !self.writable || self.switching.is_some() || self.store().is_err() {
+            return Ok(());
+        }
+        let result = match (self.flex_wanted(), self.saved.flex_applied.is_some()) {
+            (false, true) => self.restore_flex(vault).map(|_| ()),
+            (true, false) => match self.flex_block() {
+                Some(reason) => Err(reason),
+                None => self.apply_flex(vault),
+            },
+            _ => Ok(()),
+        };
+        self.flex_apply_failed = result.err();
+        result
+    }
+    /// The Flex part of a switch, done before the login file is written: on for a Flex
+    /// key (a failure aborts the switch, which would otherwise bill the standard tier),
+    /// off again when leaving Flex (a failure never blocks the switch).
+    fn switch_flex(&mut self, to_flex: bool, vault: &Vault) -> Result<(), CodexReason> {
+        if to_flex {
+            self.apply_flex(vault)?;
+            self.flex_notice = Some(CodexFlexChange::On);
+        } else if self.saved.flex_applied.is_some() {
+            match self.restore_flex(vault) {
+                Ok(off) => self.flex_notice = off.then_some(CodexFlexChange::Off),
+                Err(CodexReason::FlexRestoreFailed) => (),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
     }
     fn selected(&self) -> Option<&SavedAccount> {
         let id = self.selected_id.as_deref()?;
@@ -1217,6 +1353,16 @@ impl CodexEngine {
         if !self.demo && ContextPaths::credential_overrides_present() {
             result.warnings.push(CodexReason::ExternalCredentials);
         }
+        if !self.demo && self.flex_restore_pending() {
+            result.warnings.push(CodexReason::FlexRestoreFailed);
+        }
+        if let Some(reason) = self.flex_apply_failed
+            && !self.demo
+            && self.flex_wanted()
+            && self.saved.flex_applied.is_none()
+        {
+            result.warnings.push(reason);
+        }
         let common = self.common_block();
         let capability = |reason: Option<CodexReason>| {
             reason.map_or_else(CodexCapability::allowed, CodexCapability::blocked)
@@ -1276,6 +1422,8 @@ impl CodexEngine {
                         .flatten(),
                     selected: self.selected_id.as_ref() == Some(&account.id),
                     switchable: self.switch_capability(account),
+                    use_flex: account.use_flex,
+                    flex: self.flex_capability(account),
                     quota: account.quota.clone(),
                     quota_read_at: account.quota_read_at,
                     quota_state: self.quota_state(account, now),
@@ -1362,6 +1510,9 @@ impl CodexEngine {
             }
             CodexCommand::AddApiKey(name, key) => {
                 self.add_api_key(&name, &key, vault, now)?;
+            }
+            CodexCommand::SetApiKeyFlex(id, enabled) => {
+                self.set_api_key_flex(&id, enabled, vault)?;
             }
             CodexCommand::Delete(id) => {
                 if self.pending_login.is_some() || self.switching.is_some() {
@@ -1486,9 +1637,19 @@ impl CodexEngine {
             codex_switcher_running: summary.switcher_running,
         };
     }
+    /// Follow the live login (see [`Self::observe_login`]) and then make config.toml agree
+    /// with it: Flex is never left on for a login that is not a Flex key, and a failed
+    /// restore is retried here on every tick.
+    pub(crate) fn observe(&mut self, vault: &Vault, now: i64) -> Result<(), CodexReason> {
+        let observed = self.observe_login(vault, now);
+        // A Flex failure is reported through the snapshot's warnings, not as an error
+        // of following the login.
+        let _ = self.reconcile_flex(vault);
+        observed
+    }
     /// Track the live auth.json: adopt Codex's token rotations into the saved record,
     /// keep an external `codex login` as a new saved account, and repair a hybrid file.
-    pub(crate) fn observe(&mut self, vault: &Vault, now: i64) -> Result<(), CodexReason> {
+    fn observe_login(&mut self, vault: &Vault, now: i64) -> Result<(), CodexReason> {
         if self.demo || !self.writable || self.switching.is_some() {
             return Ok(());
         }
@@ -1617,6 +1778,7 @@ impl CodexEngine {
             automation: AccountAutomation::default(),
             preferred_return_reset_at: None,
             preferred_return_handled_reset_at: None,
+            use_flex: false,
         });
         Ok(self.saved.accounts.len() - 1)
     }
@@ -1964,6 +2126,46 @@ impl CodexEngine {
         let index = self.adopt_or_import(auth, CodexIdentityEvidence::ClaimsOnly, now)?;
         if self.saved.accounts.len() > before {
             self.saved.accounts[index].name = name.to_owned();
+        }
+        self.save(vault)
+    }
+    /// Turn Flex on or off for a saved API key. When the key is the active login, the
+    /// change reaches config.toml at once; a failure to turn it on is reported and the
+    /// setting stays off, a failure to turn it off keeps the restore pending (retried).
+    fn set_api_key_flex(
+        &mut self,
+        id: &str,
+        enabled: bool,
+        vault: &Vault,
+    ) -> Result<(), CodexReason> {
+        if self.pending_login.is_some() || self.switching.is_some() {
+            return Err(CodexReason::Busy);
+        }
+        let index = self.account_index(id)?;
+        if self.saved.accounts[index].auth_kind != AuthKind::ApiKey {
+            return Err(CodexReason::UnsupportedAuth);
+        }
+        if self.saved.accounts[index].use_flex == enabled {
+            return Ok(());
+        }
+        if let Some(reason) = self.common_block() {
+            return Err(reason);
+        }
+        if enabled {
+            // The config is judged again before it is edited: a restricted layer blocks.
+            self.requalify()?;
+            if let Some(reason) = self.flex_block() {
+                return Err(reason);
+            }
+        }
+        self.saved.accounts[index].use_flex = enabled;
+        if let Err(error) = self.reconcile_flex(vault) {
+            if enabled {
+                self.saved.accounts[index].use_flex = false;
+            } else {
+                self.save(vault)?;
+            }
+            return Err(error);
         }
         self.save(vault)
     }
@@ -2524,46 +2726,65 @@ impl CodexEngine {
         } else {
             None
         };
+        let flex_target = {
+            let target = &self.saved.accounts[index];
+            target.auth_kind == AuthKind::ApiKey && target.use_flex
+        };
+        self.flex_notice = None;
         let mut attempts = 0;
-        let written = loop {
-            attempts += 1;
-            let current = store.read().map_err(store_reason)?;
-            if let Some(expected) = &expected_owner {
-                let same_owner = current.auth_bytes().is_some_and(|bytes| {
-                    OpaqueAuth::parse(bytes.to_vec()).is_ok_and(|auth| {
-                        Binding::from_auth(&auth).is_ok_and(|owner| owner.same_owner(expected))
-                    })
-                });
-                if !same_owner {
-                    // Follow and preserve the external selection before returning;
-                    // it must never become the outgoing login of this auto plan.
-                    self.observe(vault, now)?;
-                    self.hold_automatic_returns(now, vault)?;
-                    return Err(CodexReason::ExternalChange);
+        let written = (|| -> Result<CodexAuthSnapshot, CodexReason> {
+            loop {
+                attempts += 1;
+                let current = store.read().map_err(store_reason)?;
+                if let Some(expected) = &expected_owner {
+                    let same_owner = current.auth_bytes().is_some_and(|bytes| {
+                        OpaqueAuth::parse(bytes.to_vec()).is_ok_and(|auth| {
+                            Binding::from_auth(&auth).is_ok_and(|owner| owner.same_owner(expected))
+                        })
+                    });
+                    if !same_owner {
+                        // Follow and preserve the external selection before returning;
+                        // it must never become the outgoing login of this auto plan.
+                        self.observe(vault, now)?;
+                        self.hold_automatic_returns(now, vault)?;
+                        return Err(CodexReason::ExternalChange);
+                    }
+                    if let Some((plan, returning, policy)) = automatic
+                        && !self.automatic_target_still_eligible(plan, returning, policy, now)
+                    {
+                        return Err(CodexReason::ExternalChange);
+                    }
                 }
-                if let Some((plan, returning, policy)) = automatic
-                    && !self.automatic_target_still_eligible(plan, returning, policy, now)
+                if let Some(bytes) = current.auth_bytes() {
+                    self.preserve_outgoing(bytes, now)?;
+                }
+                self.save(vault)?;
+                let incoming =
+                    Zeroizing::new(self.saved.accounts[self.account_index(id)?].auth.clone());
+                #[cfg(test)]
+                if automatic.is_some()
+                    && let Some(writer) = self.before_automatic_replace.take()
                 {
-                    return Err(CodexReason::ExternalChange);
+                    writer();
+                }
+                // Flex is settled before the login file is written: a Flex key is never
+                // switched to without it, and Flex never stays on for another login.
+                self.switch_flex(flex_target, vault)?;
+                match store.replace(&incoming, &current.generation, vault) {
+                    Ok(snapshot) => return Ok(snapshot),
+                    // Codex refreshed the outgoing token meanwhile: keep it and try again.
+                    Err(CodexStoreError::ExternalChange) if attempts < 4 => continue,
+                    Err(error) => return Err(store_reason(error)),
                 }
             }
-            if let Some(bytes) = current.auth_bytes() {
-                self.preserve_outgoing(bytes, now)?;
-            }
-            self.save(vault)?;
-            let incoming =
-                Zeroizing::new(self.saved.accounts[self.account_index(id)?].auth.clone());
-            #[cfg(test)]
-            if automatic.is_some()
-                && let Some(writer) = self.before_automatic_replace.take()
-            {
-                writer();
-            }
-            match store.replace(&incoming, &current.generation, vault) {
-                Ok(snapshot) => break snapshot,
-                // Codex refreshed the outgoing token meanwhile: keep it and try again.
-                Err(CodexStoreError::ExternalChange) if attempts < 4 => continue,
-                Err(error) => return Err(store_reason(error)),
+        })();
+        let written = match written {
+            Ok(written) => written,
+            Err(error) => {
+                // The login did not change: config.toml must agree with it again.
+                self.flex_notice = None;
+                let _ = self.reconcile_flex(vault);
+                return Err(error);
             }
         };
         self.selected_id = Some(id.into());
@@ -2696,15 +2917,22 @@ impl CodexEngine {
         }
         self.refresh_environment();
         let restarted = outcome.daemon_running && matches!(outcome.restart, Some(Ok(())));
+        self.switching = None;
+        // Flex follows the login the switch ended on, whoever changed it meanwhile.
+        let _ = self.reconcile_flex(vault);
         self.last_switch = Some(CodexLastSwitchView {
             account_id: job.target_id.clone(),
             at: now,
             daemon_restarted: restarted,
             other_clients: self.environment.other_clients,
             error: matches!(outcome.restart, Some(Err(_)))
-                .then_some(CodexReason::DaemonRestartFailed),
+                .then_some(CodexReason::DaemonRestartFailed)
+                .or_else(|| {
+                    self.flex_restore_pending()
+                        .then_some(CodexReason::FlexRestoreFailed)
+                }),
+            flex: self.flex_notice.take(),
         });
-        self.switching = None;
         if let Ok(index) = self.account_index(&job.target_id) {
             self.observe_return_window(index, now);
         }
@@ -2717,6 +2945,7 @@ impl CodexEngine {
     /// A switch whose locked first half succeeded must never stay "in progress".
     pub(crate) fn abort_switch(&mut self) {
         self.switching = None;
+        self.flex_notice = None;
     }
     fn observe_return_window(&mut self, index: usize, now: i64) {
         let active = self.selected_id.as_deref() == Some(&self.saved.accounts[index].id);
@@ -2822,6 +3051,7 @@ fn sanitize(saved: Saved) -> (Saved, Saved) {
     let mut bad = Saved::default();
     good.return_hold_until = saved.return_hold_until;
     good.last_auto_switch_at = saved.last_auto_switch_at;
+    good.flex_applied = saved.flex_applied;
     let mut ids = BTreeSet::new();
     for mut account in saved.accounts.into_iter() {
         let auth = OpaqueAuth::parse(account.auth.clone()).ok();

@@ -94,6 +94,8 @@ export function codexApiKeyAccount(
     quota: null,
     quotaReadAt: null,
     quotaState: 'unread',
+    useFlex: false,
+    flex: codexCapability(),
     ...overrides,
   });
 }

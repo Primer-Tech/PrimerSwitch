@@ -4195,3 +4195,559 @@ async fn a_lampese_key_never_duplicates_renames_or_resets_a_saved_key_and_is_tri
     assert_eq!(f.engine.saved.accounts.len(), before + 1);
     f.claude_untouched();
 }
+
+// Flex processing for an API key: Codex's `service_tier` is "flex" exactly while a Flex
+// key is the active login, and every other byte of config.toml is left alone.
+const SECOND_KEY: &str = "sk-proj-SENTINEL-0123456789abcdeg";
+const OWNER_CONFIG: &[u8] = b"# my codex\r\ncli_auth_credentials_store = \"file\"\r\nservice_tier = \"default\"\r\nmodel = \"fixture-model\"\r\nfast_default_opt_out = true\r\n\r\n[profiles.fast]\r\nservice_tier = \"priority\"\r\n";
+impl Fixture {
+    /// Codex 0.163 and a config like the owner's.
+    fn flex_ready(&mut self, config: &[u8]) {
+        self.engine.installation.as_mut().unwrap().version = "0.163.0".into();
+        self.write_config(config);
+    }
+    fn write_config(&self, bytes: &[u8]) {
+        fs::write(self.home.join("config.toml"), bytes).unwrap();
+    }
+    fn config(&self) -> Vec<u8> {
+        fs::read(self.home.join("config.toml")).unwrap()
+    }
+    async fn set_flex(&mut self, id: &str, enabled: bool) -> Result<(), CodexReason> {
+        self.engine
+            .command(
+                CodexCommand::SetApiKeyFlex(id.into(), enabled),
+                &self.vault,
+                250,
+            )
+            .await
+            .map(|_| ())
+    }
+    /// A saved key that uses Flex.
+    async fn flex_key(&mut self, name: &str, key: &str) -> String {
+        self.add_key(name, key).await.unwrap();
+        let id = self.key_id(key);
+        self.set_flex(&id, true).await.unwrap();
+        id
+    }
+    fn saved_state(&self) -> Saved {
+        self.vault.load(RECORD).unwrap().unwrap()
+    }
+    fn warnings(&self) -> Vec<CodexReason> {
+        self.engine
+            .snapshot(false, 300, &CodexPolicy::default())
+            .warnings
+    }
+}
+fn flex_mark(previous: Option<&str>) -> FlexMark {
+    FlexMark {
+        previous: previous.map(Into::into),
+        config_existed: true,
+    }
+}
+fn flexed(config: &[u8], from: &str) -> Vec<u8> {
+    String::from_utf8(config.to_vec())
+        .unwrap()
+        .replacen(from, "service_tier = \"flex\"", 1)
+        .into_bytes()
+}
+
+#[tokio::test]
+async fn the_flex_option_needs_codex_0_163_and_an_api_key() {
+    let mut f = Fixture::new();
+    let a = f.id_of("ws-a");
+    f.add_key("Work key", FAKE_KEY).await.unwrap();
+    let key = f.key_id(FAKE_KEY);
+    // The fixture's Codex is 0.160.0: the option is blocked, with the reason.
+    assert_eq!(
+        f.view(&key).flex.blocked_reason,
+        Some(CodexReason::FlexUnsupportedVersion)
+    );
+    assert!(!f.view(&key).flex.enabled && !f.view(&key).use_flex);
+    assert_eq!(
+        f.set_flex(&key, true).await.err(),
+        Some(CodexReason::FlexUnsupportedVersion)
+    );
+    assert!(!f.view(&key).use_flex);
+    // A ChatGPT account has no such option.
+    assert_eq!(
+        f.view(&a).flex.blocked_reason,
+        Some(CodexReason::UnsupportedAuth)
+    );
+    assert_eq!(
+        f.set_flex(&a, true).await.err(),
+        Some(CodexReason::UnsupportedAuth)
+    );
+    assert_eq!(
+        f.set_flex("missing", true).await.err(),
+        Some(CodexReason::IdentityUnverified)
+    );
+    // A pre-release of 0.163.0 counts.
+    f.engine.installation.as_mut().unwrap().version = "0.163.0-alpha.2".into();
+    assert!(f.view(&key).flex.enabled);
+    f.set_flex(&key, true).await.unwrap();
+    assert!(f.view(&key).use_flex);
+    // The same key, after Codex went back to an older version: it cannot be turned on
+    // by a switch, but it can still be turned off.
+    f.engine.installation.as_mut().unwrap().version = "0.162.0".into();
+    assert_eq!(
+        f.view(&key).switchable.blocked_reason,
+        Some(CodexReason::FlexUnsupportedVersion)
+    );
+    assert_eq!(
+        f.engine.begin_switch(&key, &f.vault, 200).err(),
+        Some(CodexReason::FlexUnsupportedVersion)
+    );
+    assert!(f.view(&key).flex.enabled);
+    f.set_flex(&key, false).await.unwrap();
+    assert!(f.view(&key).switchable.enabled);
+    assert_eq!(f.active(), auth("user-a", "ws-a", "initial"));
+    f.claude_untouched();
+}
+
+#[tokio::test]
+async fn a_switch_to_a_flex_key_sets_flex_and_the_switch_back_restores_every_byte() {
+    let mut f = Fixture::new();
+    f.flex_ready(OWNER_CONFIG);
+    let a = f.id_of("ws-a");
+    let key = f.flex_key("Work key", FAKE_KEY).await;
+    // Turning the option on while ChatGPT is active changes nothing in the config.
+    assert_eq!(f.config(), OWNER_CONFIG);
+    assert!(f.saved_state().flex_applied.is_none());
+    let outcome = f.switch(&key).await.unwrap();
+    assert!(outcome.daemon_restarted);
+    assert_eq!(outcome.flex, Some(CodexFlexChange::On));
+    assert_eq!(outcome.error, None);
+    assert_eq!(f.active(), key_file(FAKE_KEY));
+    // Only the value changed: comments, CRLF, the profile and every other key stay.
+    assert_eq!(
+        f.config(),
+        flexed(OWNER_CONFIG, "service_tier = \"default\"")
+    );
+    assert!(
+        String::from_utf8(f.config())
+            .unwrap()
+            .contains("[profiles.fast]\r\nservice_tier = \"priority\"")
+    );
+    // The mark is durable before anything depends on it.
+    let mark = f.saved_state().flex_applied.unwrap();
+    assert_eq!(mark, flex_mark(Some("\"default\"")));
+    assert_eq!(*f.daemon.calls.lock().unwrap(), vec!["state", "restart"]);
+    // Writing the config did not make the Codex context unsafe: it qualifies again, and
+    // the context the engine holds already matches the new file.
+    f.engine
+        .store()
+        .unwrap()
+        .context()
+        .revalidate_sources()
+        .unwrap();
+    f.engine.requalify().unwrap();
+    assert!(f.engine.store().is_ok());
+    assert!(
+        f.warnings()
+            .iter()
+            .all(|w| *w != CodexReason::FlexRestoreFailed)
+    );
+    let snapshot =
+        serde_json::to_string(&f.engine.snapshot(false, 300, &CodexPolicy::default())).unwrap();
+    assert!(snapshot.contains("\"useFlex\":true"));
+    assert!(!snapshot.contains(FAKE_KEY) && !snapshot.contains("sk-proj"));
+    // Back to ChatGPT: Flex is off before the login changes and the file is as it was.
+    let outcome = f.switch(&a).await.unwrap();
+    assert_eq!(outcome.flex, Some(CodexFlexChange::Off));
+    assert_eq!(outcome.error, None);
+    assert_eq!(f.config(), OWNER_CONFIG);
+    assert!(f.saved_state().flex_applied.is_none());
+    assert_eq!(f.active(), auth("user-a", "ws-a", "initial"));
+    // Another trip keeps working and the key stays a Flex key.
+    f.switch(&key).await.unwrap();
+    assert_eq!(
+        f.config(),
+        flexed(OWNER_CONFIG, "service_tier = \"default\"")
+    );
+    f.switch(&a).await.unwrap();
+    assert_eq!(f.config(), OWNER_CONFIG);
+    assert!(f.view(&key).use_flex);
+    f.claude_untouched();
+}
+
+#[tokio::test]
+async fn config_variants_round_trip_and_a_missing_config_is_created_and_removed() {
+    for (config, applied) in [
+        (
+            Some(&b"model = \"x\"\n[tui]\ntheme = \"y\"\n"[..]),
+            &b"service_tier = \"flex\"\nmodel = \"x\"\n[tui]\ntheme = \"y\"\n"[..],
+        ),
+        (
+            Some(&b"service_tier = \"flex\"\nmodel = \"x\"\n"[..]),
+            &b"service_tier = \"flex\"\nmodel = \"x\"\n"[..],
+        ),
+        (None, &b"service_tier = \"flex\"\n"[..]),
+    ] {
+        let mut f = Fixture::new();
+        match config {
+            Some(bytes) => f.flex_ready(bytes),
+            None => {
+                f.flex_ready(b"");
+                fs::remove_file(f.home.join("config.toml")).unwrap();
+            }
+        }
+        let a = f.id_of("ws-a");
+        let key = f.flex_key("Work key", FAKE_KEY).await;
+        f.switch(&key).await.unwrap();
+        assert_eq!(f.config(), applied);
+        f.switch(&a).await.unwrap();
+        match config {
+            Some(bytes) => assert_eq!(f.config(), bytes),
+            None => assert!(!f.home.join("config.toml").exists()),
+        }
+        assert!(f.saved_state().flex_applied.is_none());
+        f.claude_untouched();
+    }
+}
+
+#[tokio::test]
+async fn a_config_write_failure_aborts_the_switch_and_leaves_the_login_unchanged() {
+    let mut f = Fixture::new();
+    // A `service_tier` that is not a string cannot be edited safely.
+    f.flex_ready(b"service_tier = 5\n");
+    let a = f.id_of("ws-a");
+    let key = f.flex_key("Work key", FAKE_KEY).await;
+    let before = f.active();
+    assert_eq!(
+        f.switch(&key).await.err(),
+        Some(CodexReason::FlexConfigFailed)
+    );
+    // "Flex only" never becomes standard-price billing: nothing was switched.
+    assert_eq!(f.active(), before);
+    assert_eq!(f.engine.selected_id.as_deref(), Some(a.as_str()));
+    assert!(f.engine.switching.is_none() && f.engine.last_switch.is_none());
+    assert!(f.saved_state().flex_applied.is_none());
+    assert_eq!(f.config(), b"service_tier = 5\n");
+    assert!(f.daemon.calls.lock().unwrap().is_empty());
+    // A key without Flex still switches with the same config.
+    f.add_key("Plain", SECOND_KEY).await.unwrap();
+    let plain = f.key_id(SECOND_KEY);
+    f.switch(&plain).await.unwrap();
+    assert_eq!(f.active(), key_file(SECOND_KEY));
+    assert_eq!(f.config(), b"service_tier = 5\n");
+    f.claude_untouched();
+}
+
+#[tokio::test]
+async fn a_failed_login_write_after_the_config_write_puts_the_config_back() {
+    let mut f = Fixture::new();
+    f.flex_ready(OWNER_CONFIG);
+    let key = f.flex_key("Work key", FAKE_KEY).await;
+    // The saved key cannot be written as a login: the write fails after Flex was set.
+    let index = f.engine.account_index(&key).unwrap();
+    f.engine.saved.accounts[index].auth =
+        br#"{"auth_mode":"apikey","OPENAI_API_KEY":" "}"#.to_vec();
+    let before = f.active();
+    assert_eq!(
+        f.switch(&key).await.err(),
+        Some(CodexReason::UnsupportedAuth)
+    );
+    assert_eq!(f.active(), before);
+    assert_eq!(f.config(), OWNER_CONFIG);
+    assert!(f.saved_state().flex_applied.is_none() && f.engine.saved.flex_applied.is_none());
+    assert!(f.engine.switching.is_none());
+    assert_eq!(f.engine.selected_id, Some(f.id_of("ws-a")));
+    f.claude_untouched();
+}
+
+#[tokio::test]
+async fn a_restore_that_fails_never_blocks_the_switch_to_chatgpt_and_is_retried() {
+    let mut f = Fixture::new();
+    f.flex_ready(OWNER_CONFIG);
+    let a = f.id_of("ws-a");
+    let key = f.flex_key("Work key", FAKE_KEY).await;
+    f.switch(&key).await.unwrap();
+    let flexed_config = f.config();
+    // The saved mark cannot be applied (a damaged state), so the restore fails.
+    f.engine.saved.flex_applied = Some(flex_mark(Some("not a toml string")));
+    let outcome = f.switch(&a).await.unwrap();
+    assert_eq!(outcome.error, Some(CodexReason::FlexRestoreFailed));
+    assert_eq!(outcome.flex, None);
+    // The switch to ChatGPT completed; Flex stays recorded and is reported.
+    assert_eq!(f.active(), auth("user-a", "ws-a", "initial"));
+    assert_eq!(f.engine.selected_id.as_deref(), Some(a.as_str()));
+    assert!(f.engine.saved.flex_applied.is_some());
+    assert_eq!(f.config(), flexed_config);
+    assert!(f.warnings().contains(&CodexReason::FlexRestoreFailed));
+    // Every tick retries and reports until it works.
+    f.engine.observe(&f.vault, 400).unwrap();
+    assert!(f.warnings().contains(&CodexReason::FlexRestoreFailed));
+    assert_eq!(f.config(), flexed_config);
+    f.engine.saved.flex_applied = Some(flex_mark(Some("\"default\"")));
+    f.engine.observe(&f.vault, 410).unwrap();
+    assert_eq!(f.config(), OWNER_CONFIG);
+    assert!(f.engine.saved.flex_applied.is_none() && f.saved_state().flex_applied.is_none());
+    assert!(!f.warnings().contains(&CodexReason::FlexRestoreFailed));
+    f.claude_untouched();
+}
+
+#[tokio::test]
+async fn startup_and_outside_switches_reconcile_flex_with_the_active_login() {
+    let mut f = Fixture::new();
+    f.flex_ready(OWNER_CONFIG);
+    let a = f.id_of("ws-a");
+    let key = f.flex_key("Work key", FAKE_KEY).await;
+    // A crash after the config write: the state says Flex is applied, ChatGPT is active.
+    f.write_config(&flexed(OWNER_CONFIG, "service_tier = \"default\""));
+    f.engine.saved.flex_applied = Some(flex_mark(Some("\"default\"")));
+    f.engine.save(&f.vault).unwrap();
+    // The state survives a restart of the app.
+    let mut restarted = CodexEngine::load(&f.vault);
+    assert_eq!(
+        restarted.saved.flex_applied,
+        Some(flex_mark(Some("\"default\"")))
+    );
+    std::mem::swap(&mut f.engine.saved, &mut restarted.saved);
+    f.engine.observe(&f.vault, 300).unwrap();
+    assert_eq!(f.config(), OWNER_CONFIG);
+    assert!(f.saved_state().flex_applied.is_none());
+    assert_eq!(f.engine.selected_id.as_deref(), Some(a.as_str()));
+    // The owner runs `codex login --with-api-key` with the Flex key outside the app:
+    // Flex follows that login.
+    f.write_active(&key_file(FAKE_KEY));
+    f.engine.observe(&f.vault, 310).unwrap();
+    assert_eq!(f.engine.selected_id.as_deref(), Some(key.as_str()));
+    assert_eq!(
+        f.config(),
+        flexed(OWNER_CONFIG, "service_tier = \"default\"")
+    );
+    assert_eq!(
+        f.saved_state().flex_applied,
+        Some(flex_mark(Some("\"default\"")))
+    );
+    // And back to ChatGPT outside the app: Flex is cleared again.
+    f.write_active(&auth("user-a", "ws-a", "initial"));
+    f.engine.observe(&f.vault, 320).unwrap();
+    assert_eq!(f.engine.selected_id.as_deref(), Some(a.as_str()));
+    assert_eq!(f.config(), OWNER_CONFIG);
+    // The Flex key becomes active outside the app but the config cannot be edited: that
+    // is reported, never silent, and it is applied as soon as the file can be edited.
+    f.write_config(
+        b"service_tier = 5
+",
+    );
+    f.write_active(&key_file(FAKE_KEY));
+    f.engine.observe(&f.vault, 322).unwrap();
+    assert_eq!(f.engine.selected_id.as_deref(), Some(key.as_str()));
+    assert!(f.warnings().contains(&CodexReason::FlexConfigFailed));
+    assert_eq!(
+        f.config(),
+        b"service_tier = 5
+"
+    );
+    f.write_config(OWNER_CONFIG);
+    f.engine.observe(&f.vault, 324).unwrap();
+    assert!(!f.warnings().contains(&CodexReason::FlexConfigFailed));
+    assert_eq!(
+        f.config(),
+        flexed(OWNER_CONFIG, "service_tier = \"default\"")
+    );
+    f.write_active(&auth("user-a", "ws-a", "initial"));
+    f.engine.observe(&f.vault, 326).unwrap();
+    assert_eq!(f.config(), OWNER_CONFIG);
+    // Another API key without Flex never turns it on.
+    f.add_key("Plain", SECOND_KEY).await.unwrap();
+    f.write_active(&key_file(SECOND_KEY));
+    f.engine.observe(&f.vault, 330).unwrap();
+    assert_eq!(f.config(), OWNER_CONFIG);
+    f.claude_untouched();
+}
+
+#[tokio::test]
+async fn the_option_can_be_toggled_on_the_active_key_and_a_failure_keeps_the_setting_honest() {
+    let mut f = Fixture::new();
+    f.flex_ready(OWNER_CONFIG);
+    f.add_key("Work key", FAKE_KEY).await.unwrap();
+    let key = f.key_id(FAKE_KEY);
+    f.switch(&key).await.unwrap();
+    assert_eq!(f.config(), OWNER_CONFIG);
+    // On while the key is active: the config changes at once.
+    f.set_flex(&key, true).await.unwrap();
+    assert!(f.view(&key).use_flex);
+    assert_eq!(
+        f.config(),
+        flexed(OWNER_CONFIG, "service_tier = \"default\"")
+    );
+    assert_eq!(
+        f.saved_state().flex_applied,
+        Some(flex_mark(Some("\"default\"")))
+    );
+    assert!(f.saved_state().accounts.iter().any(|a| a.use_flex));
+    // Off again: restored.
+    f.set_flex(&key, false).await.unwrap();
+    assert!(!f.view(&key).use_flex);
+    assert_eq!(f.config(), OWNER_CONFIG);
+    assert!(f.saved_state().flex_applied.is_none());
+    // A failure to turn it on leaves it off.
+    f.write_config(b"service_tier = 5\n");
+    assert_eq!(
+        f.set_flex(&key, true).await.err(),
+        Some(CodexReason::FlexConfigFailed)
+    );
+    assert!(!f.view(&key).use_flex && !f.saved_state().accounts.iter().any(|a| a.use_flex));
+    assert_eq!(f.config(), b"service_tier = 5\n");
+    // A failure to turn it off keeps the restore pending, and the setting is off.
+    f.write_config(OWNER_CONFIG);
+    f.set_flex(&key, true).await.unwrap();
+    f.engine.saved.flex_applied = Some(flex_mark(Some("broken")));
+    assert_eq!(
+        f.set_flex(&key, false).await.err(),
+        Some(CodexReason::FlexRestoreFailed)
+    );
+    assert!(!f.view(&key).use_flex && !f.saved_state().accounts.iter().any(|a| a.use_flex));
+    assert!(f.engine.saved.flex_applied.is_some());
+    assert!(f.warnings().contains(&CodexReason::FlexRestoreFailed));
+    // On a key that is not active nothing touches the config.
+    f.engine.saved.flex_applied = Some(flex_mark(Some("\"default\"")));
+    f.engine.observe(&f.vault, 400).unwrap();
+    assert_eq!(f.config(), OWNER_CONFIG);
+    f.add_key("Other", SECOND_KEY).await.unwrap();
+    let other = f.key_id(SECOND_KEY);
+    f.set_flex(&other, true).await.unwrap();
+    assert!(f.view(&other).use_flex);
+    assert_eq!(f.config(), OWNER_CONFIG);
+    assert!(f.saved_state().flex_applied.is_none());
+    f.claude_untouched();
+}
+
+#[tokio::test]
+async fn between_flex_keys_the_original_value_survives_and_an_owner_edit_is_never_overwritten() {
+    let mut f = Fixture::new();
+    f.flex_ready(OWNER_CONFIG);
+    let a = f.id_of("ws-a");
+    let first = f.flex_key("First", FAKE_KEY).await;
+    let second = f.flex_key("Second", SECOND_KEY).await;
+    f.switch(&first).await.unwrap();
+    let mark = f.saved_state().flex_applied.unwrap();
+    // Flex key to Flex key: the file keeps Flex and the first mark.
+    let outcome = f.switch(&second).await.unwrap();
+    assert_eq!(outcome.flex, Some(CodexFlexChange::On));
+    assert_eq!(f.saved_state().flex_applied, Some(mark));
+    assert_eq!(
+        f.config(),
+        flexed(OWNER_CONFIG, "service_tier = \"default\"")
+    );
+    // The owner picks another tier by hand while Flex is on: it stays on the way back.
+    f.write_config(
+        &String::from_utf8(f.config())
+            .unwrap()
+            .replace("\"flex\"", "\"priority\"")
+            .into_bytes(),
+    );
+    let edited = f.config();
+    f.switch(&a).await.unwrap();
+    assert_eq!(f.config(), edited);
+    assert!(f.saved_state().flex_applied.is_none());
+    f.claude_untouched();
+}
+
+#[tokio::test]
+async fn flex_state_loads_from_old_records_and_survives_a_round_trip() {
+    let mut f = Fixture::new();
+    f.flex_ready(OWNER_CONFIG);
+    f.add_key("Work key", FAKE_KEY).await.unwrap();
+    // A record from before this option has neither field.
+    let mut record = serde_json::to_value(&f.engine.saved).unwrap();
+    assert!(record.get("flex_applied").is_none());
+    assert!(record["accounts"][1].get("use_flex").is_none());
+    f.vault.save(RECORD, &record).unwrap();
+    let loaded = CodexEngine::load(&f.vault);
+    assert!(loaded.writable);
+    assert_eq!(loaded.saved.accounts.len(), 2);
+    assert!(loaded.saved.flex_applied.is_none());
+    assert!(loaded.saved.accounts.iter().all(|a| !a.use_flex));
+    // With both fields set they come back unchanged.
+    record["flex_applied"] = json!({"previous":"\"default\"","config_existed":true});
+    record["accounts"][1]["use_flex"] = json!(true);
+    f.vault.save(RECORD, &record).unwrap();
+    let loaded = CodexEngine::load(&f.vault);
+    assert_eq!(
+        loaded.saved.flex_applied,
+        Some(flex_mark(Some("\"default\"")))
+    );
+    assert!(loaded.saved.accounts[1].use_flex);
+    // A mark written without a previous value (the key was absent) also loads.
+    record["flex_applied"] = json!({"previous":null,"config_existed":false});
+    f.vault.save(RECORD, &record).unwrap();
+    assert_eq!(
+        CodexEngine::load(&f.vault).saved.flex_applied,
+        Some(FlexMark {
+            previous: None,
+            config_existed: false
+        })
+    );
+}
+
+#[tokio::test]
+async fn the_runtime_exposes_the_flex_toggle_and_the_switch_outcome() {
+    let mut f = Fixture::new();
+    f.flex_ready(OWNER_CONFIG);
+    f.add_key("Work key", FAKE_KEY).await.unwrap();
+    let key = f.key_id(FAKE_KEY);
+    let a = f.id_of("ws-a");
+    f.factory
+        .enqueue(Plan::quota(Ok(quota(Some("ws-a"), 5, 5))));
+    let (_temp, handle) = runtime(&mut f, Settings::default()).await;
+    let snapshot = handle.codex_set_api_key_flex(&key, true).await.unwrap();
+    let view = snapshot.accounts.iter().find(|v| v.id == key).unwrap();
+    assert!(view.use_flex && view.flex.enabled);
+    let snapshot = handle.codex_switch_account(&key).await.unwrap();
+    assert_eq!(
+        snapshot.last_switch.as_ref().and_then(|s| s.flex),
+        Some(CodexFlexChange::On)
+    );
+    let json = serde_json::to_value(&snapshot).unwrap();
+    assert_eq!(json["lastSwitch"]["flex"], "on");
+    assert_eq!(
+        f.config(),
+        flexed(OWNER_CONFIG, "service_tier = \"default\"")
+    );
+    let snapshot = handle.codex_switch_account(&a).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(&snapshot).unwrap()["lastSwitch"]["flex"],
+        "off"
+    );
+    assert_eq!(f.config(), OWNER_CONFIG);
+    assert_eq!(
+        handle.codex_set_api_key_flex(&a, true).await.err(),
+        Some(CodexReason::UnsupportedAuth)
+    );
+}
+
+#[tokio::test]
+async fn flex_is_blocked_while_the_codex_configuration_is_restricted() {
+    let mut f = Fixture::new();
+    f.flex_ready(OWNER_CONFIG);
+    f.add_key("Work key", FAKE_KEY).await.unwrap();
+    let key = f.key_id(FAKE_KEY);
+    assert!(f.view(&key).flex.enabled);
+    // A default profile can change the provider and login: the config is not editable.
+    f.write_config(
+        b"profile = \"work\"
+service_tier = \"default\"
+",
+    );
+    assert_eq!(
+        f.set_flex(&key, true).await.err(),
+        Some(CodexReason::PolicyRestricted)
+    );
+    assert!(!f.view(&key).use_flex);
+    assert_eq!(
+        f.config(),
+        b"profile = \"work\"
+service_tier = \"default\"
+"
+    );
+    // No qualified installation: the capability carries the reason.
+    f.engine.installation = None;
+    f.engine.reason = Some(CodexReason::PolicyRestricted);
+    assert_eq!(
+        f.view(&key).flex.blocked_reason,
+        Some(CodexReason::PolicyRestricted)
+    );
+}

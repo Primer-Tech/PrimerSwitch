@@ -331,6 +331,16 @@
         id: 'notice-outcome',
         text: noticeText(outcome),
         lines: [
+          ...(outcome.kind === 'switched' && outcome.flex
+            ? [
+                {
+                  text: t(
+                    $language,
+                    outcome.flex === 'on' ? 'codexFlexOn' : 'codexFlexOff',
+                  ),
+                },
+              ]
+            : []),
           ...(outcome.kind === 'switched' && outcome.otherClients > 0
             ? [{ text: t($language, 'codexSwitchedOtherClients') }]
             : []),
@@ -672,6 +682,35 @@
         : null}
     >
       {#snippet extra()}
+        {#if saved?.authKind === 'apiKey'}
+          <section aria-label={t($language, 'codexFlexLabel')}>
+            <label class="toggle-row">
+              <span
+                ><strong>{t($language, 'codexFlexLabel')}</strong><small
+                  id="codex-flex-help">{t($language, 'codexFlexHelp')}</small
+                ></span
+              >
+              <input
+                type="checkbox"
+                role="switch"
+                aria-describedby="codex-flex-help"
+                checked={saved.useFlex ?? false}
+                disabled={locked || !saved.flex?.enabled}
+                onchange={async (event) => {
+                  const box = event.currentTarget;
+                  // A refused change must not leave the switch looking on.
+                  if (!(await controller.setApiKeyFlex(saved.id, box.checked)))
+                    box.checked = account(saved.id)?.useFlex ?? false;
+                }}
+              />
+            </label>
+            {#if saved.flex && !saved.flex.enabled && saved.flex.blockedReason}<p
+                class="note"
+              >
+                {codexMessage(saved.flex.blockedReason, $language)}
+              </p>{/if}
+          </section>
+        {/if}
         {#if saved?.authKind === 'chatgpt'}
           <section aria-label={t($language, 'availableResets')}>
             <h3>{t($language, 'availableResets')}</h3>

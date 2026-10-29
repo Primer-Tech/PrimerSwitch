@@ -28,9 +28,13 @@ pub const MIN_CODEX_VERSION: &str = "0.160.0";
 /// Release whose sources were inspected for the auth.json and daemon contracts.
 pub const PINNED_SOURCE_COMMIT: &str = "a956835d020762cb2b570053af06f643a11c0ecc";
 
-/// Parse `codex-cli 0.160.0` or a bare `0.162.0-alpha.10`. Returns the version text
-/// when it is at least [`MIN_CODEX_VERSION`] and below 1.0 (an untested major).
-pub fn supported_version(text: &str) -> Option<String> {
+/// First Codex whose `service_tier = "flex"` setting was verified (against 0.163.0-alpha.2
+/// and the 0.163.0 sources): a configured value is sent unchanged in the request.
+pub const MIN_FLEX_CODEX_VERSION: &str = "0.163.0";
+
+/// `major.minor.patch` of `codex-cli 0.160.0` or a bare `0.162.0-alpha.10`; the
+/// pre-release and build suffixes are ignored.
+fn core_version(text: &str) -> Option<((u64, u64, u64), String)> {
     let text = text.trim();
     let version = text.strip_prefix("codex-cli ").unwrap_or(text).trim();
     if version.is_empty() || version.len() > 64 || version.chars().any(char::is_whitespace) {
@@ -49,8 +53,22 @@ pub fn supported_version(text: &str) -> Option<String> {
     if parts.next().is_some() {
         return None;
     }
+    Some((parsed, version.to_owned()))
+}
+
+/// Parse `codex-cli 0.160.0` or a bare `0.162.0-alpha.10`. Returns the version text
+/// when it is at least [`MIN_CODEX_VERSION`] and below 1.0 (an untested major).
+pub fn supported_version(text: &str) -> Option<String> {
+    let (parsed, version) = core_version(text)?;
     let minimum = (0, 160, 0);
-    (parsed.0 == 0 && parsed >= minimum).then(|| version.to_owned())
+    (parsed.0 == 0 && parsed >= minimum).then_some(version)
+}
+
+/// The version is at least [`MIN_FLEX_CODEX_VERSION`] (and below 1.0), so a configured
+/// Flex service tier is honoured. A pre-release of that version counts.
+pub fn supports_flex(text: &str) -> bool {
+    let minimum = core_version(MIN_FLEX_CODEX_VERSION).map(|(parsed, _)| parsed);
+    core_version(text).is_some_and(|(parsed, _)| parsed.0 == 0 && Some(parsed) >= minimum)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -97,7 +115,7 @@ pub enum CodexError {
 
 #[cfg(test)]
 mod version_tests {
-    use super::supported_version;
+    use super::{supported_version, supports_flex};
     #[test]
     fn minimum_version_and_prereleases() {
         assert_eq!(
@@ -119,6 +137,28 @@ mod version_tests {
             "codex-cli 0.160.0 extra",
         ] {
             assert_eq!(supported_version(rejected), None, "{rejected}");
+        }
+    }
+    #[test]
+    fn flex_needs_codex_0_163_or_a_prerelease_of_it() {
+        for supported in [
+            "codex-cli 0.163.0",
+            "0.163.0-alpha.2",
+            "0.164.1",
+            "codex-cli 0.200.0+build",
+        ] {
+            assert!(supports_flex(supported), "{supported}");
+        }
+        for unsupported in [
+            "codex-cli 0.162.9",
+            "0.160.0",
+            "0.162.0-alpha.10",
+            "1.0.0",
+            "codex-cli 0.163",
+            "",
+            "nonsense",
+        ] {
+            assert!(!supports_flex(unsupported), "{unsupported}");
         }
     }
 }

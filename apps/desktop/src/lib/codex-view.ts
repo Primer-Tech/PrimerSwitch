@@ -209,7 +209,8 @@ function row(
     secondary:
       [
         account.authKind === 'apiKey' && account.apiKeyTail
-          ? t(locale, 'codexApiKeyEnding', { tail: account.apiKeyTail })
+          ? t(locale, 'codexApiKeyEnding', { tail: account.apiKeyTail }) +
+            (account.useFlex ? ` · ${t(locale, 'codexFlexTag')}` : '')
           : null,
         account.email && account.email !== account.name ? account.email : null,
         workspaceLabel,

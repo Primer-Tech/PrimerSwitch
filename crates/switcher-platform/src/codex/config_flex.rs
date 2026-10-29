@@ -53,25 +53,47 @@ impl CodexConfigFlex {
         }
         Ok(found.value.map(|value| value.decoded))
     }
-    /// Make the top-level `service_tier` "flex". Returns what to restore later. Nothing
-    /// is written when the value is already "flex" (the mark then keeps "flex" as the
-    /// value to restore, so an owner's own setting is never removed).
-    pub fn apply(&self, vault: &Vault) -> CodexResult<FlexMark> {
-        self.edit(vault, |text, existed| {
+    /// What to put back later, read from the file as it is now. Writes nothing, so the
+    /// caller can save the mark durably before [`Self::apply`] changes the file. Refused
+    /// when `restore` could not put the value back: a `service_tier` that is not a plain
+    /// string, a multi-line or triple-quoted string, or a value longer than a mark keeps.
+    /// When the file already says "flex" the mark keeps "flex", so an owner's own
+    /// setting is never removed.
+    pub fn plan(&self) -> CodexResult<FlexMark> {
+        let (bytes, _) = self.read()?;
+        let text = text_of(slice(&bytes))?;
+        let found = locate(text)?;
+        if found.other {
+            return Err(CodexStoreError::UnsupportedContext);
+        }
+        let previous = match &found.value {
+            Some(value) => {
+                let raw = &text[value.span.clone()];
+                restorable(raw)?;
+                Some(raw.to_owned())
+            }
+            None => None,
+        };
+        Ok(FlexMark {
+            previous,
+            config_existed: bytes.is_some(),
+        })
+    }
+    /// Make the top-level `service_tier` "flex". Nothing is written when it already is,
+    /// so a retry after a conflict is harmless. The mark comes from [`Self::plan`], which
+    /// the caller has saved before this call.
+    pub fn apply(&self, vault: &Vault) -> CodexResult<()> {
+        self.edit(vault, |text, _| {
             let found = locate(text)?;
             if found.other {
                 return Err(CodexStoreError::UnsupportedContext);
             }
-            let mark = FlexMark {
-                previous: found
-                    .value
-                    .as_ref()
-                    .map(|value| text[value.span.clone()].to_owned()),
-                config_existed: existed,
-            };
             let new = match &found.value {
-                Some(value) if value.decoded == "flex" => return Ok((mark, None)),
-                Some(value) => splice(text, value.span.clone(), FLEX),
+                Some(value) if value.decoded == "flex" => return Ok(((), None)),
+                Some(value) => {
+                    restorable(&text[value.span.clone()])?;
+                    splice(text, value.span.clone(), FLEX)
+                }
                 None => {
                     let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
                     let at = found.insert_at;
@@ -79,7 +101,7 @@ impl CodexConfigFlex {
                 }
             };
             verify(&new, Some("flex"))?;
-            Ok((mark, Some(new)))
+            Ok(((), Some(new)))
         })
     }
     /// Put the saved value back, but only while the file still says "flex"; a value the
@@ -233,6 +255,8 @@ impl CodexConfigFlex {
         }
         #[cfg(unix)]
         std::fs::File::open(self.context.home())?.sync_all()?;
+        #[cfg(test)]
+        tests::after_replace(&path);
         if slice(&self.read()?.0) != Some(text.as_bytes()) {
             return Err(CodexStoreError::ExternalChange);
         }
@@ -265,6 +289,14 @@ fn string_token(raw: &str) -> CodexResult<String> {
         }
         _ => Err(CodexStoreError::UnsupportedContext),
     }
+}
+/// `raw` is a value that `restore` can put back later: a single-line, plain TOML string
+/// that a mark can hold.
+fn restorable(raw: &str) -> CodexResult<()> {
+    if raw.len() > MAX_PREVIOUS || raw.starts_with("\"\"\"") || raw.starts_with("'''") {
+        return Err(CodexStoreError::UnsupportedContext);
+    }
+    string_token(raw).map(|_| ())
 }
 /// The edited document still parses and its top-level `service_tier` says `want`.
 fn verify(text: &str, want: Option<&str>) -> CodexResult<()> {
@@ -369,6 +401,12 @@ mod tests {
     fn config(flex: &CodexConfigFlex) -> Vec<u8> {
         fs::read(flex.path()).unwrap()
     }
+    /// What the engine does: plan the mark, then set Flex.
+    fn set(flex: &CodexConfigFlex, vault: &Vault) -> FlexMark {
+        let mark = flex.plan().unwrap();
+        flex.apply(vault).unwrap();
+        mark
+    }
     fn leftovers(flex: &CodexConfigFlex) -> Vec<String> {
         fs::read_dir(flex.context.home())
             .unwrap()
@@ -417,7 +455,7 @@ mod tests {
         ];
         for (original, applied) in cases {
             let (_root, flex, vault) = fixture(Some(original));
-            let mark = flex.apply(&vault).unwrap();
+            let mark = set(&flex, &vault);
             assert!(mark.config_existed);
             assert_eq!(
                 String::from_utf8_lossy(&config(&flex)),
@@ -442,7 +480,7 @@ mod tests {
         let (_root, flex, vault) = fixture(None);
         assert!(!flex.path().exists());
         assert_eq!(flex.current().unwrap(), None);
-        let mark = flex.apply(&vault).unwrap();
+        let mark = set(&flex, &vault);
         assert_eq!(
             mark,
             FlexMark {
@@ -454,7 +492,7 @@ mod tests {
         assert!(flex.restore(&mark, &vault).unwrap());
         assert!(!flex.path().exists());
         // Codex added its own settings meanwhile: only our line goes, the file stays.
-        flex.apply(&vault).unwrap();
+        set(&flex, &vault);
         fs::write(flex.path(), b"service_tier = \"flex\"\nmodel = \"y\"\n").unwrap();
         assert!(flex.restore(&mark, &vault).unwrap());
         assert_eq!(config(&flex), b"model = \"y\"\n");
@@ -464,7 +502,7 @@ mod tests {
     #[test]
     fn a_value_the_owner_changed_meanwhile_is_never_overwritten() {
         let (_root, flex, vault) = fixture(Some(b"service_tier = \"default\"\nmodel = \"x\"\n"));
-        let mark = flex.apply(&vault).unwrap();
+        let mark = set(&flex, &vault);
         for changed in [
             &b"service_tier = \"priority\"\nmodel = \"x\"\n"[..],
             b"model = \"x\"\n",
@@ -487,7 +525,7 @@ mod tests {
         let original = b"# mine\nservice_tier = \"flex\"\n";
         let (_root, flex, vault) = fixture(Some(original));
         let before = flex.read().unwrap().1;
-        let mark = flex.apply(&vault).unwrap();
+        let mark = set(&flex, &vault);
         // Nothing was written, not even a new timestamp.
         assert_eq!(flex.read().unwrap().1, before);
         assert_eq!(mark.previous.as_deref(), Some("\"flex\""));
@@ -506,6 +544,7 @@ mod tests {
             b"\xff\xfe",
         ] {
             let (_root, flex, vault) = fixture(Some(refused));
+            assert!(flex.plan().is_err(), "{refused:?}");
             assert!(flex.apply(&vault).is_err(), "{refused:?}");
             assert_eq!(config(&flex), refused);
             assert!(leftovers(&flex).is_empty());
@@ -574,7 +613,7 @@ mod tests {
         for name in ["auth.json", "history.jsonl", "mcp.json"] {
             fs::write(home.join(name), b"unrelated-sentinel").unwrap();
         }
-        let mark = flex.apply(&vault).unwrap();
+        let mark = set(&flex, &vault);
         for name in ["auth.json", "history.jsonl", "mcp.json"] {
             assert_eq!(fs::read(home.join(name)).unwrap(), b"unrelated-sentinel");
         }
@@ -600,7 +639,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let (_root, flex, vault) = fixture(Some(b"service_tier = \"default\"\n"));
         fs::set_permissions(flex.path(), fs::Permissions::from_mode(0o640)).unwrap();
-        let mark = flex.apply(&vault).unwrap();
+        let mark = set(&flex, &vault);
         let mode = |flex: &CodexConfigFlex| {
             fs::metadata(flex.path()).unwrap().permissions().mode() & 0o777
         };
@@ -609,11 +648,134 @@ mod tests {
         assert_eq!(mode(&flex), 0o640);
     }
 
+    type Hook = Box<dyn FnOnce(&std::path::Path)>;
+    thread_local! {
+        static AFTER_REPLACE: std::cell::RefCell<Option<Hook>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    /// Runs the registered hook once, right after our replacement and before it is read
+    /// back: Codex writing the file at that moment.
+    pub(super) fn after_replace(path: &std::path::Path) {
+        if let Some(hook) = AFTER_REPLACE.with(|slot| slot.borrow_mut().take()) {
+            hook(path);
+        }
+    }
+    fn on_replace(hook: impl FnOnce(&std::path::Path) + 'static) {
+        AFTER_REPLACE.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    #[test]
+    fn plan_writes_nothing_and_names_what_restore_will_put_back() {
+        let (_root, flex, _vault) = fixture(Some(b"service_tier = 'default'\nmodel = \"x\"\n"));
+        let before = flex.read().unwrap().1;
+        assert_eq!(
+            flex.plan().unwrap(),
+            FlexMark {
+                previous: Some("'default'".into()),
+                config_existed: true
+            }
+        );
+        assert_eq!(flex.read().unwrap().1, before);
+        let (_root, flex, _vault) = fixture(Some(b"model = \"x\"\n"));
+        assert_eq!(
+            flex.plan().unwrap(),
+            FlexMark {
+                previous: None,
+                config_existed: true
+            }
+        );
+        // A missing file stays missing.
+        let (_root, flex, _vault) = fixture(None);
+        assert_eq!(
+            flex.plan().unwrap(),
+            FlexMark {
+                previous: None,
+                config_existed: false
+            }
+        );
+        assert!(!flex.path().exists());
+        // The longest value a mark holds is accepted and comes back byte for byte.
+        let longest = format!("service_tier = \"{}\"\n", "a".repeat(254));
+        let (_root, flex, vault) = fixture(Some(longest.as_bytes()));
+        let mark = set(&flex, &vault);
+        assert_eq!(mark.previous.as_ref().map(String::len), Some(256));
+        assert!(flex.restore(&mark, &vault).unwrap());
+        assert_eq!(config(&flex), longest.as_bytes());
+    }
+
+    #[test]
+    fn a_value_that_restore_could_not_put_back_is_refused_before_anything_is_written() {
+        let long = format!("service_tier = \"{}\"\n", "a".repeat(255));
+        for refused in [
+            "service_tier = \"\"\"\ndefault\"\"\"\nmodel = \"x\"\n",
+            "service_tier = \"\"\"default\"\"\"\n",
+            "service_tier = '''default'''\n",
+            "service_tier = '''\ndefault'''\n",
+            long.as_str(),
+        ] {
+            let (_root, flex, vault) = fixture(Some(refused.as_bytes()));
+            assert!(flex.plan().is_err(), "{refused:?}");
+            // The edit itself refuses the same values: no mark could undo it.
+            assert!(flex.apply(&vault).is_err(), "{refused:?}");
+            assert_eq!(config(&flex), refused.as_bytes());
+            assert!(leftovers(&flex).is_empty());
+        }
+    }
+
+    #[test]
+    fn the_original_value_survives_a_write_by_codex_right_after_our_replacement() {
+        let original = b"service_tier = \"default\"\nmodel = \"x\"\n";
+        // Codex adds a setting between our replacement and the read-back: the edit is
+        // retried, finds Flex already in place and changes nothing more.
+        let (_root, flex, vault) = fixture(Some(original));
+        let mark = flex.plan().unwrap();
+        on_replace(|path| {
+            let mut text = fs::read(path).unwrap();
+            text.extend_from_slice(b"[tui]\ntheme = \"y\"\n");
+            fs::write(path, text).unwrap();
+        });
+        flex.apply(&vault).unwrap();
+        assert_eq!(
+            config(&flex),
+            b"service_tier = \"flex\"\nmodel = \"x\"\n[tui]\ntheme = \"y\"\n"
+        );
+        // The mark was fixed before the write: the owner's value comes back.
+        assert!(flex.restore(&mark, &vault).unwrap());
+        assert_eq!(
+            config(&flex),
+            b"service_tier = \"default\"\nmodel = \"x\"\n[tui]\ntheme = \"y\"\n"
+        );
+        // A stale rewrite by Codex puts the old value back: the retry sets Flex again.
+        let (_root, flex, vault) = fixture(Some(original));
+        let mark = flex.plan().unwrap();
+        on_replace(|path| {
+            fs::write(
+                path,
+                b"service_tier = \"default\"\nmodel = \"x\"\n# codex\n",
+            )
+            .unwrap();
+        });
+        flex.apply(&vault).unwrap();
+        assert_eq!(
+            config(&flex),
+            b"service_tier = \"flex\"\nmodel = \"x\"\n# codex\n"
+        );
+        assert!(flex.restore(&mark, &vault).unwrap());
+        assert_eq!(
+            config(&flex),
+            b"service_tier = \"default\"\nmodel = \"x\"\n# codex\n"
+        );
+        assert!(leftovers(&flex).is_empty());
+    }
+
     #[test]
     fn a_leading_byte_order_mark_stays_first() {
         let original = "\u{feff}model = \"x\"\n";
         let (_root, flex, vault) = fixture(Some(original.as_bytes()));
-        match flex.apply(&vault) {
+        match flex
+            .plan()
+            .and_then(|mark| flex.apply(&vault).map(|()| mark))
+        {
             Ok(mark) => {
                 assert_eq!(
                     String::from_utf8(config(&flex)).unwrap(),

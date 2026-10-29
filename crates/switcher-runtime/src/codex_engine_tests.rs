@@ -4751,3 +4751,236 @@ service_tier = \"default\"
         Some(CodexReason::PolicyRestricted)
     );
 }
+
+// The mark is saved before config.toml changes: no crash leaves Flex without a mark.
+impl Fixture {
+    /// A restart of the app: the state comes back from the vault.
+    fn reload_state(&mut self) {
+        let mut restarted = CodexEngine::load(&self.vault);
+        std::mem::swap(&mut self.engine.saved, &mut restarted.saved);
+    }
+    /// What a crash leaves behind: the mark in the vault and `config` in config.toml.
+    fn crash_with(&mut self, mark: FlexMark, config: Option<&[u8]>) {
+        match config {
+            Some(bytes) => self.write_config(bytes),
+            None => fs::remove_file(self.home.join("config.toml")).unwrap(),
+        }
+        self.engine.saved.flex_applied = Some(mark);
+        self.engine.save(&self.vault).unwrap();
+        self.reload_state();
+    }
+    /// The vault record cannot be written any more.
+    fn break_vault(&self) {
+        let record = self._root.path().join("vault/codex-state.vault");
+        fs::rename(&record, self._root.path().join("vault/kept.vault")).unwrap();
+        fs::create_dir(&record).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_crash_between_the_mark_and_the_config_write_clears_the_mark_and_leaves_the_file_alone() {
+    let mut f = Fixture::new();
+    f.flex_ready(OWNER_CONFIG);
+    let a = f.id_of("ws-a");
+    f.flex_key("Work key", FAKE_KEY).await;
+    // The mark reached the vault, the file was never written, ChatGPT is active.
+    f.crash_with(flex_mark(Some("\"default\"")), Some(OWNER_CONFIG));
+    assert_eq!(
+        f.saved_state().flex_applied,
+        Some(flex_mark(Some("\"default\"")))
+    );
+    assert!(f.engine.flex_restore_pending());
+    f.engine.observe(&f.vault, 300).unwrap();
+    // Not Flex means not ours: the mark goes and not one byte of the file changes.
+    assert_eq!(f.config(), OWNER_CONFIG);
+    assert!(f.engine.saved.flex_applied.is_none() && f.saved_state().flex_applied.is_none());
+    assert!(!f.warnings().contains(&CodexReason::FlexRestoreFailed));
+    assert_eq!(f.engine.selected_id.as_deref(), Some(a.as_str()));
+    // The same when the key was absent and there was no file: no file appears.
+    f.crash_with(
+        FlexMark {
+            previous: None,
+            config_existed: false,
+        },
+        None,
+    );
+    f.engine.observe(&f.vault, 310).unwrap();
+    assert!(!f.home.join("config.toml").exists());
+    assert!(f.saved_state().flex_applied.is_none());
+    // A value the owner chose meanwhile is left alone as well.
+    let owner = b"service_tier = \"priority\"\nmodel = \"x\"\n";
+    f.crash_with(flex_mark(Some("\"default\"")), Some(owner));
+    f.engine.observe(&f.vault, 320).unwrap();
+    assert_eq!(f.config(), owner);
+    assert!(f.saved_state().flex_applied.is_none());
+    f.claude_untouched();
+}
+
+#[tokio::test]
+async fn a_crash_after_the_config_write_is_restored_unless_a_flex_key_is_active() {
+    let mut f = Fixture::new();
+    f.flex_ready(OWNER_CONFIG);
+    let a = f.id_of("ws-a");
+    let key = f.flex_key("Work key", FAKE_KEY).await;
+    // Mark and Flex are both on disk; the login never changed. Codex added a setting.
+    let mut crashed = flexed(OWNER_CONFIG, "service_tier = \"default\"");
+    crashed.extend_from_slice(b"[tui]\r\ntheme = \"y\"\r\n");
+    f.crash_with(flex_mark(Some("\"default\"")), Some(&crashed));
+    f.engine.observe(&f.vault, 300).unwrap();
+    let mut restored = OWNER_CONFIG.to_vec();
+    restored.extend_from_slice(b"[tui]\r\ntheme = \"y\"\r\n");
+    assert_eq!(f.config(), restored);
+    assert!(f.engine.saved.flex_applied.is_none() && f.saved_state().flex_applied.is_none());
+    assert_eq!(f.engine.selected_id.as_deref(), Some(a.as_str()));
+    // The same state while the Flex key is the live login: Flex and the mark stay.
+    f.crash_with(flex_mark(Some("\"default\"")), Some(&crashed));
+    f.write_active(&key_file(FAKE_KEY));
+    f.engine.observe(&f.vault, 310).unwrap();
+    assert_eq!(f.engine.selected_id.as_deref(), Some(key.as_str()));
+    assert_eq!(f.config(), crashed);
+    assert_eq!(
+        f.saved_state().flex_applied,
+        Some(flex_mark(Some("\"default\"")))
+    );
+    // And back to ChatGPT outside the app: the saved original value returns.
+    f.write_active(&auth("user-a", "ws-a", "initial"));
+    f.engine.observe(&f.vault, 320).unwrap();
+    assert_eq!(f.config(), restored);
+    assert!(f.saved_state().flex_applied.is_none());
+    f.claude_untouched();
+}
+
+#[tokio::test]
+async fn a_value_a_mark_could_not_put_back_aborts_the_switch_and_changes_no_file() {
+    let long = format!("service_tier = \"{}\"\n", "a".repeat(300)).into_bytes();
+    for config in [
+        b"service_tier = \"\"\"\ndefault\"\"\"\nmodel = \"x\"\n".to_vec(),
+        b"service_tier = '''default'''\n".to_vec(),
+        long,
+    ] {
+        let mut f = Fixture::new();
+        f.flex_ready(&config);
+        let key = f.flex_key("Work key", FAKE_KEY).await;
+        let login = f.active();
+        assert_eq!(
+            f.switch(&key).await.err(),
+            Some(CodexReason::FlexConfigFailed)
+        );
+        assert_eq!(f.config(), config);
+        assert_eq!(f.active(), login);
+        assert!(f.engine.saved.flex_applied.is_none() && f.saved_state().flex_applied.is_none());
+        assert!(f.daemon.calls.lock().unwrap().is_empty());
+        assert!(f.engine.switching.is_none() && f.engine.last_switch.is_none());
+        // Turning the option on for the active key is refused the same way.
+        f.add_key("Plain", SECOND_KEY).await.unwrap();
+        let plain = f.key_id(SECOND_KEY);
+        f.switch(&plain).await.unwrap();
+        assert_eq!(
+            f.set_flex(&plain, true).await.err(),
+            Some(CodexReason::FlexConfigFailed)
+        );
+        assert!(!f.view(&plain).use_flex);
+        assert!(
+            !f.saved_state()
+                .accounts
+                .iter()
+                .any(|a| a.id == plain && a.use_flex)
+        );
+        assert_eq!(f.config(), config);
+        assert!(f.saved_state().flex_applied.is_none());
+        f.claude_untouched();
+    }
+}
+
+#[tokio::test]
+async fn when_the_mark_cannot_be_saved_the_config_is_never_written() {
+    let mut f = Fixture::new();
+    f.flex_ready(OWNER_CONFIG);
+    f.add_key("Work key", FAKE_KEY).await.unwrap();
+    let key = f.key_id(FAKE_KEY);
+    f.switch(&key).await.unwrap();
+    f.break_vault();
+    // Nothing may depend on a mark that is not durable: the file is not touched at all.
+    assert_eq!(
+        f.engine.apply_flex(&f.vault).err(),
+        Some(CodexReason::VaultUnavailable)
+    );
+    assert_eq!(f.config(), OWNER_CONFIG);
+    assert!(f.engine.saved.flex_applied.is_none());
+    let leftovers = fs::read_dir(&f.home)
+        .unwrap()
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".primerswitch")
+        })
+        .count();
+    assert_eq!(leftovers, 0);
+    // The toggle on the active key fails the same way and the setting stays off.
+    assert_eq!(
+        f.set_flex(&key, true).await.err(),
+        Some(CodexReason::VaultUnavailable)
+    );
+    assert_eq!(f.config(), OWNER_CONFIG);
+    assert!(!f.engine.saved.accounts.iter().any(|a| a.use_flex));
+    assert!(!f.engine.writable);
+    f.claude_untouched();
+}
+
+#[tokio::test]
+async fn a_config_write_that_fails_after_the_mark_was_saved_takes_the_mark_back() {
+    let mut f = Fixture::new();
+    f.flex_ready(OWNER_CONFIG);
+    f.add_key("Work key", FAKE_KEY).await.unwrap();
+    let key = f.key_id(FAKE_KEY);
+    f.switch(&key).await.unwrap();
+    // The context lock is held elsewhere: the plan works, the write cannot start.
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(f._root.path().join(format!(
+            "vault/.context-{}.lock",
+            f.engine.store().unwrap().context().context_id()
+        )))
+        .unwrap();
+    lock.lock().unwrap();
+    assert_eq!(
+        f.set_flex(&key, true).await.err(),
+        Some(CodexReason::FlexConfigFailed)
+    );
+    assert_eq!(f.config(), OWNER_CONFIG);
+    assert!(f.engine.saved.flex_applied.is_none() && f.saved_state().flex_applied.is_none());
+    // The setting is off in memory and in the vault: a restart does not apply it later.
+    assert!(!f.view(&key).use_flex && !f.saved_state().accounts.iter().any(|a| a.use_flex));
+    drop(lock);
+    f.set_flex(&key, true).await.unwrap();
+    assert_eq!(
+        f.config(),
+        flexed(OWNER_CONFIG, "service_tier = \"default\"")
+    );
+    f.claude_untouched();
+}
+
+#[tokio::test]
+async fn the_toggle_decides_on_the_live_login_not_on_a_stale_selection() {
+    let mut f = Fixture::new();
+    f.flex_ready(OWNER_CONFIG);
+    let a = f.id_of("ws-a");
+    f.add_key("Work key", FAKE_KEY).await.unwrap();
+    let key = f.key_id(FAKE_KEY);
+    f.switch(&key).await.unwrap();
+    // `codex login` with ChatGPT outside the app, before the next tick looked at it.
+    f.write_active(&auth("user-a", "ws-a", "external"));
+    assert_eq!(f.engine.selected_id.as_deref(), Some(key.as_str()));
+    f.set_flex(&key, true).await.unwrap();
+    // The setting is saved, but Flex is not applied under a ChatGPT login.
+    assert_eq!(f.engine.selected_id.as_deref(), Some(a.as_str()));
+    assert!(f.view(&key).use_flex && f.saved_state().accounts.iter().any(|a| a.use_flex));
+    assert_eq!(f.config(), OWNER_CONFIG);
+    assert!(f.engine.saved.flex_applied.is_none() && f.saved_state().flex_applied.is_none());
+    assert!(!f.warnings().contains(&CodexReason::FlexRestoreFailed));
+    f.claude_untouched();
+}

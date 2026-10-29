@@ -967,8 +967,10 @@ impl CodexEngine {
     fn flex_config(&self) -> Result<CodexConfigFlex, CodexReason> {
         Ok(CodexConfigFlex::new(self.store()?.context().clone()))
     }
-    /// Set `service_tier = "flex"` and record what to put back, durably, before anything
-    /// depends on it. Does nothing while this app's own setting is still in place.
+    /// Set `service_tier = "flex"`. What to put back is saved durably BEFORE the file
+    /// changes, so no crash can leave Flex in config.toml without a mark: a mark with a
+    /// file that does not say Flex is cleared by the next restore, and a mark with Flex
+    /// in the file is restored. Does nothing while this app's own setting is in place.
     fn apply_flex(&mut self, vault: &Vault) -> Result<(), CodexReason> {
         let config = self
             .flex_config()
@@ -980,15 +982,24 @@ impl CodexEngine {
         {
             return Ok(());
         }
-        let mark = config
-            .apply(vault)
-            .map_err(|_| CodexReason::FlexConfigFailed)?;
-        let before = self.saved.flex_applied.replace(mark.clone());
+        let mark = config.plan().map_err(|_| CodexReason::FlexConfigFailed)?;
+        let before = self.saved.flex_applied.replace(mark);
         if let Err(error) = self.save(vault) {
-            // Without a durable mark Flex would outlive a crash: undo it.
+            // Nothing was written to config.toml yet.
             self.saved.flex_applied = before;
-            let _ = config.restore(&mark, vault);
             return Err(error);
+        }
+        if config.apply(vault).is_err() {
+            // The file may still have taken the change (a conflict after the replace):
+            // then the mark stays and the next restore puts the value back.
+            if config
+                .current()
+                .is_ok_and(|value| value.as_deref() != Some("flex"))
+            {
+                self.saved.flex_applied = None;
+                let _ = self.save(vault);
+            }
+            return Err(CodexReason::FlexConfigFailed);
         }
         // The new file is a normal Codex config: take it as the qualified state.
         let _ = self.requalify();
@@ -1512,7 +1523,7 @@ impl CodexEngine {
                 self.add_api_key(&name, &key, vault, now)?;
             }
             CodexCommand::SetApiKeyFlex(id, enabled) => {
-                self.set_api_key_flex(&id, enabled, vault)?;
+                self.set_api_key_flex(&id, enabled, vault, now)?;
             }
             CodexCommand::Delete(id) => {
                 if self.pending_login.is_some() || self.switching.is_some() {
@@ -2137,10 +2148,15 @@ impl CodexEngine {
         id: &str,
         enabled: bool,
         vault: &Vault,
+        now: i64,
     ) -> Result<(), CodexReason> {
         if self.pending_login.is_some() || self.switching.is_some() {
             return Err(CodexReason::Busy);
         }
+        // The active login can have changed outside the app since the last tick: Flex is
+        // decided on the live one, never on a stale selection. A failed observation does
+        // not stop the toggle.
+        let _ = self.observe_login(vault, now);
         let index = self.account_index(id)?;
         if self.saved.accounts[index].auth_kind != AuthKind::ApiKey {
             return Err(CodexReason::UnsupportedAuth);
@@ -2162,6 +2178,8 @@ impl CodexEngine {
         if let Err(error) = self.reconcile_flex(vault) {
             if enabled {
                 self.saved.accounts[index].use_flex = false;
+                // The mark saved before the config write also carried the new setting.
+                let _ = self.save(vault);
             } else {
                 self.save(vault)?;
             }

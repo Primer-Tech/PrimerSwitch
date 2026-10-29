@@ -130,6 +130,10 @@ The [future provider plan](FUTURE_CODEX.md) defines C00–C04 gates. Add test gr
 
 ## 8. Commands and completion record
 
+### 0.2.6 manual Claude identity recovery regressions
+
+Five runtime fixtures cover stale CLI identity with the selected saved credential, forced fresh owner proof despite cached verification, unchanged saved tokens and unrelated JSON, an expired live credential without refresh or inference, wrong account/workspace or missing/empty saved workspace, transport/401/429 failures, and concurrent token rotation or external login. The existing unknown-owner switch rejection remains required. All fixture homes and transports are synthetic. An owner-authorized local corrective switch is operational evidence, separate from these tests.
+
 ### 0.2.5 sign-in repair and automatic return regressions
 
 - A saved inactive Claude account with an expired/rejected access token and valid refresh grant recovers with one refresh and a matching profile proof. Generic 401, permission 403, rate limits and explicit `invalid_grant` stay distinct; confirmed revocation backs off, old unconfirmed sign-in flags revalidate, and a successful unchanged active session clears a stale prompt.

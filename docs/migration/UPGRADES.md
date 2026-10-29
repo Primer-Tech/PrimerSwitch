@@ -75,6 +75,10 @@ Install 0.2.4 over the existing Windows installation under the same user and kee
 
 After upgrading, use the same Automation controls in each provider's account details to customize thresholds, exclude manual-only accounts, set priority, and enable return after a natural five-hour reset. Manual selection pauses returns for 15 minutes, with a visible resume control. Validation and the local installation's opaque file-preservation evidence are recorded in [PROGRESS.md](PROGRESS.md).
 
+## Manual Claude switch 0.2.6 fix
+
+Install 0.2.6 over 0.2.5 under the same user and in the same directory. Accounts, credentials and settings retain their existing format. If Claude's credential file already contains the selected saved account but its configured identity still names another account, manual Switch can repair that mismatch after fresh account/workspace verification. Exact credential matching and the existing encrypted transaction preserve newer external logins. Automatic switching retains its existing ownership checks.
+
 ## Sign-in and automatic return 0.2.5 fix
 
 Install 0.2.5 over 0.2.4 under the same user and in the same directory. Saved account identities, thresholds, priorities and opt-ins are preserved. Expired inactive Claude access tokens now receive a bounded refresh/identity check before being treated as needing sign-in. Old unconfirmed sign-in flags are checked again once; an explicitly revoked refresh grant still requires browser sign-in.

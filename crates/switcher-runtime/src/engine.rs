@@ -1354,7 +1354,9 @@ impl Engine {
                 self.saved.return_hold_until =
                     Some(self.clock.now().saturating_add(MANUAL_RETURN_HOLD));
                 self.persist()?;
-                self.switch_to(&id, false, false).await?;
+                if !self.reconcile_selected_login(&id).await? {
+                    self.switch_to(&id, false, false).await?;
+                }
             }
             Command::Delete(id) => {
                 let i = self.index(&id)?;
@@ -2383,6 +2385,59 @@ impl Engine {
             return Err(error);
         }
         Ok(())
+    }
+    /// A CLI login can update credentials without updating `oauthAccount`. An
+    /// explicit selection may repair that owner only when the entire live OAuth
+    /// blob already equals the selected saved credential and a fresh profile
+    /// confirms its account/workspace. Never capture it as the stale outgoing
+    /// owner, or refresh a credential the CLI is already using.
+    async fn reconcile_selected_login(&mut self, id: &str) -> Result<bool, RuntimeError> {
+        self.observe_active()?;
+        let live = self.live()?;
+        let i = self.index(id)?;
+        let target = self.saved.accounts[i].clone();
+        let Some(oauth) = target
+            .credentials
+            .get("claudeAiOauth")
+            .filter(|v| v.is_object())
+        else {
+            return Ok(false);
+        };
+        if same_owner(&target, &live.identity)
+            || live.credentials.get("claudeAiOauth") != Some(oauth)
+        {
+            return Ok(false);
+        }
+        if target.account_uuid().is_none_or(str::is_empty)
+            || target.organization_uuid().is_none_or(str::is_empty)
+        {
+            return Err(RuntimeError::Identity);
+        }
+        let token = target.access_token().ok_or(RuntimeError::Identity)?;
+        self.verify_profile(id, token, &live.identity_fingerprint)
+            .await?;
+        self.persist()?;
+        self.active_store()?.switch_checked(
+            &target.credentials,
+            &target.oauth_account,
+            &live.fingerprint,
+            self.vault.as_ref().ok_or(RuntimeError::Storage)?,
+        )?;
+        self.observe_active()?;
+        // Observing a different configured owner invalidates cached proofs. The
+        // selected credential was just proven and committed under the full guard.
+        self.saved.accounts[i].identity_verified = true;
+        let reading = self.saved.readings.entry(id.into()).or_default();
+        reading.active_reauth_pending = false;
+        reading.error = None;
+        self.exhausted = false;
+        self.persist()?;
+        self.notify(format!(
+            "{} {}",
+            self.t("Switched to", "Comutat pe"),
+            safe_label(target.email().unwrap_or(&target.name))
+        ));
+        Ok(true)
     }
     async fn switch_to(
         &mut self,
@@ -5566,6 +5621,203 @@ mod tests {
         );
         assert_eq!(std::fs::read(&paths.credentials_file).unwrap(), before);
         assert_eq!(handle.get_snapshot().active_id.as_deref(), Some("a"));
+    }
+    #[tokio::test]
+    async fn manual_switch_repairs_stale_cli_identity_for_the_selected_live_token() {
+        let fake = Arc::new(Fake::default());
+        let (temp, handle, _clock, paths) = fixture(
+            vec![account("a", 1000), account("b", 1000)],
+            Some("a"),
+            1000,
+            fake.clone(),
+        );
+        handle.tick(true).await.unwrap();
+        let before = saved_record(&temp);
+        let outgoing = before.accounts[0].clone();
+        let target = before.accounts[1].clone();
+        let mut credentials = target.credentials.clone();
+        credentials["unrelatedCliCredential"] = json!({"keep": true});
+        std::fs::write(
+            &paths.credentials_file,
+            serde_json::to_vec(&credentials).unwrap(),
+        )
+        .unwrap();
+        let profiles = count(&fake, PROFILE_URL);
+
+        handle.switch_account("b").await.unwrap();
+
+        assert_eq!(handle.get_snapshot().active_id.as_deref(), Some("b"));
+        assert_eq!(count(&fake, PROFILE_URL), profiles + 1);
+        assert_eq!(count(&fake, TOKEN_URL), 0);
+        let config: Value =
+            serde_json::from_slice(&std::fs::read(&paths.global_config_file).unwrap()).unwrap();
+        assert_eq!(config["keep"], true);
+        let live = ActiveStore::file(paths).read().unwrap();
+        assert!(same_owner(&target, &live.identity));
+        assert_eq!(live.credentials, credentials);
+        let saved = saved_record(&temp);
+        assert_eq!(saved.accounts[0].credentials, outgoing.credentials);
+        assert_eq!(saved.accounts[0].oauth_account, outgoing.oauth_account);
+        assert_eq!(saved.accounts[1].credentials, target.credentials);
+        assert!(saved.readings["a"].unverified_oauth.is_none());
+        assert!(saved.return_hold_until.is_some());
+        assert!(view(&handle, "b").identity_verified);
+    }
+    #[tokio::test]
+    async fn manual_identity_repair_never_refreshes_the_live_expired_credential() {
+        let fake = Arc::new(Fake::default());
+        let mut target = account("b", 1000);
+        target.credentials["claudeAiOauth"]["expiresAt"] = json!(999_000);
+        let (_temp, handle, _clock, paths) = fixture(
+            vec![account("a", 1000), target.clone()],
+            Some("a"),
+            1000,
+            fake.clone(),
+        );
+        std::fs::write(
+            &paths.credentials_file,
+            serde_json::to_vec(&target.credentials).unwrap(),
+        )
+        .unwrap();
+        handle.switch_account("b").await.unwrap();
+        assert_eq!(handle.get_snapshot().active_id.as_deref(), Some("b"));
+        assert_eq!(count(&fake, PROFILE_URL), 1);
+        assert_eq!(count(&fake, TOKEN_URL), 0);
+        assert_eq!(count(&fake, USAGE_URL), 0);
+        assert_eq!(count(&fake, INFERENCE_URL), 0);
+    }
+    #[tokio::test]
+    async fn manual_identity_repair_requires_fresh_matching_account_and_workspace() {
+        for (reply, expected) in [
+            (owner_reply("intruder").1, RuntimeError::Identity),
+            (
+                Ok(response(
+                    200,
+                    json!({"account":{"uuid":"b"},"organization":{"uuid":"other-org"}}),
+                )),
+                RuntimeError::Identity,
+            ),
+            (
+                Ok(response(200, json!({"account":{"uuid":"b"}}))),
+                RuntimeError::Identity,
+            ),
+            (Err(ClientError::Transport), RuntimeError::Provider),
+            (Err(ClientError::Unauthorized), RuntimeError::SignInRequired),
+            (
+                Err(ClientError::RateLimited {
+                    retry_after: Some(600),
+                }),
+                RuntimeError::Provider,
+            ),
+        ] {
+            let fake = Arc::new(Fake::default());
+            let (temp, handle, _clock, paths) = fixture(
+                vec![account("a", 1000), account("b", 1000)],
+                Some("a"),
+                1000,
+                fake.clone(),
+            );
+            handle.tick(true).await.unwrap();
+            let saved = saved_record(&temp);
+            let credentials = serde_json::to_vec(&saved.accounts[1].credentials).unwrap();
+            std::fs::write(&paths.credentials_file, &credentials).unwrap();
+            let config = std::fs::read(&paths.global_config_file).unwrap();
+            fake.replies.lock().unwrap().push_back((PROFILE_URL, reply));
+
+            assert_eq!(handle.switch_account("b").await.unwrap_err(), expected);
+
+            assert_eq!(std::fs::read(&paths.credentials_file).unwrap(), credentials);
+            assert_eq!(std::fs::read(&paths.global_config_file).unwrap(), config);
+            assert_eq!(handle.get_snapshot().active_id.as_deref(), Some("a"));
+            let after = saved_record(&temp);
+            for (before, after) in saved.accounts.iter().zip(&after.accounts) {
+                assert_eq!(before.credentials, after.credentials);
+            }
+            assert_eq!(count(&fake, TOKEN_URL), 0);
+        }
+    }
+    #[tokio::test]
+    async fn manual_identity_repair_requires_a_known_saved_workspace() {
+        for organization in [Value::Null, json!("")] {
+            let fake = Arc::new(Fake::default());
+            let mut target = account("b", 1000);
+            target.oauth_account["organizationUuid"] = organization;
+            let (_temp, handle, _clock, paths) = fixture(
+                vec![account("a", 1000), target.clone()],
+                Some("a"),
+                1000,
+                fake.clone(),
+            );
+            let credentials = serde_json::to_vec(&target.credentials).unwrap();
+            std::fs::write(&paths.credentials_file, &credentials).unwrap();
+            let config = std::fs::read(&paths.global_config_file).unwrap();
+
+            assert_eq!(
+                handle.switch_account("b").await.unwrap_err(),
+                RuntimeError::Identity
+            );
+
+            assert_eq!(std::fs::read(&paths.credentials_file).unwrap(), credentials);
+            assert_eq!(std::fs::read(&paths.global_config_file).unwrap(), config);
+            assert_eq!(count(&fake, PROFILE_URL), 0);
+            assert_eq!(count(&fake, TOKEN_URL), 0);
+        }
+    }
+    #[tokio::test]
+    async fn manual_identity_repair_preserves_external_login_and_same_owner_rotation() {
+        for changed_owner in [false, true] {
+            let fake = Arc::new(Fake::default());
+            let (temp, handle, _clock, paths) = fixture(
+                vec![account("a", 1000), account("b", 1000)],
+                Some("a"),
+                1000,
+                fake.clone(),
+            );
+            let saved = saved_record(&temp);
+            std::fs::write(
+                &paths.credentials_file,
+                serde_json::to_vec(&saved.accounts[1].credentials).unwrap(),
+            )
+            .unwrap();
+            let mut external = account(if changed_owner { "external" } else { "b" }, 1000);
+            external.credentials["claudeAiOauth"]["accessToken"] =
+                json!("token-external-rotated-SENTINEL");
+            let external_credentials = serde_json::to_vec(&external.credentials).unwrap();
+            let external_config = if changed_owner {
+                serde_json::to_vec(&json!({"oauthAccount":external.oauth_account,"keep":true}))
+                    .unwrap()
+            } else {
+                std::fs::read(&paths.global_config_file).unwrap()
+            };
+            let credentials_path = paths.credentials_file.clone();
+            let config_path = paths.global_config_file.clone();
+            let credentials = external_credentials.clone();
+            let config = external_config.clone();
+            *fake.hook.lock().unwrap() = Some(Box::new(move |request| {
+                assert_eq!(request.url, PROFILE_URL);
+                std::fs::write(credentials_path, credentials).unwrap();
+                std::fs::write(config_path, config).unwrap();
+            }));
+
+            assert_eq!(
+                handle.switch_account("b").await.unwrap_err(),
+                RuntimeError::ExternalChange
+            );
+
+            assert_eq!(
+                std::fs::read(&paths.credentials_file).unwrap(),
+                external_credentials
+            );
+            assert_eq!(
+                std::fs::read(&paths.global_config_file).unwrap(),
+                external_config
+            );
+            let after = saved_record(&temp);
+            for (before, after) in saved.accounts.iter().zip(&after.accounts) {
+                assert_eq!(before.credentials, after.credentials);
+            }
+            assert_eq!(count(&fake, TOKEN_URL), 0);
+        }
     }
     #[tokio::test]
     async fn holding_a_grant_alone_costs_no_reset_preflight_and_never_blocks_switching() {

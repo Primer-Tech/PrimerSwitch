@@ -1,5 +1,9 @@
 # Shared implementation contract
 
+## Manual Claude identity recovery (2026-10-22)
+
+An explicit Claude account selection can reconcile stale CLI `oauthAccount` metadata when the entire live `claudeAiOauth` blob already equals the selected saved credential. A new profile request must confirm both account and workspace, even if a cached proof exists. The existing encrypted transaction checks the full original login fingerprint before writing. Do not refresh that live credential, attribute it to the stale outgoing owner, or change any saved credential. Provider failures, mismatched workspaces and concurrent external token/owner changes leave the CLI login intact. This bounded recovery runs only for a manual selection; automatic switching retains its existing ownership rules.
+
 ## Sign-in repair and return scheduling (2026-10-15)
 
 Claude browser sign-in uses the subscription authorization route from the installed public Claude Code 2.1.300 constants, `https://claude.com/cai/oauth/authorize`; token exchange and the manual callback stay on `platform.claude.com`. Console authorization is a different billing/workspace flow. Keep the full current login scopes; do not infer that an organization scope alone selects Console.

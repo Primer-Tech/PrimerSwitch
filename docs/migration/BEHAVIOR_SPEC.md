@@ -272,5 +272,6 @@ These preserve the application's intended functionality while fixing behavior th
 | D11 | Unauthorized retry bypasses normal 429 state | One bounded retry path using the same backoff and timestamp handling |
 | D12 | Priming persistence/ambiguous claims can repeat a scarce side effect | Durable attempt records, same-key reset retry, reconciliation before abandoning an unresolved claim |
 | D13 | HTTP error snippets can reach tooltips | Redacted typed details; no authenticated bodies, tokens or raw credential data over IPC/logs |
+| D14 | CLI credentials can name the selected saved account while `oauthAccount` still names another | Manual selection repairs the stale metadata only for an exact live/saved OAuth match, fresh account/workspace proof and a full-fingerprint guarded transaction; preserve both saved credentials and never refresh the live token |
 
 Adding a stricter unsupported-feature gate, changing last-resort `usable_now`, changing model matching, altering defaults, or removing automatic priming/reset redemption requires an explicit documented decision and acceptance evidence; it is not an implicit refactor.

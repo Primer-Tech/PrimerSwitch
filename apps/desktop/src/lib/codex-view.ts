@@ -210,7 +210,8 @@ function row(
       [
         account.authKind === 'apiKey' && account.apiKeyTail
           ? t(locale, 'codexApiKeyEnding', { tail: account.apiKeyTail }) +
-            (account.useFlex ? ` · ${t(locale, 'codexFlexTag')}` : '')
+            (account.useFlex ? ` · ${t(locale, 'codexFlexTag')}` : '') +
+            (account.fallback ? ` · ${t(locale, 'codexFallbackTag')}` : '')
           : null,
         account.email && account.email !== account.name ? account.email : null,
         workspaceLabel,
@@ -377,8 +378,8 @@ export function codexView(
           )
         : null,
     alertLimit: activeLimit,
-    // An API key has no limit to reach and automation never switches to it, so it
-    // neither prevents nor counts in "every account is limited".
+    // An API key has no limit to reach, so it neither prevents nor counts in
+    // "every account is limited" (a fallback key is the way out of that state).
     allLimited:
       built.some((r) => r.automation.enabled && !r.apiKey) &&
       built

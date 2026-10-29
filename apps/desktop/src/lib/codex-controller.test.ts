@@ -683,6 +683,71 @@ describe('Codex Flex processing', () => {
     expect(codexSnapshotSchema.safeParse(unknown).success).toBe(false);
   });
 });
+describe('Codex automatic API-key fallback', () => {
+  const withKey = (overrides = {}, revision = 1) => {
+    const raw = codexSnapshot({ revision });
+    raw.accounts.push(codexApiKeyAccount('codex-key', overrides));
+    return raw;
+  };
+  it('turns the fallback on or off for an API key in one native call', async () => {
+    const { c, call } = setup(withKey());
+    await c.start();
+    call.mockResolvedValueOnce(withKey({ fallback: true }, 2));
+    expect(await c.setApiKeyFallback('codex-key', true)).toBe(true);
+    expect(call).toHaveBeenLastCalledWith('codex_set_api_key_fallback', {
+      id: 'codex-key',
+      enabled: true,
+    });
+    expect(get(c).snapshot?.accounts[3].fallback).toBe(true);
+    expect(get(c).pending).toBeNull();
+    call.mockResolvedValueOnce(withKey({ fallback: false }, 3));
+    expect(await c.setApiKeyFallback('codex-key', false)).toBe(true);
+    expect(call).toHaveBeenLastCalledWith('codex_set_api_key_fallback', {
+      id: 'codex-key',
+      enabled: false,
+    });
+  });
+  it('is refused for a ChatGPT account, an unknown account or a blocked option', async () => {
+    const { c, call } = setup(
+      withKey({ fallbackToggle: codexCapability('busy') }),
+    );
+    await c.start();
+    const before = call.mock.calls.length;
+    expect(await c.setApiKeyFallback('codex-key', true)).toBe(false);
+    expect(await c.setApiKeyFallback('codex-studio', true)).toBe(false);
+    expect(await c.setApiKeyFallback('missing', true)).toBe(false);
+    expect(call.mock.calls.length).toBe(before);
+  });
+  it('shows a stable reason when the native side refuses, and keeps the old setting', async () => {
+    const { c, call } = setup(withKey());
+    await c.start();
+    call.mockRejectedValueOnce('busy');
+    expect(await c.setApiKeyFallback('codex-key', true)).toBe(false);
+    expect(get(c).error).toBe('busy');
+    expect(get(c).snapshot?.accounts[3].fallback).toBe(false);
+    call.mockRejectedValueOnce(new Error('could not save'));
+    expect(await c.setApiKeyFallback('codex-key', true)).toBe(false);
+    expect(get(c).error).toBe('actionFailed');
+  });
+  it('accepts the fallback fields and rejects unknown ones', () => {
+    const raw = withKey({
+      fallback: true,
+      fallbackHint: 'fallbackNeedsAutoSwitch',
+    });
+    raw.selectedId = 'codex-key';
+    raw.fallbackEngaged = { keyId: 'codex-key', since: 1_700_000_000 };
+    expect(codexSnapshotSchema.safeParse(raw).success).toBe(true);
+    const unknown = structuredClone(raw) as unknown as {
+      fallbackEngaged: Record<string, unknown>;
+    };
+    unknown.fallbackEngaged.fromAccountId = 'codex-studio';
+    expect(codexSnapshotSchema.safeParse(unknown).success).toBe(false);
+    // A snapshot from an older native side has none of the fields.
+    const old = codexSnapshot() as unknown as Record<string, unknown>;
+    delete old.fallbackEngaged;
+    expect(codexSnapshotSchema.safeParse(old).success).toBe(true);
+  });
+});
 describe('Codex managed browser sign-in', () => {
   it('completes managed browser login via its own poll without a pasted-code command', async () => {
     vi.useFakeTimers();

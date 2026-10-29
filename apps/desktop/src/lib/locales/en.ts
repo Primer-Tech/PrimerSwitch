@@ -475,7 +475,7 @@ export const en = {
     'Adding an account doesn’t change which account Codex uses.',
   codexApiKeyTitle: 'Add an OpenAI API key',
   codexApiKeyDescription:
-    'Codex bills an API key per token, outside your ChatGPT plan. PrimerSwitch never switches to it on its own; you choose it with Switch.',
+    'Codex bills an API key per token, outside your ChatGPT plan. PrimerSwitch never switches to it on its own unless you turn on Use as fallback for this key; otherwise you choose it with Switch.',
   codexApiKeyNameLabel: 'Name',
   codexApiKeyLabel: 'API key',
   codexApiKeyHelp:
@@ -550,4 +550,19 @@ export const en = {
     'Flex is on. New Codex sessions use Flex; sessions that are already open keep their tier.',
   codexFlexOff:
     "Flex is off again. A session started while Flex was on can fail on ChatGPT with 'Unsupported service_tier: flex'; start a new session.",
+  codexReason_fallbackNeedsAutoSwitch:
+    'Automatic fallback only works while automatic switching is on. Turn that on in the Codex automation settings.',
+  codexFallbackLabel: 'Use as fallback',
+  codexFallbackHelp:
+    'When every ChatGPT account is at its limit, PrimerSwitch switches to this key by itself, and switches back when an account recovers. Codex bills this key per token.',
+  codexFallbackTag: 'Fallback',
+  codexFallbackConfirmTitle: 'Allow automatic billing on this key?',
+  codexFallbackConfirmText:
+    'Codex bills this key per token, outside your ChatGPT plan. PrimerSwitch will switch to it by itself when every ChatGPT account is at its limit and switch back when one recovers. Set a monthly budget on the OpenAI project.',
+  codexFallbackConfirmAction: 'Turn on fallback',
+  codexFallbackFlexWarning:
+    'A Codex session started while this key is active with Flex fails on ChatGPT after the automatic return until you start a new one.',
+  codexFallbackBanner:
+    'Using API key {name} (billed per token) since {time} because every ChatGPT account is at its limit. PrimerSwitch returns automatically when one recovers.',
+  codexFallbackSwitchBack: 'Switch back now',
 } as const;

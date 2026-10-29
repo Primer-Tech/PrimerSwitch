@@ -96,6 +96,9 @@ export function codexApiKeyAccount(
     quotaState: 'unread',
     useFlex: false,
     flex: codexCapability(),
+    fallback: false,
+    fallbackToggle: codexCapability(),
+    fallbackHint: null,
     ...overrides,
   });
 }
@@ -229,6 +232,7 @@ export function codexSnapshot(
     accounts: codexAccounts(),
     selectedId: 'codex-studio',
     nextId: 'codex-research',
+    fallbackEngaged: null,
     // Personal is at its 5-hour limit and Studio is active, so only Research ranks.
     order: ['codex-research'],
     activeModel: null,

@@ -72,7 +72,7 @@ Account creation should happen in an isolated, verified credential context so ad
 
 Keep a single credential owner per saved account context. A sidecar's refresh rotation is durably adopted by the switcher; a copied active snapshot is not a second independent refresher. If ownership/adoption cannot be established, require login again for that saved account and show a clear stale-session state. Keep imported records without repeatedly replaying invalidated refresh tokens.
 
-Detect effective environment-key/custom-provider modes and managed login/workspace restrictions before a switch. A config profile's `model_provider`, custom provider or credential environment can determine which backend is used. Preserve that configuration and explain when the selected account cannot affect it. Do not override a managed policy or silently turn a ChatGPT subscription connection into billed API usage.
+Detect effective environment-key/custom-provider modes and managed login/workspace restrictions before a switch. A config profile's `model_provider`, custom provider or credential environment can determine which backend is used. Preserve that configuration and explain when the selected account cannot affect it. Do not override a managed policy or silently turn a ChatGPT subscription connection into billed API usage. The one exception is a key the owner explicitly allowed as an automatic fallback after a billing confirmation (see CODEX_USAGE.md).
 
 ## 5. Quotas, history and optional automation
 

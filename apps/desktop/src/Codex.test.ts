@@ -23,6 +23,7 @@ import {
   codexSnapshot,
 } from './test/codex-fixtures';
 import { snapshot } from './test/fixtures';
+import { codexClock } from './lib/codex-format';
 import { language, t } from './lib/i18n';
 import type { Settings } from './lib/types';
 async function setup(
@@ -980,7 +981,9 @@ describe('Codex API key accounts', () => {
     expect(within(dialog).getByRole('heading', { level: 2 })).toHaveTextContent(
       'Add an OpenAI API key',
     );
-    expect(dialog).toHaveTextContent('never switches to it on its own');
+    expect(dialog).toHaveTextContent(
+      'never switches to it on its own unless you turn on Use as fallback for this key',
+    );
     // A password field that browsers and spell checkers leave alone.
     expect(key).toHaveAttribute('type', 'password');
     expect(key).toHaveAttribute('autocomplete', 'off');
@@ -1340,5 +1343,255 @@ describe('Codex Flex processing', () => {
       await screen.findByText(t('en', 'codexReason_flexRestoreFailed')),
     ).toBeVisible();
     noKey();
+  });
+});
+const engaged = (
+  raw = codexSnapshot(),
+  since = 1_700_000_000,
+  overrides = {},
+) => {
+  const snap = withKey(
+    codexSnapshot({
+      ...raw,
+      revision: raw.revision + 1,
+      selectedId: 'codex-key',
+      fallbackEngaged: { keyId: 'codex-key', since },
+    }),
+    { fallback: true, ...overrides },
+  );
+  snap.accounts.forEach((a) => (a.selected = a.id === 'codex-key'));
+  return snap;
+};
+describe('Codex automatic API-key fallback', () => {
+  it('asks for billing consent before turning the fallback on, and saves nothing on cancel', async () => {
+    const { call } = await setup(withKey());
+    const opened = await openDetails('Work key');
+    const toggle = opened.getByRole('switch', { name: /Use as fallback/ });
+    expect(toggle).not.toBeChecked();
+    expect(toggle).toBeEnabled();
+    expect(opened.getByText(/switches to this key by itself/)).toBeVisible();
+    expect(toggle).toHaveAccessibleDescription(t('en', 'codexFallbackHelp'));
+    const calls = call.mock.calls.length;
+    await fireEvent.click(toggle);
+    // The consent window opens; nothing is saved yet.
+    const consent = within(await screen.findByRole('dialog'));
+    expect(
+      consent.getByRole('heading', {
+        name: 'Allow automatic billing on this key?',
+      }),
+    ).toBeVisible();
+    expect(
+      consent.getByText(
+        'Codex bills this key per token, outside your ChatGPT plan. PrimerSwitch will switch to it by itself when every ChatGPT account is at its limit and switch back when one recovers. Set a monthly budget on the OpenAI project.',
+      ),
+    ).toBeVisible();
+    expect(call.mock.calls.length).toBe(calls);
+    await fireEvent.click(consent.getByRole('button', { name: 'Cancel' }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    expect(call.mock.calls.length).toBe(calls);
+    expect(within(row('Work key')).queryByText(/Fallback/)).toBeNull();
+    noKey();
+  });
+  it('saves the setting only after the owner confirms, and tags the key row', async () => {
+    const { call } = await setup(withKey());
+    const opened = await openDetails('Work key');
+    await fireEvent.click(
+      opened.getByRole('switch', { name: /Use as fallback/ }),
+    );
+    const consent = within(await screen.findByRole('dialog'));
+    call.mockResolvedValueOnce(
+      withKey(codexSnapshot({ revision: 2 }), { fallback: true }),
+    );
+    await fireEvent.click(
+      consent.getByRole('button', { name: 'Turn on fallback' }),
+    );
+    expect(call).toHaveBeenLastCalledWith('codex_set_api_key_fallback', {
+      id: 'codex-key',
+      enabled: true,
+    });
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    expect(
+      within(row('Work key')).getByText('API key …cdef · Fallback'),
+    ).toBeVisible();
+    // Turning it off again needs no confirmation.
+    const again = await openDetails('Work key');
+    const toggle = again.getByRole('switch', { name: /Use as fallback/ });
+    expect(toggle).toBeChecked();
+    call.mockResolvedValueOnce(withKey(codexSnapshot({ revision: 3 })));
+    await fireEvent.click(toggle);
+    expect(call).toHaveBeenLastCalledWith('codex_set_api_key_fallback', {
+      id: 'codex-key',
+      enabled: false,
+    });
+    expect(screen.getAllByRole('dialog')).toHaveLength(1);
+    noKey();
+  });
+  it('shows an error and keeps the setting off when the save is refused', async () => {
+    const { call, codexController } = await setup(withKey());
+    const opened = await openDetails('Work key');
+    await fireEvent.click(
+      opened.getByRole('switch', { name: /Use as fallback/ }),
+    );
+    const consent = within(await screen.findByRole('dialog'));
+    call.mockRejectedValueOnce('busy');
+    await fireEvent.click(
+      consent.getByRole('button', { name: 'Turn on fallback' }),
+    );
+    expect(await consent.findByRole('alert')).toHaveTextContent(
+      t('en', 'codexReason_busy'),
+    );
+    expect(get(codexController).snapshot?.accounts[3].fallback).toBe(false);
+    // The window stays open so the owner can try again or cancel.
+    expect(screen.getByRole('dialog')).toBeVisible();
+    noKey();
+  });
+  it('explains that the setting needs automatic switching, and still lets it be saved', async () => {
+    await setup(
+      withKey(codexSnapshot(), { fallbackHint: 'fallbackNeedsAutoSwitch' }),
+    );
+    const opened = await openDetails('Work key');
+    expect(
+      opened.getByText(t('en', 'codexReason_fallbackNeedsAutoSwitch')),
+    ).toBeVisible();
+    expect(
+      opened.getByRole('switch', { name: /Use as fallback/ }),
+    ).toBeEnabled();
+  });
+  it('shows why the setting cannot be changed now', async () => {
+    await setup(
+      withKey(codexSnapshot(), { fallbackToggle: codexCapability('busy') }),
+    );
+    const opened = await openDetails('Work key');
+    expect(
+      opened.getByRole('switch', { name: /Use as fallback/ }),
+    ).toBeDisabled();
+    expect(opened.getByText(t('en', 'codexReason_busy'))).toBeVisible();
+  });
+  it('warns that sessions started under Flex fail after the return, when both are on', async () => {
+    await setup(withKey(codexSnapshot(), { fallback: true, useFlex: true }));
+    const opened = await openDetails('Work key');
+    expect(
+      opened.getByText(
+        'A Codex session started while this key is active with Flex fails on ChatGPT after the automatic return until you start a new one.',
+      ),
+    ).toBeVisible();
+    cleanup();
+    await setup(withKey(codexSnapshot(), { fallback: true, useFlex: false }));
+    const without = await openDetails('Work key');
+    expect(without.queryByText(/started while this key is active/)).toBeNull();
+  });
+  it('shows no fallback option for a ChatGPT account', async () => {
+    await setup(withKey());
+    const opened = await openDetails('studio@example.invalid');
+    expect(opened.queryByRole('switch', { name: /fallback/i })).toBeNull();
+  });
+  it('shows a persistent banner while the fallback key is active, with a way back', async () => {
+    const since = 1_700_000_000;
+    const { call } = await setup(engaged(codexSnapshot(), since));
+    const banner = screen.getByText(
+      `Using API key Work key (billed per token) since ${codexClock(since, 'en')} because every ChatGPT account is at its limit. PrimerSwitch returns automatically when one recovers.`,
+    );
+    expect(banner).toBeVisible();
+    // No way to dismiss it.
+    expect(
+      within(banner.closest('[role="status"]') as HTMLElement).queryByRole(
+        'button',
+        { name: /dismiss|close/i },
+      ),
+    ).toBeNull();
+    expect(
+      within(row('Work key')).getByText('API key …cdef · Fallback'),
+    ).toBeVisible();
+    const back = screen.getByRole('button', { name: 'Switch back now' });
+    expect(back).toBeEnabled();
+    const result = switched('codex-research', 3);
+    call.mockResolvedValueOnce(withKey(result, { fallback: true }));
+    await fireEvent.click(back);
+    expect(call).toHaveBeenLastCalledWith('codex_switch_account', {
+      id: 'codex-research',
+    });
+    await waitFor(() =>
+      expect(screen.queryByText(/Using API key Work key/)).toBeNull(),
+    );
+    noKey();
+  });
+  it('shows no banner when no fallback is engaged, or after the key stopped being the active login', async () => {
+    await setup(withKey(codexSnapshot(), { fallback: true }));
+    expect(screen.queryByText(/billed per token\) since/)).toBeNull();
+    expect(
+      screen.queryByRole('button', { name: 'Switch back now' }),
+    ).toBeNull();
+    cleanup();
+    // A leftover marker for a key that is not the active login must not promise a return.
+    const stale = codexSnapshot({
+      fallbackEngaged: { keyId: 'codex-key', since: 1_700_000_000 },
+    });
+    await setup(withKey(stale, { fallback: true }));
+    expect(
+      screen.queryByRole('button', { name: 'Switch back now' }),
+    ).toBeNull();
+    cleanup();
+    // The key is the login but its setting was turned off: no automatic return is promised.
+    await setup(engaged(codexSnapshot(), 1_700_000_000, { fallback: false }));
+    expect(screen.queryByText(/billed per token\) since/)).toBeNull();
+    expect(
+      screen.queryByRole('button', { name: 'Switch back now' }),
+    ).toBeNull();
+  });
+  it('offers no way back while no ChatGPT account can be switched to', async () => {
+    const raw = engaged();
+    raw.nextId = null;
+    raw.accounts.forEach((a) => {
+      if (a.authKind === 'chatgpt') a.switchable = codexCapability('busy');
+    });
+    await setup(raw);
+    expect(screen.getByText(/Using API key Work key/)).toBeVisible();
+    expect(
+      screen.queryByRole('button', { name: 'Switch back now' }),
+    ).toBeNull();
+  });
+  it('says everything in Romanian too', async () => {
+    const since = 1_700_000_000;
+    await setup(engaged(codexSnapshot(), since), 'ro');
+    expect(
+      screen.getByText(
+        `Se folosește cheia API Work key (facturată per token) din ${codexClock(since, 'ro')}, pentru că toate conturile ChatGPT sunt la limită. PrimerSwitch revine automat când unul se reface.`,
+      ),
+    ).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Revino acum' })).toBeEnabled();
+    const opened = await openDetails('Work key', 'ro');
+    expect(
+      opened.getByRole('switch', { name: /Folosește ca rezervă/ }),
+    ).toBeChecked();
+    expect(
+      within(row('Work key')).getByText(
+        `${t('ro', 'codexApiKeyEnding', { tail: 'cdef' })} · Rezervă`,
+      ),
+    ).toBeVisible();
+  });
+  it('asks for consent in Romanian', async () => {
+    await setup(withKey(), 'ro');
+    const opened = await openDetails('Work key', 'ro');
+    await fireEvent.click(
+      opened.getByRole('switch', { name: /Folosește ca rezervă/ }),
+    );
+    const consent = within(await screen.findByRole('dialog'));
+    expect(
+      consent.getByText(t('ro', 'codexFallbackConfirmText')),
+    ).toBeVisible();
+    expect(
+      consent.getByRole('button', { name: 'Pornește rezerva' }),
+    ).toBeEnabled();
+  });
+  it('warns about Flex inside the consent window when the key uses Flex', async () => {
+    await setup(withKey(codexSnapshot(), { useFlex: true }));
+    const opened = await openDetails('Work key');
+    await fireEvent.click(
+      opened.getByRole('switch', { name: /Use as fallback/ }),
+    );
+    const consent = within(await screen.findByRole('dialog'));
+    expect(
+      consent.getByText(t('en', 'codexFallbackFlexWarning')),
+    ).toBeVisible();
   });
 });

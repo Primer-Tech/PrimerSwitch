@@ -2,6 +2,7 @@
   import { onMount, tick } from 'svelte';
   import { language, t } from '../lib/i18n';
   import {
+    codexClock,
     codexElapsed,
     codexImportedMessage,
     codexMessage,
@@ -30,6 +31,7 @@
   import Icon from './Icon.svelte';
   import CodexResets from './CodexResets.svelte';
   import CodexApiKeyDialog from './CodexApiKeyDialog.svelte';
+  import CodexFallbackDialog from './CodexFallbackDialog.svelte';
   let {
     controller,
     now,
@@ -144,6 +146,8 @@
     deleteTarget = $state<AccountRowView | null>(null),
     apiKeyOpen = $state(false),
     apiKeyError = $state<CodexError | null>(null),
+    /** The API key whose automatic fallback waits for the owner's billing consent. */
+    fallbackTarget = $state<string | null>(null),
     returnFocus = $state<HTMLElement | null>(null);
   let details = $derived(view.rows.find((r) => r.id === detailsId) ?? null);
   const account = (id: string | undefined): CodexAccount | null =>
@@ -245,6 +249,17 @@
       await tick();
       focusOutcome(returnFocus);
     }
+  }
+  /** Billing consent: nothing is saved until the owner confirms in the dialog. */
+  function askFallback(id: string, trigger: HTMLElement | null) {
+    returnFocus = trigger;
+    detailsId = null;
+    fallbackTarget = id;
+  }
+  async function confirmFallback() {
+    const target = fallbackTarget;
+    if (target && (await controller.setApiKeyFallback(target, true)))
+      fallbackTarget = null;
   }
   async function cancelLogin() {
     await controller.cancelLogin();
@@ -354,6 +369,41 @@
             : []),
         ],
         dismiss: () => controller.dismissNotice(),
+      });
+    }
+    const engaged = snapshot?.fallbackEngaged ?? null;
+    const engagedKey = engaged ? account(engaged.keyId) : null;
+    // Only while that key is still the active login with the fallback on: else no return is promised.
+    if (engaged && engagedKey?.selected && engagedKey.fallback) {
+      // The way back: the account automatic return would use, else any account that can be used.
+      const back =
+        account(snapshot?.nextId ?? undefined) ??
+        snapshot?.accounts.find(
+          (a) => a.authKind === 'chatgpt' && a.switchable.enabled,
+        ) ??
+        null;
+      list.push({
+        key: 'fallback',
+        tone: 'warn',
+        role: 'status',
+        text: t($language, 'codexFallbackBanner', {
+          name: engagedKey.name,
+          time: codexClock(engaged.since, $language),
+        }),
+        action:
+          back && back.authKind === 'chatgpt' && back.switchable.enabled
+            ? {
+                label: t($language, 'codexFallbackSwitchBack'),
+                disabled: locked,
+                run: (trigger) => {
+                  const target = back;
+                  void controller.switchAccount(target).then(async () => {
+                    await tick();
+                    focusOutcome(trigger);
+                  });
+                },
+              }
+            : undefined,
       });
     }
     if (view.allLimited)
@@ -711,6 +761,46 @@
               </p>{/if}
           </section>
         {/if}
+        {#if saved?.authKind === 'apiKey'}
+          <section aria-label={t($language, 'codexFallbackLabel')}>
+            <label class="toggle-row">
+              <span
+                ><strong>{t($language, 'codexFallbackLabel')}</strong><small
+                  id="codex-fallback-help"
+                  >{t($language, 'codexFallbackHelp')}</small
+                ></span
+              >
+              <input
+                type="checkbox"
+                role="switch"
+                aria-describedby="codex-fallback-help"
+                checked={saved.fallback ?? false}
+                disabled={locked || !saved.fallbackToggle?.enabled}
+                onchange={async (event) => {
+                  const box = event.currentTarget;
+                  if (box.checked) {
+                    // Turning it on bills this key by itself: ask first, save nothing yet.
+                    box.checked = false;
+                    askFallback(saved.id, returnFocus);
+                    return;
+                  }
+                  if (!(await controller.setApiKeyFallback(saved.id, false)))
+                    box.checked = account(saved.id)?.fallback ?? false;
+                }}
+              />
+            </label>
+            {#if saved.fallbackHint}<p class="note">
+                {codexMessage(saved.fallbackHint, $language)}
+              </p>{:else if saved.fallbackToggle && !saved.fallbackToggle.enabled && saved.fallbackToggle.blockedReason}<p
+                class="note"
+              >
+                {codexMessage(saved.fallbackToggle.blockedReason, $language)}
+              </p>{/if}
+            {#if saved.fallback && saved.useFlex}<p class="note warning-text">
+                {t($language, 'codexFallbackFlexWarning')}
+              </p>{/if}
+          </section>
+        {/if}
         {#if saved?.authKind === 'chatgpt'}
           <section aria-label={t($language, 'availableResets')}>
             <h3>{t($language, 'availableResets')}</h3>
@@ -752,6 +842,19 @@
       {/snippet}
     </AccountDetails>
   </Modal>{/if}
+{#if fallbackTarget}<CodexFallbackDialog
+    pending={pending === 'codex_set_api_key_fallback'}
+    disabled={locked}
+    warning={account(fallbackTarget)?.useFlex
+      ? t($language, 'codexFallbackFlexWarning')
+      : null}
+    error={$controller.error
+      ? codexMessage($controller.error, $language)
+      : null}
+    {returnFocus}
+    onconfirm={() => void confirmFallback()}
+    oncancel={() => (fallbackTarget = null)}
+  />{/if}
 {#if deleteTarget}<DeleteDialog
     text={t($language, 'deleteCodex', { name: deleteTarget.name })}
     pending={pending === 'codex_delete_account'}

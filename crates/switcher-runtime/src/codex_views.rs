@@ -43,6 +43,9 @@ pub enum CodexReason {
     /// `service_tier` could not be put back; it is retried, and a session started now can
     /// fail on a ChatGPT login.
     FlexRestoreFailed,
+    /// An API key is set as the fallback, but it only acts while automatic switching
+    /// is on.
+    FallbackNeedsAutoSwitch,
 }
 impl std::fmt::Display for CodexReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -186,6 +189,13 @@ pub struct CodexAccountView {
     pub use_flex: bool,
     /// Whether the Flex setting of this account can be changed now, and why not.
     pub flex: CodexCapability,
+    /// The API key is the automatic fallback when every ChatGPT account is at its limit.
+    pub fallback: bool,
+    /// Whether the fallback setting of this account can be changed now, and why not.
+    pub fallback_toggle: CodexCapability,
+    /// Why the fallback cannot act now (automatic switching is off, the key cannot be
+    /// switched to); the setting itself can still be saved.
+    pub fallback_hint: Option<CodexReason>,
     pub quota: Option<CodexQuotaView>,
     pub quota_read_at: Option<i64>,
     pub quota_state: CodexQuotaState,
@@ -244,8 +254,17 @@ pub struct CodexSnapshot {
     pub switching: Option<CodexSwitchView>,
     pub last_switch: Option<CodexLastSwitchView>,
     pub return_hold_until: Option<i64>,
+    /// Set while PrimerSwitch itself moved Codex to a fallback API key because every
+    /// ChatGPT account was at its limit, and that key is still the active login.
+    pub fallback_engaged: Option<CodexFallbackView>,
     pub environment: CodexEnvironmentView,
     pub warnings: Vec<CodexReason>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexFallbackView {
+    pub key_id: String,
+    pub since: i64,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -309,6 +328,7 @@ impl CodexSnapshot {
             switching: None,
             last_switch: None,
             return_hold_until: None,
+            fallback_engaged: None,
             environment: CodexEnvironmentView::default(),
             warnings: Vec::new(),
         }

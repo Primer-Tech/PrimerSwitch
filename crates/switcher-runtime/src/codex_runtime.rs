@@ -2,7 +2,9 @@
 //! restart and its graceful drain) runs outside the owner lock, serialized by
 //! `codex_job`, so Claude actions and polling are never blocked by it.
 use super::*;
-use crate::codex_engine::{CodexAutoSwitch, CodexAutomation, QuotaJob, ResetJob, SwitchJob};
+use crate::codex_engine::{
+    CodexAutoKind, CodexAutoSwitch, CodexAutomation, QuotaJob, ResetJob, SwitchJob,
+};
 use zeroize::Zeroizing;
 
 /// Background cadence: follow auth.json, read at most one due quota, then decide
@@ -148,6 +150,18 @@ impl RuntimeHandle {
     ) -> Result<CodexSnapshot, CodexReason> {
         let _job = self.codex_job_lock().await?;
         self.codex_snapshot_command(CodexCommand::SetApiKeyFlex(id.into(), enabled))
+            .await
+    }
+    /// Make a saved API key the automatic fallback, or stop it being one (see
+    /// `CodexEngine::set_api_key_fallback`). The window asks the owner to confirm the
+    /// billing before it calls this with `enabled`.
+    pub async fn codex_set_api_key_fallback(
+        &self,
+        id: &str,
+        enabled: bool,
+    ) -> Result<CodexSnapshot, CodexReason> {
+        let _job = self.codex_job_lock().await?;
+        self.codex_snapshot_command(CodexCommand::SetApiKeyFallback(id.into(), enabled))
             .await
     }
     pub async fn codex_delete_account(&self, id: &str) -> Result<CodexSnapshot, CodexReason> {
@@ -315,7 +329,7 @@ impl RuntimeHandle {
     async fn codex_switch_locked(
         &self,
         id: &str,
-        automatic: Option<(&CodexAutoSwitch, bool)>,
+        automatic: Option<&CodexAutoSwitch>,
     ) -> Result<CodexSnapshot, CodexReason> {
         let job: Option<SwitchJob> = {
             let mut engine = self.inner.owner.lock().await;
@@ -330,9 +344,7 @@ impl RuntimeHandle {
                 let vault = vault.as_ref().ok_or(CodexReason::VaultUnavailable)?;
                 codex.set_policy(&policy, now);
                 match automatic {
-                    Some((plan, returning)) => {
-                        codex.begin_automatic_switch(plan, returning, &policy, vault, now)
-                    }
+                    Some(plan) => codex.begin_automatic_switch(plan, &policy, vault, now),
                     None => codex.begin_switch(id, vault, now),
                 }
             };
@@ -426,7 +438,6 @@ impl RuntimeHandle {
                     engine.codex.selected_threshold(&policy),
                 )
             };
-            let returning = matches!(&step, CodexAutomation::Return(_));
             match step {
                 CodexAutomation::Idle => return,
                 CodexAutomation::Refresh(id) => {
@@ -444,7 +455,9 @@ impl RuntimeHandle {
                     }
                     return;
                 }
-                CodexAutomation::Switch(plan) | CodexAutomation::Return(plan) => {
+                CodexAutomation::Switch(plan)
+                | CodexAutomation::Return(plan)
+                | CodexAutomation::Fallback(plan) => {
                     {
                         let mut engine = self.inner.owner.lock().await;
                         let Engine { codex, vault, .. } = &mut *engine;
@@ -457,9 +470,7 @@ impl RuntimeHandle {
                             return;
                         }
                     }
-                    let result = self
-                        .codex_switch_locked(&plan.target_id, Some((&plan, returning)))
-                        .await;
+                    let result = self.codex_switch_locked(&plan.target_id, Some(&plan)).await;
                     let mut engine = self.inner.owner.lock().await;
                     let ro = engine.ro();
                     match result {
@@ -469,10 +480,19 @@ impl RuntimeHandle {
                                 .as_ref()
                                 .filter(|outcome| outcome.account_id == plan.target_id)
                             {
-                                let (title, body) = if returning {
-                                    codex_returned_text(ro, &plan, outcome)
-                                } else {
-                                    codex_switched_text(ro, &plan, outcome, threshold)
+                                let (title, body) = match plan.kind {
+                                    CodexAutoKind::Switch => {
+                                        codex_switched_text(ro, &plan, outcome, threshold)
+                                    }
+                                    CodexAutoKind::Return => {
+                                        codex_returned_text(ro, &plan, outcome)
+                                    }
+                                    CodexAutoKind::KeyFallback => {
+                                        codex_fallback_text(ro, &plan, outcome)
+                                    }
+                                    CodexAutoKind::KeyReturn => {
+                                        codex_key_returned_text(ro, &plan, outcome)
+                                    }
                                 };
                                 engine.notify_with(title, body);
                             }
@@ -569,6 +589,56 @@ fn codex_returned_text(
     };
     (title, format!("{recovered} · {terminals}"))
 }
+/// The notice after the automatic fallback moved Codex to an API key: it says the money
+/// part first, and that PrimerSwitch comes back by itself.
+fn codex_fallback_text(
+    ro: bool,
+    plan: &CodexAutoSwitch,
+    outcome: &CodexLastSwitchView,
+) -> (String, String) {
+    let key = safe_label(&plan.target_name);
+    let title = if ro {
+        format!("Codex a comutat pe cheia API {key}")
+    } else {
+        format!("Codex switched to API key {key}")
+    };
+    let why = if ro {
+        "Toate conturile ChatGPT sunt la limită. Codex facturează acum per token. PrimerSwitch revine singur când un cont se reface."
+    } else {
+        "Every ChatGPT account is at its limit. Codex now bills per token. PrimerSwitch returns by itself when an account recovers."
+    };
+    (
+        title,
+        format!("{why} · {}", codex_terminals_text(ro, outcome)),
+    )
+}
+/// The notice after the automatic return from the fallback key to a ChatGPT account.
+fn codex_key_returned_text(
+    ro: bool,
+    plan: &CodexAutoSwitch,
+    outcome: &CodexLastSwitchView,
+) -> (String, String) {
+    let (account, key) = (
+        safe_label(&plan.target_name),
+        safe_label(&plan.previous_name),
+    );
+    let title = if ro {
+        format!("Codex a comutat pe {account}")
+    } else {
+        format!("Codex switched to {account}")
+    };
+    let why = if ro {
+        format!(
+            "Contul {account} are din nou consum disponibil. S-a revenit de la cheia API {key}."
+        )
+    } else {
+        format!("Account {account} has usage again. Switched back from API key {key}.")
+    };
+    (
+        title,
+        format!("{why} · {}", codex_terminals_text(ro, outcome)),
+    )
+}
 /// Automatic switching wanted to switch, but every Codex account is at its limit.
 fn codex_exhausted_text(ro: bool, frees_first: Option<&(String, i64)>, now: i64) -> String {
     let mut body = if ro {
@@ -621,7 +691,7 @@ impl RuntimeHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codex_engine::CodexAutoSwitch;
+    use crate::codex_engine::{CodexAutoKind, CodexAutoSwitch};
     fn plan(peak: Option<i32>) -> CodexAutoSwitch {
         CodexAutoSwitch {
             previous_id: "a".into(),
@@ -629,6 +699,7 @@ mod tests {
             target_name: "b@example.invalid".into(),
             previous_name: "a@example.invalid".into(),
             peak,
+            kind: CodexAutoKind::Switch,
         }
     }
     fn outcome(daemon_restarted: bool, error: Option<CodexReason>) -> CodexLastSwitchView {
@@ -684,6 +755,49 @@ mod tests {
         assert_eq!(
             codex_failed_text(true, "b@example.invalid"),
             "Codex nu a putut fi comutat automat pe b@example.invalid. Deschide PrimerSwitch pentru detalii."
+        );
+    }
+    #[test]
+    fn the_fallback_notices_name_the_key_the_cost_and_the_return_in_both_languages() {
+        let mut to_key = plan(Some(97));
+        to_key.kind = CodexAutoKind::KeyFallback;
+        to_key.target_name = "Work\u{7} key".into();
+        let live = outcome(true, None);
+        assert_eq!(
+            codex_fallback_text(false, &to_key, &live),
+            (
+                "Codex switched to API key Work key".into(),
+                "Every ChatGPT account is at its limit. Codex now bills per token. PrimerSwitch returns by itself when an account recovers. · open terminals reconnect automatically."
+                    .into()
+            )
+        );
+        assert_eq!(
+            codex_fallback_text(true, &to_key, &outcome(false, None)),
+            (
+                "Codex a comutat pe cheia API Work key".into(),
+                "Toate conturile ChatGPT sunt la limită. Codex facturează acum per token. PrimerSwitch revine singur când un cont se reface. · următoarea sesiune Codex îl folosește."
+                    .into()
+            )
+        );
+        let mut back = plan(None);
+        back.kind = CodexAutoKind::KeyReturn;
+        back.previous_name = "Work\u{7} key".into();
+        let failed = outcome(false, Some(CodexReason::DaemonRestartFailed));
+        assert_eq!(
+            codex_key_returned_text(false, &back, &live),
+            (
+                "Codex switched to b@example.invalid".into(),
+                "Account b@example.invalid has usage again. Switched back from API key Work key. · open terminals reconnect automatically."
+                    .into()
+            )
+        );
+        assert_eq!(
+            codex_key_returned_text(true, &back, &failed),
+            (
+                "Codex a comutat pe b@example.invalid".into(),
+                "Contul b@example.invalid are din nou consum disponibil. S-a revenit de la cheia API Work key. · terminalele deschise păstrează contul anterior până le repornești."
+                    .into()
+            )
         );
     }
     #[test]

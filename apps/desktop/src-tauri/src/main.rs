@@ -294,6 +294,20 @@ async fn codex_set_api_key_flex(
         .await
         .map_err(|e| e.to_string())
 }
+/// Make a saved API key the automatic fallback (billed per token) or stop it being one.
+/// The window asks the owner to confirm the billing before it turns this on.
+#[tauri::command]
+async fn codex_set_api_key_fallback(
+    runtime: State<'_, RuntimeHandle>,
+    id: String,
+    enabled: bool,
+) -> Reply<CodexSnapshot> {
+    codex_id(&id)?;
+    runtime
+        .codex_set_api_key_fallback(&id, enabled)
+        .await
+        .map_err(|e| e.to_string())
+}
 #[tauri::command]
 async fn codex_import_switcher(runtime: State<'_, RuntimeHandle>) -> Reply<CodexSnapshot> {
     runtime
@@ -397,6 +411,7 @@ fn main() {
             codex_import_switcher,
             codex_add_api_key,
             codex_set_api_key_flex,
+            codex_set_api_key_fallback,
             codex_refresh_all,
             codex_consume_reset,
             codex_update_account_automation,

@@ -1702,6 +1702,7 @@ fn switch_to(f: &Fixture, id: &str, peak: i32) -> CodexAutomation {
         target_name: name(id),
         previous_name: name(&active),
         peak: Some(peak),
+        kind: CodexAutoKind::Switch,
     })
 }
 
@@ -2427,6 +2428,7 @@ fn return_to(f: &Fixture, id: &str) -> CodexAutomation {
         unreachable!()
     };
     plan.peak = None;
+    plan.kind = CodexAutoKind::Return;
     CodexAutomation::Return(plan)
 }
 fn reopen(f: &mut Fixture, now: i64) {
@@ -3109,7 +3111,7 @@ fn a_prepared_codex_return_preserves_an_external_login_before_or_during_replacem
         f.engine.begin_auto_switch(NOW, &f.vault).unwrap();
         assert_eq!(
             f.engine
-                .begin_automatic_switch(&plan, true, &CodexPolicy::default(), &f.vault, NOW)
+                .begin_automatic_switch(&plan, &CodexPolicy::default(), &f.vault, NOW)
                 .err(),
             Some(CodexReason::ExternalChange)
         );
@@ -3151,7 +3153,7 @@ async fn external_selection_during_return_preflight_and_preference_edits_cancel_
     f.engine.begin_auto_switch(NOW, &f.vault).unwrap();
     assert_eq!(
         f.engine
-            .begin_automatic_switch(&plan, true, &CodexPolicy::default(), &f.vault, NOW)
+            .begin_automatic_switch(&plan, &CodexPolicy::default(), &f.vault, NOW)
             .err(),
         Some(CodexReason::ExternalChange)
     );
@@ -3165,7 +3167,7 @@ async fn external_selection_during_return_preflight_and_preference_edits_cancel_
     f.engine.begin_auto_switch(NOW, &f.vault).unwrap();
     assert_eq!(
         f.engine
-            .begin_automatic_switch(&plan, true, &CodexPolicy::default(), &f.vault, NOW)
+            .begin_automatic_switch(&plan, &CodexPolicy::default(), &f.vault, NOW)
             .err(),
         Some(CodexReason::ExternalChange)
     );
@@ -3174,7 +3176,7 @@ async fn external_selection_during_return_preflight_and_preference_edits_cancel_
     f.engine.hold_automatic_returns(NOW, &f.vault).unwrap();
     assert_eq!(
         f.engine
-            .begin_automatic_switch(&plan, true, &CodexPolicy::default(), &f.vault, NOW)
+            .begin_automatic_switch(&plan, &CodexPolicy::default(), &f.vault, NOW)
             .err(),
         Some(CodexReason::ExternalChange)
     );
@@ -3500,7 +3502,7 @@ async fn a_natural_return_survives_failed_outgoing_quota_but_keeps_target_and_ow
     );
     assert_eq!(
         f.engine
-            .begin_automatic_switch(&plan, true, &CodexPolicy::default(), &f.vault, NOW)
+            .begin_automatic_switch(&plan, &CodexPolicy::default(), &f.vault, NOW)
             .err(),
         Some(CodexReason::ExternalChange)
     );
@@ -3509,7 +3511,7 @@ async fn a_natural_return_survives_failed_outgoing_quota_but_keeps_target_and_ow
     f.engine.begin_auto_switch(NOW, &f.vault).unwrap();
     let job = f
         .engine
-        .begin_automatic_switch(&plan, true, &CodexPolicy::default(), &f.vault, NOW)
+        .begin_automatic_switch(&plan, &CodexPolicy::default(), &f.vault, NOW)
         .unwrap()
         .unwrap();
     f.engine
@@ -3865,19 +3867,20 @@ fn automation_never_picks_an_api_key_even_when_it_has_a_quota_and_a_return_marke
         Some(key.as_str())
     );
     // A prepared plan that names the key is refused before anything is written.
-    let plan = CodexAutoSwitch {
-        previous_id: a.clone(),
-        target_id: key.clone(),
-        target_name: "Key".into(),
-        previous_name: "A".into(),
-        peak: Some(97),
-    };
     f.read(&a, main_quota(97, 40), NOW);
     let active = f.active();
-    for returning in [false, true] {
+    for kind in [CodexAutoKind::Switch, CodexAutoKind::Return] {
+        let plan = CodexAutoSwitch {
+            previous_id: a.clone(),
+            target_id: key.clone(),
+            target_name: "Key".into(),
+            previous_name: "A".into(),
+            peak: Some(97),
+            kind,
+        };
         assert_eq!(
             f.engine
-                .begin_automatic_switch(&plan, returning, &policy, &f.vault, NOW)
+                .begin_automatic_switch(&plan, &policy, &f.vault, NOW)
                 .err(),
             Some(CodexReason::ExternalChange)
         );
@@ -4983,4 +4986,1251 @@ async fn the_toggle_decides_on_the_live_login_not_on_a_stale_selection() {
     assert!(f.engine.saved.flex_applied.is_none() && f.saved_state().flex_applied.is_none());
     assert!(!f.warnings().contains(&CodexReason::FlexRestoreFailed));
     f.claude_untouched();
+}
+
+// Automatic fallback to an API key (billed per token) when every ChatGPT account is at
+// its limit, and the automatic return. Every gate must fail closed.
+fn fallback_to(f: &Fixture, key: &str, peak: i32) -> CodexAutomation {
+    let CodexAutomation::Switch(mut plan) = switch_to(f, key, peak) else {
+        unreachable!()
+    };
+    plan.kind = CodexAutoKind::KeyFallback;
+    CodexAutomation::Fallback(plan)
+}
+fn key_return_to(f: &Fixture, id: &str) -> CodexAutomation {
+    let CodexAutomation::Switch(mut plan) = switch_to(f, id, 0) else {
+        unreachable!()
+    };
+    plan.peak = None;
+    plan.kind = CodexAutoKind::KeyReturn;
+    CodexAutomation::Return(plan)
+}
+fn plan_of(automation: CodexAutomation) -> CodexAutoSwitch {
+    match automation {
+        CodexAutomation::Switch(plan)
+        | CodexAutomation::Return(plan)
+        | CodexAutomation::Fallback(plan) => plan,
+        other => panic!("not a plan: {other:?}"),
+    }
+}
+impl Fixture {
+    async fn set_fallback(&mut self, id: &str, enabled: bool) -> Result<(), CodexReason> {
+        self.engine
+            .command(
+                CodexCommand::SetApiKeyFallback(id.into(), enabled),
+                &self.vault,
+                250,
+            )
+            .await
+            .map(|_| ())
+    }
+    /// A saved key that is the automatic fallback.
+    async fn fallback_key(&mut self, name: &str, key: &str) -> String {
+        self.add_key(name, key).await.unwrap();
+        let id = self.key_id(key);
+        self.set_fallback(&id, true).await.unwrap();
+        id
+    }
+    /// Run an automatic plan like the runtime does: the cooldown starts, the guarded write
+    /// happens, the daemon restarts and the switch is finished.
+    async fn auto_switch(&mut self, plan: &CodexAutoSwitch, now: i64) -> Result<(), CodexReason> {
+        self.engine.begin_auto_switch(now, &self.vault).unwrap();
+        let job = self
+            .engine
+            .begin_automatic_switch(plan, &CodexPolicy::default(), &self.vault, now)?
+            .unwrap();
+        let outcome = job.run().await;
+        self.engine
+            .finish_switch(&job, &outcome, &self.vault, now + 1, true)?;
+        Ok(())
+    }
+    /// An automatic switch that was refused changed nothing: not the login, the config,
+    /// the daemon, the saved selection, the marker or the cooldown's other effects.
+    fn assert_unswitched(&self, login: &[u8], config: &[u8], selected: &str) {
+        assert_eq!(self.active(), login);
+        assert_eq!(self.config(), config);
+        assert_eq!(self.engine.selected_id.as_deref(), Some(selected));
+        assert!(self.daemon.calls.lock().unwrap().is_empty());
+        assert!(self.engine.switching.is_none());
+    }
+}
+/// `a` is active and at its limit, `b` is proven at its limit too, and `key` is a saved
+/// key that is the fallback (with Flex when asked, on a Codex that supports it).
+async fn exhausted_world(flex: bool) -> (Fixture, String, String, String) {
+    let mut f = Fixture::new();
+    if flex {
+        f.flex_ready(OWNER_CONFIG);
+    }
+    let a = f.id_of("ws-a");
+    let b = f.add("user-b", "ws-b", "saved");
+    f.read(&a, main_quota(97, 40), NOW);
+    f.read(
+        &b,
+        main_quota_at(100, NOW + 7200, 60, NOW + 86400),
+        NOW - 600,
+    );
+    let key = f.fallback_key("Work key", FAKE_KEY).await;
+    if flex {
+        f.set_flex(&key, true).await.unwrap();
+    }
+    (f, a, b, key)
+}
+
+#[tokio::test]
+async fn the_fallback_engages_only_when_every_chatgpt_account_is_proven_at_its_limit() {
+    let (mut f, a, b, key) = exhausted_world(false).await;
+    let policy = CodexPolicy::default();
+    assert_eq!(f.engine.automation(NOW, &policy), fallback_to(&f, &key, 97));
+    // The key is never an ordinary candidate: the next account and the usage order stay empty.
+    assert_eq!(f.next(&policy), None);
+    assert!(f.order(&policy).is_empty());
+    // An account that was never read keeps "every account is limited" unproven.
+    let c = f.add("user-c", "ws-c", "saved");
+    assert_eq!(f.engine.automation(NOW, &policy), CodexAutomation::Idle);
+    f.read(
+        &c,
+        main_quota_at(100, NOW + 7200, 10, NOW + 86400),
+        NOW - 600,
+    );
+    assert_eq!(f.engine.automation(NOW, &policy), fallback_to(&f, &key, 97));
+    // A failed reading, and a signed-out account, are unproven as well.
+    f.engine
+        .account_errors
+        .insert(c.clone(), CodexReason::ProviderUnavailable);
+    assert_eq!(f.engine.automation(NOW, &policy), CodexAutomation::Idle);
+    f.engine.account_errors.remove(&c);
+    let index = f.engine.account_index(&c).unwrap();
+    f.engine.saved.accounts[index].needs_sign_in = true;
+    assert_eq!(f.engine.automation(NOW, &policy), CodexAutomation::Idle);
+    f.engine.saved.accounts[index].needs_sign_in = false;
+    assert_eq!(f.engine.automation(NOW, &policy), fallback_to(&f, &key, 97));
+    // An account that can take over wins: an ordinary switch, never the key.
+    f.read(&c, main_quota(10, 10), NOW);
+    assert_eq!(f.engine.automation(NOW, &policy), switch_to(&f, &c, 97));
+    // Its reading is old: it is read again first, still without the key.
+    f.read(&c, main_quota(10, 10), NOW - 1200);
+    assert_eq!(
+        f.engine.automation(NOW, &policy),
+        CodexAutomation::Refresh(c.clone())
+    );
+    // Excluded from automatic switching, an account does not count either way.
+    let index = f.engine.account_index(&c).unwrap();
+    f.engine.saved.accounts[index].automation.enabled = false;
+    assert_eq!(f.engine.automation(NOW, &policy), fallback_to(&f, &key, 97));
+    // A natural return never targets the key, whatever its preferences say.
+    let key_index = f.engine.account_index(&key).unwrap();
+    f.engine.saved.accounts[key_index].automation = AccountAutomation {
+        priority: Some(1),
+        return_on_five_hour_reset: true,
+        ..AccountAutomation::default()
+    };
+    f.engine.saved.accounts[key_index].preferred_return_reset_at = Some(NOW - 10);
+    assert_eq!(f.engine.automation(NOW, &policy), fallback_to(&f, &key, 97));
+    assert_ne!(
+        f.engine.due_quota(NOW + 100_000, &policy).as_deref(),
+        Some(key.as_str())
+    );
+    let _ = (a, b);
+    f.claude_untouched();
+}
+
+#[tokio::test]
+async fn every_other_fallback_gate_fails_closed_and_the_all_limited_notice_is_unchanged() {
+    let (mut f, a, b, key) = exhausted_world(false).await;
+    let policy = CodexPolicy::default();
+    let a_name = f.view(&a).name;
+    let all_limited = CodexAutomation::Exhausted {
+        frees_first: Some((a_name, NOW + 3600)),
+    };
+    assert_eq!(f.engine.automation(NOW, &policy), fallback_to(&f, &key, 97));
+    // Automatic switching off.
+    let off = CodexPolicy {
+        auto_switch: false,
+        ..policy
+    };
+    assert_eq!(f.engine.automation(NOW, &off), CodexAutomation::Idle);
+    // The key is not a fallback: today's all-limited notice, exactly as before.
+    f.set_fallback(&key, false).await.unwrap();
+    assert_eq!(f.engine.automation(NOW, &policy), all_limited);
+    f.set_fallback(&key, true).await.unwrap();
+    // The owner excluded the key from automatic switching.
+    let index = f.engine.account_index(&key).unwrap();
+    f.engine.saved.accounts[index].automation.enabled = false;
+    assert_eq!(f.engine.automation(NOW, &policy), all_limited);
+    f.engine.saved.accounts[index].automation.enabled = true;
+    // The key cannot be switched to: a Flex key on a Codex that does not support Flex.
+    f.engine.saved.accounts[index].use_flex = true;
+    assert_eq!(f.engine.automation(NOW, &policy), all_limited);
+    f.engine.saved.accounts[index].use_flex = false;
+    f.engine
+        .account_errors
+        .insert(key.clone(), CodexReason::ProviderUnavailable);
+    assert_eq!(f.engine.automation(NOW, &policy), all_limited);
+    f.engine.account_errors.remove(&key);
+    // The active reading is not fresh, or is below its threshold.
+    f.engine.verified_now.remove(&a);
+    assert_eq!(f.engine.automation(NOW, &policy), CodexAutomation::Idle);
+    f.read(&a, main_quota(97, 40), NOW - 901);
+    assert_eq!(f.engine.automation(NOW, &policy), CodexAutomation::Idle);
+    f.read(&a, main_quota(60, 40), NOW);
+    assert_eq!(f.engine.automation(NOW, &policy), CodexAutomation::Idle);
+    f.read(&a, main_quota(97, 40), NOW);
+    // The cooldown: one automatic attempt per ten minutes, whatever its outcome.
+    f.engine.begin_auto_switch(NOW, &f.vault).unwrap();
+    assert_eq!(f.engine.automation(NOW, &policy), CodexAutomation::Idle);
+    assert_eq!(
+        f.engine.automation(NOW + AUTO_SWITCH_COOLDOWN - 1, &policy),
+        CodexAutomation::Idle
+    );
+    f.read(&a, main_quota(97, 40), NOW + AUTO_SWITCH_COOLDOWN);
+    f.read(
+        &b,
+        main_quota_at(100, NOW + 7200, 60, NOW + 86400),
+        NOW + AUTO_SWITCH_COOLDOWN - 600,
+    );
+    assert_eq!(
+        f.engine.automation(NOW + AUTO_SWITCH_COOLDOWN, &policy),
+        fallback_to(&f, &key, 97)
+    );
+    f.engine.saved.last_auto_switch_at = None;
+    f.read(&a, main_quota(97, 40), NOW);
+    // A blocked setup, and a switch in progress.
+    f.engine.writable = false;
+    assert_eq!(f.engine.automation(NOW, &policy), CodexAutomation::Idle);
+    f.engine.writable = true;
+    f.engine.switching = Some(CodexSwitchView {
+        target_id: key.clone(),
+        stage: CodexSwitchStage::Restarting,
+        started_at: NOW,
+    });
+    assert_eq!(f.engine.automation(NOW, &policy), CodexAutomation::Idle);
+    f.engine.switching = None;
+    assert_eq!(f.engine.automation(NOW, &policy), fallback_to(&f, &key, 97));
+    f.claude_untouched();
+}
+
+#[tokio::test]
+async fn a_reading_that_has_passed_its_reset_time_is_read_again_before_any_money_is_spent() {
+    let (mut f, _a, b, key) = exhausted_world(false).await;
+    let policy = CodexPolicy::default();
+    // b was read ten minutes ago as limited until NOW - 10: that window has reopened.
+    f.read(&b, main_quota_at(100, NOW - 10, 60, NOW + 86400), NOW - 600);
+    assert_eq!(
+        f.engine.automation(NOW, &policy),
+        CodexAutomation::Refresh(b.clone())
+    );
+    // Just read: the recovery is being checked, so neither the key nor "all limited".
+    f.read(&b, main_quota_at(100, NOW - 10, 60, NOW + 86400), NOW - 60);
+    f.quota_mut(&b).limits[0]
+        .primary
+        .as_mut()
+        .unwrap()
+        .resets_at = Some(NOW - 30);
+    assert_eq!(f.engine.automation(NOW, &policy), CodexAutomation::Idle);
+    // The new reading says b is still limited, until later: the key is allowed.
+    f.read(&b, main_quota_at(100, NOW + 3000, 60, NOW + 86400), NOW);
+    assert_eq!(f.engine.automation(NOW, &policy), fallback_to(&f, &key, 97));
+    f.claude_untouched();
+}
+
+#[tokio::test]
+async fn the_fallback_key_is_chosen_by_priority_then_id_and_only_among_usable_keys() {
+    let (mut f, _a, _b, first) = exhausted_world(false).await;
+    let policy = CodexPolicy::default();
+    let second = f.fallback_key("Second key", SECOND_KEY).await;
+    f.add_key("Not a fallback", "sk-proj-SENTINEL-0123456789abcdeh")
+        .await
+        .unwrap();
+    let plain = f.key_id("sk-proj-SENTINEL-0123456789abcdeh");
+    let set = |f: &mut Fixture, id: &str, priority: Option<u16>| {
+        let index = f.engine.account_index(id).unwrap();
+        f.engine.saved.accounts[index].automation.priority = priority;
+    };
+    // Equal (unranked) keys: the lower id.
+    let lower = first.clone().min(second.clone());
+    let higher = first.clone().max(second.clone());
+    assert_eq!(plan_of(f.engine.automation(NOW, &policy)).target_id, lower);
+    // An explicit priority beats an unranked key; the lowest number wins.
+    set(&mut f, &higher, Some(5));
+    assert_eq!(plan_of(f.engine.automation(NOW, &policy)).target_id, higher);
+    set(&mut f, &lower, Some(2));
+    assert_eq!(plan_of(f.engine.automation(NOW, &policy)).target_id, lower);
+    // A key that is not the fallback is never chosen, however good its priority.
+    set(&mut f, &plain, Some(1));
+    assert_eq!(plan_of(f.engine.automation(NOW, &policy)).target_id, lower);
+    // A fallback key that cannot be switched to is skipped for the next one.
+    set(&mut f, &higher, Some(1));
+    let index = f.engine.account_index(&higher).unwrap();
+    f.engine.saved.accounts[index].use_flex = true;
+    assert_eq!(plan_of(f.engine.automation(NOW, &policy)).target_id, lower);
+    f.claude_untouched();
+}
+
+#[tokio::test]
+async fn the_fallback_switch_marks_the_engagement_and_survives_a_restart_until_the_login_changes() {
+    let (mut f, a, b, key) = exhausted_world(false).await;
+    let policy = CodexPolicy::default();
+    let plan = plan_of(f.engine.automation(NOW, &policy));
+    let before = f.engine.snapshot(false, NOW, &policy);
+    assert!(before.fallback_engaged.is_none());
+    f.auto_switch(&plan, NOW).await.unwrap();
+    assert_eq!(f.engine.selected_id.as_deref(), Some(key.as_str()));
+    assert_eq!(f.active(), key_file(FAKE_KEY));
+    assert_eq!(*f.daemon.calls.lock().unwrap(), vec!["state", "restart"]);
+    // The marker names the key, where it came from and when.
+    let marker = f.saved_state().fallback_engaged.unwrap();
+    assert_eq!(
+        (
+            marker.key_id.as_str(),
+            marker.from_account_id.as_str(),
+            marker.since
+        ),
+        (key.as_str(), a.as_str(), NOW)
+    );
+    let snapshot = f.engine.snapshot(false, NOW + 5, &policy);
+    assert_eq!(
+        snapshot.fallback_engaged,
+        Some(CodexFallbackView {
+            key_id: key.clone(),
+            since: NOW
+        })
+    );
+    let json = serde_json::to_value(&snapshot).unwrap();
+    assert_eq!(json["fallbackEngaged"]["keyId"], key.as_str());
+    assert_eq!(json["fallbackEngaged"]["since"], NOW);
+    assert!(!json.to_string().contains("SENTINEL"));
+    // Between an outside change and the next observation the banner must not show.
+    f.engine.selected_id = Some(a.clone());
+    assert!(
+        f.engine
+            .snapshot(false, NOW + 6, &policy)
+            .fallback_engaged
+            .is_none()
+    );
+    f.engine.selected_id = Some(key.clone());
+    // A restart keeps it while the key is the live login.
+    reopen(&mut f, NOW + 60);
+    assert_eq!(f.engine.selected_id.as_deref(), Some(key.as_str()));
+    assert!(
+        f.engine
+            .snapshot(false, NOW + 60, &policy)
+            .fallback_engaged
+            .is_some()
+    );
+    // Turning the setting off hides the banner: it would promise a return that no
+    // longer happens.
+    f.set_fallback(&key, false).await.unwrap();
+    assert!(
+        f.engine
+            .snapshot(false, NOW + 61, &policy)
+            .fallback_engaged
+            .is_none()
+    );
+    f.set_fallback(&key, true).await.unwrap();
+    // A login made outside the app ends it, whatever it is.
+    f.write_active(&auth("user-c", "ws-c", "external"));
+    f.engine.observe(&f.vault, NOW + 70).unwrap();
+    assert!(f.engine.saved.fallback_engaged.is_none());
+    assert!(f.saved_state().fallback_engaged.is_none());
+    assert!(
+        f.engine
+            .snapshot(false, NOW + 70, &policy)
+            .fallback_engaged
+            .is_none()
+    );
+    let _ = b;
+    f.claude_untouched();
+}
+
+#[tokio::test]
+async fn the_marker_is_cleared_by_a_manual_switch_a_return_and_a_deleted_key() {
+    let (mut f, a, b, key) = exhausted_world(false).await;
+    let policy = CodexPolicy::default();
+    let engage = |f: &Fixture| plan_of(f.engine.automation(NOW, &policy)).clone();
+    // A manual switch away from the key.
+    let plan = engage(&f);
+    f.auto_switch(&plan, NOW).await.unwrap();
+    assert!(f.engine.saved.fallback_engaged.is_some());
+    f.switch(&a).await.unwrap();
+    assert!(
+        f.engine.saved.fallback_engaged.is_none() && f.saved_state().fallback_engaged.is_none()
+    );
+    // The automatic return.
+    f.engine.saved.last_auto_switch_at = None;
+    f.read(&a, main_quota(97, 40), NOW);
+    let plan = engage(&f);
+    f.auto_switch(&plan, NOW).await.unwrap();
+    assert!(f.saved_state().fallback_engaged.is_some());
+    let later = NOW + AUTO_SWITCH_COOLDOWN;
+    f.read(&b, main_quota(10, 10), later);
+    let plan = plan_of(f.engine.automation(later, &policy));
+    assert_eq!(plan.kind, CodexAutoKind::KeyReturn);
+    f.auto_switch(&plan, later).await.unwrap();
+    assert_eq!(f.engine.selected_id.as_deref(), Some(b.as_str()));
+    assert!(
+        f.engine.saved.fallback_engaged.is_none() && f.saved_state().fallback_engaged.is_none()
+    );
+    // A marker whose key is gone is dropped when the state loads.
+    let mut record = serde_json::to_value(&f.engine.saved).unwrap();
+    record["fallback_engaged"] = json!({"key_id":"gone","from_account_id":"x","since":1});
+    f.vault.save(RECORD, &record).unwrap();
+    assert!(CodexEngine::load(&f.vault).saved.fallback_engaged.is_none());
+    record["fallback_engaged"] = json!({"key_id":key,"from_account_id":a,"since":1});
+    f.vault.save(RECORD, &record).unwrap();
+    assert!(CodexEngine::load(&f.vault).saved.fallback_engaged.is_some());
+    f.claude_untouched();
+}
+
+#[tokio::test]
+async fn the_marker_is_kept_until_the_login_has_been_observed() {
+    let (mut f, _a, _b, key) = exhausted_world(false).await;
+    let plan = plan_of(f.engine.automation(NOW, &CodexPolicy::default()));
+    f.auto_switch(&plan, NOW).await.unwrap();
+    // A fresh engine that cannot see the login yet (Codex is not discovered) must not
+    // take "no login seen" for "the key is no longer the login".
+    let mut engine = CodexEngine::load(&f.vault).with_test_seams(
+        f.factory.clone(),
+        f.daemon.clone(),
+        f.inventory.clone(),
+        f.switcher.clone(),
+    );
+    engine.observe(&f.vault, NOW + 5).unwrap();
+    assert!(engine.selected_id.is_none() && engine.observed_generation.is_none());
+    assert_eq!(
+        engine
+            .saved
+            .fallback_engaged
+            .as_ref()
+            .map(|marker| marker.key_id.as_str()),
+        Some(key.as_str())
+    );
+    assert_eq!(
+        f.saved_state()
+            .fallback_engaged
+            .as_ref()
+            .map(|marker| marker.key_id.as_str()),
+        Some(key.as_str())
+    );
+}
+
+#[tokio::test]
+async fn a_flex_fallback_key_gets_its_config_before_the_login_and_a_flex_failure_aborts() {
+    let (mut f, a, _b, key) = exhausted_world(true).await;
+    let policy = CodexPolicy::default();
+    let plan = plan_of(f.engine.automation(NOW, &policy));
+    let login = f.active();
+    f.auto_switch(&plan, NOW).await.unwrap();
+    assert_eq!(f.active(), key_file(FAKE_KEY));
+    // Flex is on in config.toml, recorded, before the key became the login.
+    assert_eq!(
+        f.config(),
+        flexed(OWNER_CONFIG, "service_tier = \"default\"")
+    );
+    assert_eq!(
+        f.saved_state().flex_applied,
+        Some(flex_mark(Some("\"default\"")))
+    );
+    assert_eq!(f.engine.selected_id.as_deref(), Some(key.as_str()));
+    assert_eq!(
+        f.engine.last_switch.as_ref().and_then(|s| s.flex),
+        Some(CodexFlexChange::On)
+    );
+    assert!(f.saved_state().fallback_engaged.is_some());
+    // The same plan with a config that cannot be edited: nothing at all happens.
+    let (mut f, a2, _b2, _key2) = exhausted_world(true).await;
+    f.write_config(b"service_tier = 5\n");
+    let plan = plan_of(f.engine.automation(NOW, &policy));
+    f.engine.begin_auto_switch(NOW, &f.vault).unwrap();
+    assert_eq!(
+        f.engine
+            .begin_automatic_switch(&plan, &policy, &f.vault, NOW)
+            .err(),
+        Some(CodexReason::FlexConfigFailed)
+    );
+    assert_eq!(f.active(), login);
+    f.assert_unswitched(&login, b"service_tier = 5\n", &a2);
+    assert!(f.engine.saved.fallback_engaged.is_none() && f.engine.saved.flex_applied.is_none());
+    // And the cooldown still holds: no retry within ten minutes.
+    assert_eq!(
+        f.engine.automation(NOW + AUTO_SWITCH_COOLDOWN - 1, &policy),
+        CodexAutomation::Idle
+    );
+    let _ = a;
+    f.claude_untouched();
+}
+
+#[tokio::test]
+async fn the_return_needs_a_fresh_usable_account_the_manual_hold_and_the_setting() {
+    let (mut f, a, b, key) = exhausted_world(true).await;
+    let policy = CodexPolicy::default();
+    let plan = plan_of(f.engine.automation(NOW, &policy));
+    f.auto_switch(&plan, NOW).await.unwrap();
+    let later = NOW + AUTO_SWITCH_COOLDOWN;
+    // Every ChatGPT account is still at its limit: stay on the key.
+    f.read(&a, main_quota(97, 40), later);
+    f.read(&b, main_quota_at(100, later + 3000, 60, NOW + 86400), later);
+    assert_eq!(f.engine.automation(later, &policy), CodexAutomation::Idle);
+    // b has usage again, but its reading is old: it is read again first.
+    f.read(&b, main_quota(10, 10), later - 1000);
+    assert_eq!(
+        f.engine.automation(later, &policy),
+        CodexAutomation::Refresh(b.clone())
+    );
+    // A reading attempted a moment ago is not repeated at once.
+    f.read(&b, main_quota(10, 10), later - 1000);
+    let index = f.engine.account_index(&b).unwrap();
+    f.engine.saved.accounts[index].last_attempt_at = Some(later - 30);
+    assert_eq!(f.engine.automation(later, &policy), CodexAutomation::Idle);
+    // A fresh reading with headroom: the return, by the ordinary ranking.
+    f.read(&b, main_quota(10, 10), later);
+    assert_eq!(f.engine.automation(later, &policy), key_return_to(&f, &b));
+    // A manual hold (a manual pick, an outside login) is respected first.
+    f.engine
+        .hold_automatic_returns(later - 100, &f.vault)
+        .unwrap();
+    let until = later - 100 + MANUAL_RETURN_HOLD;
+    assert_eq!(f.engine.automation(later, &policy), CodexAutomation::Idle);
+    f.read(&b, main_quota(10, 10), until);
+    assert_eq!(
+        f.engine.automation(until - 1, &policy),
+        CodexAutomation::Idle
+    );
+    assert_eq!(f.engine.automation(until, &policy), key_return_to(&f, &b));
+    // Automatic switching off, or a key that is not a fallback (a manual pick): no return.
+    let off = CodexPolicy {
+        auto_switch: false,
+        ..policy
+    };
+    assert_eq!(f.engine.automation(until, &off), CodexAutomation::Idle);
+    f.set_fallback(&key, false).await.unwrap();
+    assert_eq!(f.engine.automation(until, &policy), CodexAutomation::Idle);
+    f.set_fallback(&key, true).await.unwrap();
+    // The return itself puts the account back, restores Flex and ends the engagement.
+    f.engine.saved.return_hold_until = None;
+    f.read(&b, main_quota(10, 10), until);
+    let plan = plan_of(f.engine.automation(until, &policy));
+    f.auto_switch(&plan, until).await.unwrap();
+    assert_eq!(f.engine.selected_id.as_deref(), Some(b.as_str()));
+    assert_eq!(f.active(), auth("user-b", "ws-b", "saved"));
+    assert_eq!(f.config(), OWNER_CONFIG);
+    assert!(f.saved_state().flex_applied.is_none());
+    assert!(f.saved_state().fallback_engaged.is_none());
+    assert_eq!(
+        f.engine.last_switch.as_ref().and_then(|s| s.flex),
+        Some(CodexFlexChange::Off)
+    );
+    f.claude_untouched();
+}
+
+#[tokio::test]
+async fn a_manual_pick_of_a_fallback_key_is_held_and_then_follows_the_same_return_rule() {
+    let (mut f, a, b, key) = exhausted_world(false).await;
+    let policy = CodexPolicy::default();
+    // The owner picks the key by hand: the hold is saved first (as the window does).
+    f.engine.hold_automatic_returns(NOW, &f.vault).unwrap();
+    f.switch(&key).await.unwrap();
+    assert!(f.engine.saved.fallback_engaged.is_none());
+    f.read(&a, main_quota(10, 10), NOW);
+    f.read(&b, main_quota(10, 10), NOW);
+    assert_eq!(f.engine.automation(NOW, &policy), CodexAutomation::Idle);
+    let until = NOW + MANUAL_RETURN_HOLD;
+    f.read(&a, main_quota(10, 10), until);
+    f.read(&b, main_quota(12, 12), until);
+    assert_eq!(f.engine.automation(until, &policy), key_return_to(&f, &a));
+    f.claude_untouched();
+}
+
+#[tokio::test]
+async fn there_is_no_ping_pong_between_the_key_and_the_accounts() {
+    let (mut f, a, b, key) = exhausted_world(false).await;
+    let policy = CodexPolicy::default();
+    let plan = plan_of(f.engine.automation(NOW, &policy));
+    f.auto_switch(&plan, NOW).await.unwrap();
+    // b recovers a minute later: the cooldown of the engagement still holds.
+    f.read(&b, main_quota(10, 10), NOW + 60);
+    assert_eq!(
+        f.engine.automation(NOW + 60, &policy),
+        CodexAutomation::Idle
+    );
+    let returned = NOW + AUTO_SWITCH_COOLDOWN;
+    f.read(&b, main_quota(10, 10), returned);
+    let plan = plan_of(f.engine.automation(returned, &policy));
+    f.auto_switch(&plan, returned).await.unwrap();
+    assert_eq!(f.engine.selected_id.as_deref(), Some(b.as_str()));
+    // b hits its limit at once and every account is limited again: no second engagement
+    // before the cooldown of the return is over.
+    f.read(
+        &b,
+        main_quota_at(100, returned + 7200, 60, NOW + 86400),
+        returned + 60,
+    );
+    f.read(
+        &a,
+        main_quota_at(100, returned + 7200, 40, NOW + 86400),
+        returned,
+    );
+    assert_eq!(
+        f.engine.automation(returned + 60, &policy),
+        CodexAutomation::Idle
+    );
+    let again = returned + AUTO_SWITCH_COOLDOWN;
+    f.read(&b, main_quota_at(100, again + 7200, 60, NOW + 86400), again);
+    f.read(
+        &a,
+        main_quota_at(100, again + 7200, 40, NOW + 86400),
+        again - 1,
+    );
+    assert_eq!(
+        f.engine.automation(again, &policy),
+        fallback_to(&f, &key, 100)
+    );
+    f.claude_untouched();
+}
+
+/// An automatic plan that must be refused: it changes nothing.
+fn assert_refused(
+    f: &mut Fixture,
+    plan: &CodexAutoSwitch,
+    policy: &CodexPolicy,
+    now: i64,
+    selected: &str,
+) {
+    let (login, config) = (f.active(), f.config());
+    let (marker, flex) = (
+        f.engine.saved.fallback_engaged.clone(),
+        f.engine.saved.flex_applied.clone(),
+    );
+    f.engine.begin_auto_switch(now, &f.vault).unwrap();
+    assert_eq!(
+        f.engine
+            .begin_automatic_switch(plan, policy, &f.vault, now)
+            .err(),
+        Some(CodexReason::ExternalChange)
+    );
+    f.assert_unswitched(&login, &config, selected);
+    assert_eq!(f.engine.saved.fallback_engaged, marker);
+    assert_eq!(f.engine.saved.flex_applied, flex);
+}
+
+#[tokio::test]
+async fn an_api_key_is_only_ever_the_target_of_a_fallback_plan() {
+    let (mut f, a, b, key) = exhausted_world(false).await;
+    let policy = CodexPolicy::default();
+    let genuine = plan_of(f.engine.automation(NOW, &policy));
+    assert_eq!(genuine.kind, CodexAutoKind::KeyFallback);
+    // Every fallback condition holds, yet a plan of any other kind naming the key is refused.
+    for kind in [
+        CodexAutoKind::Switch,
+        CodexAutoKind::Return,
+        CodexAutoKind::KeyReturn,
+    ] {
+        let plan = CodexAutoSwitch {
+            kind,
+            ..genuine.clone()
+        };
+        assert_refused(&mut f, &plan, &policy, NOW, &a);
+    }
+    // A fallback plan naming a ChatGPT account is refused as well.
+    let plan = CodexAutoSwitch {
+        target_id: b.clone(),
+        ..genuine.clone()
+    };
+    assert_refused(&mut f, &plan, &policy, NOW, &a);
+    // A plan made for another active account is stale.
+    let plan = CodexAutoSwitch {
+        previous_id: b.clone(),
+        ..genuine.clone()
+    };
+    assert_refused(&mut f, &plan, &policy, NOW, &a);
+    // The genuine plan is accepted (and then it really switches).
+    f.auto_switch(&genuine, NOW).await.unwrap();
+    assert_eq!(f.engine.selected_id.as_deref(), Some(key.as_str()));
+    f.claude_untouched();
+}
+
+#[tokio::test]
+async fn a_fallback_plan_whose_preconditions_changed_aborts_and_changes_nothing() {
+    let (mut f, a, b, key) = exhausted_world(false).await;
+    let policy = CodexPolicy::default();
+    let plan = plan_of(f.engine.automation(NOW, &policy));
+    // The active reading went stale.
+    assert_refused(&mut f, &plan, &policy, NOW + FRESH_SECONDS + 1, &a);
+    // The active account was read again and is below its threshold.
+    f.read(&a, main_quota(40, 20), NOW);
+    assert_refused(&mut f, &plan, &policy, NOW, &a);
+    f.read(&a, main_quota(97, 40), NOW);
+    // An account that can take over appeared.
+    f.read(&b, main_quota(10, 10), NOW);
+    assert_refused(&mut f, &plan, &policy, NOW, &a);
+    f.read(
+        &b,
+        main_quota_at(100, NOW + 7200, 60, NOW + 86400),
+        NOW - 600,
+    );
+    // Another account is unread, failed or signed out.
+    let c = f.add("user-c", "ws-c", "saved");
+    assert_refused(&mut f, &plan, &policy, NOW, &a);
+    f.read(
+        &c,
+        main_quota_at(100, NOW + 7200, 10, NOW + 86400),
+        NOW - 600,
+    );
+    f.engine
+        .account_errors
+        .insert(c.clone(), CodexReason::ProviderUnavailable);
+    assert_refused(&mut f, &plan, &policy, NOW, &a);
+    f.engine.account_errors.remove(&c);
+    // One of them reopened since it was read.
+    f.read(&c, main_quota_at(100, NOW - 10, 10, NOW + 86400), NOW - 600);
+    assert_refused(&mut f, &plan, &policy, NOW, &a);
+    f.read(
+        &c,
+        main_quota_at(100, NOW + 7200, 10, NOW + 86400),
+        NOW - 600,
+    );
+    // Automatic switching was turned off.
+    let off = CodexPolicy {
+        auto_switch: false,
+        ..policy
+    };
+    assert_refused(&mut f, &plan, &off, NOW, &a);
+    // The key stopped being the fallback, was excluded, or cannot be switched to.
+    f.set_fallback(&key, false).await.unwrap();
+    assert_refused(&mut f, &plan, &policy, NOW, &a);
+    f.set_fallback(&key, true).await.unwrap();
+    let index = f.engine.account_index(&key).unwrap();
+    f.engine.saved.accounts[index].automation.enabled = false;
+    assert_refused(&mut f, &plan, &policy, NOW, &a);
+    f.engine.saved.accounts[index].automation.enabled = true;
+    f.engine.saved.accounts[index].use_flex = true;
+    assert_refused(&mut f, &plan, &policy, NOW, &a);
+    f.engine.saved.accounts[index].use_flex = false;
+    // Another key became the better pick.
+    let second = f.fallback_key("Second key", SECOND_KEY).await;
+    let index = f.engine.account_index(&second).unwrap();
+    f.engine.saved.accounts[index].automation.priority = Some(1);
+    assert_refused(&mut f, &plan, &policy, NOW, &a);
+    f.engine.saved.accounts[index].automation.priority = None;
+    // With everything as planned it is accepted.
+    f.engine.saved.accounts[index].fallback = false;
+    f.read(&a, main_quota(97, 40), NOW);
+    f.auto_switch(&plan, NOW).await.unwrap();
+    assert_eq!(f.engine.selected_id.as_deref(), Some(key.as_str()));
+    f.claude_untouched();
+}
+
+#[tokio::test]
+async fn the_owner_switching_meanwhile_stops_a_fallback_before_and_during_the_write() {
+    for during_replace in [false, true] {
+        let (mut f, a, _b, key) = exhausted_world(false).await;
+        let policy = CodexPolicy::default();
+        let plan = plan_of(f.engine.automation(NOW, &policy));
+        let external = auth("user-c", "ws-c", "external");
+        if during_replace {
+            let path = f.home.join("auth.json");
+            let bytes = external.clone();
+            f.engine.before_automatic_replace =
+                Some(Box::new(move || fs::write(path, bytes).unwrap()));
+        } else {
+            f.write_active(&external);
+        }
+        f.engine.begin_auto_switch(NOW, &f.vault).unwrap();
+        assert_eq!(
+            f.engine
+                .begin_automatic_switch(&plan, &policy, &f.vault, NOW)
+                .err(),
+            Some(CodexReason::ExternalChange)
+        );
+        // The outside login stays, is kept as a saved account, and holds returns.
+        assert_eq!(f.active(), external);
+        assert_eq!(f.saved_bytes("ws-c"), external);
+        assert_eq!(f.engine.selected_id, Some(f.id_of("ws-c")));
+        assert!(f.daemon.calls.lock().unwrap().is_empty());
+        assert!(f.engine.saved.fallback_engaged.is_none());
+        assert!(f.engine.saved.return_hold_until.is_some());
+        assert_ne!(f.engine.selected_id.as_deref(), Some(key.as_str()));
+        let _ = a;
+        f.claude_untouched();
+    }
+}
+
+#[tokio::test]
+async fn a_return_from_the_key_is_guarded_as_strictly_as_a_return_between_accounts() {
+    // The preconditions of the return itself.
+    let engaged = || async {
+        let (mut f, a, b, key) = exhausted_world(false).await;
+        let policy = CodexPolicy::default();
+        let plan = plan_of(f.engine.automation(NOW, &policy));
+        f.auto_switch(&plan, NOW).await.unwrap();
+        f.daemon.calls.lock().unwrap().clear();
+        let later = NOW + AUTO_SWITCH_COOLDOWN;
+        f.read(&a, main_quota(97, 40), later);
+        f.read(&b, main_quota(10, 10), later);
+        let plan = plan_of(f.engine.automation(later, &policy));
+        assert_eq!(plan.kind, CodexAutoKind::KeyReturn);
+        (f, a, b, key, plan, later)
+    };
+    let policy = CodexPolicy::default();
+    let (mut f, _a, b, key, plan, later) = engaged().await;
+    // Its reading went stale; a ChatGPT account is no longer usable.
+    assert_refused(&mut f, &plan, &policy, later + FRESH_SECONDS + 1, &key);
+    f.read(&b, main_quota_at(100, later + 7200, 60, NOW + 86400), later);
+    assert_refused(&mut f, &plan, &policy, later, &key);
+    f.read(&b, main_quota(10, 10), later);
+    // The manual hold started, the setting is off, the key is not a fallback any more.
+    f.engine.hold_automatic_returns(later, &f.vault).unwrap();
+    assert_refused(&mut f, &plan, &policy, later, &key);
+    f.engine.saved.return_hold_until = None;
+    let off = CodexPolicy {
+        auto_switch: false,
+        ..policy
+    };
+    assert_refused(&mut f, &plan, &off, later, &key);
+    f.set_fallback(&key, false).await.unwrap();
+    assert_refused(&mut f, &plan, &policy, later, &key);
+    f.set_fallback(&key, true).await.unwrap();
+    // An ordinary or natural plan naming the same ChatGPT account is not a key return.
+    for kind in [
+        CodexAutoKind::Switch,
+        CodexAutoKind::Return,
+        CodexAutoKind::KeyFallback,
+    ] {
+        let plan = CodexAutoSwitch {
+            kind,
+            ..plan.clone()
+        };
+        assert_refused(&mut f, &plan, &policy, later, &key);
+    }
+    // The login changed outside the app: another ChatGPT login, another API key (before
+    // the write, and in the middle of it).
+    for (external, during_replace) in [
+        (auth("user-c", "ws-c", "external"), false),
+        (key_file(SECOND_KEY), false),
+        (key_file(SECOND_KEY), true),
+    ] {
+        let (mut f, _a, _b, key, plan, later) = engaged().await;
+        if during_replace {
+            let path = f.home.join("auth.json");
+            let bytes = external.clone();
+            f.engine.before_automatic_replace =
+                Some(Box::new(move || fs::write(path, bytes).unwrap()));
+        } else {
+            f.write_active(&external);
+        }
+        f.engine.begin_auto_switch(later, &f.vault).unwrap();
+        assert_eq!(
+            f.engine
+                .begin_automatic_switch(&plan, &policy, &f.vault, later)
+                .err(),
+            Some(CodexReason::ExternalChange)
+        );
+        assert_eq!(f.active(), external);
+        assert!(f.daemon.calls.lock().unwrap().is_empty());
+        assert_ne!(
+            f.engine.selected_id.as_deref(),
+            Some(plan.target_id.as_str())
+        );
+        assert!(f.engine.saved.fallback_engaged.is_none());
+        assert!(f.engine.saved.return_hold_until.is_some());
+        let _ = key;
+    }
+    // Rewritten by Codex with the same key, it is still the key: the return goes ahead.
+    let (mut f, _a, b, _key, plan, later) = engaged().await;
+    f.write_active(&key_file(FAKE_KEY));
+    f.auto_switch(&plan, later).await.unwrap();
+    assert_eq!(f.engine.selected_id.as_deref(), Some(b.as_str()));
+    f.claude_untouched();
+}
+
+#[tokio::test]
+async fn while_the_key_is_active_every_chatgpt_account_keeps_being_read_and_a_reopened_one_promptly()
+ {
+    let (mut f, a, b, key) = exhausted_world(false).await;
+    let policy = CodexPolicy::default();
+    let plan = plan_of(f.engine.automation(NOW, &policy));
+    f.auto_switch(&plan, NOW).await.unwrap();
+    assert_eq!(f.engine.selected_id.as_deref(), Some(key.as_str()));
+    // The key is never read; its absence is not a failure.
+    assert!(!f.engine.reads_quota(&key));
+    // a was at its limit until NOW + 600, b until NOW + 7200; both read at NOW.
+    f.read(&a, main_quota_at(97, NOW + 600, 40, NOW + 86400), NOW);
+    f.read(&b, main_quota_at(100, NOW + 7200, 60, NOW + 86400), NOW);
+    assert_eq!(f.engine.due_quota(NOW + 599, &policy), None);
+    // The moment a's block reopens it is read, long before the hourly reading.
+    assert_eq!(f.engine.due_quota(NOW + 600, &policy), Some(a.clone()));
+    // Read at NOW + 590, a moment before its window reopens: not again within the short
+    // retry floor, and then at once.
+    f.read(&a, main_quota_at(97, NOW + 600, 40, NOW + 86400), NOW + 590);
+    assert_eq!(f.engine.due_quota(NOW + 600, &policy), None);
+    assert_eq!(
+        f.engine.due_quota(NOW + 590 + RETURN_RETRY - 1, &policy),
+        None
+    );
+    assert_eq!(
+        f.engine.due_quota(NOW + 590 + RETURN_RETRY, &policy),
+        Some(a.clone())
+    );
+    // A failed attempt backs off longer.
+    let index = f.engine.account_index(&a).unwrap();
+    f.engine.saved.accounts[index].last_attempt_at = Some(NOW + 700);
+    assert_eq!(f.engine.due_quota(NOW + 700 + RETURN_RETRY, &policy), None);
+    assert_eq!(
+        f.engine.due_quota(NOW + 700 + ERROR_RETRY, &policy),
+        Some(a.clone())
+    );
+    // The ordinary cadence continues for the others: every hour.
+    f.read(
+        &a,
+        main_quota_at(97, NOW + 90_000, 40, NOW + 86400),
+        NOW - 10,
+    );
+    assert_eq!(
+        f.engine
+            .due_quota(NOW + INACTIVE_QUOTA_INTERVAL - 11, &policy),
+        None
+    );
+    assert_eq!(
+        f.engine
+            .due_quota(NOW + INACTIVE_QUOTA_INTERVAL - 10, &policy),
+        Some(a.clone())
+    );
+    // A recovered account that is read is then the return's target.
+    f.read(&b, main_quota(10, 10), NOW + AUTO_SWITCH_COOLDOWN);
+    assert_eq!(
+        f.engine.automation(NOW + AUTO_SWITCH_COOLDOWN, &policy),
+        key_return_to(&f, &b)
+    );
+    f.claude_untouched();
+}
+
+#[tokio::test]
+async fn the_fallback_setting_is_saved_shown_with_its_hints_and_old_records_load() {
+    let mut f = Fixture::new();
+    let a = f.id_of("ws-a");
+    f.add_key("Work key", FAKE_KEY).await.unwrap();
+    let key = f.key_id(FAKE_KEY);
+    let policy = CodexPolicy::default();
+    let view = f.view(&key);
+    assert!(!view.fallback && view.fallback_toggle.enabled && view.fallback_hint.is_none());
+    // Only a key can be a fallback.
+    assert_eq!(
+        f.view(&a).fallback_toggle.blocked_reason,
+        Some(CodexReason::UnsupportedAuth)
+    );
+    assert_eq!(f.view(&a).fallback_hint, None);
+    assert_eq!(
+        f.set_fallback(&a, true).await.err(),
+        Some(CodexReason::UnsupportedAuth)
+    );
+    assert_eq!(
+        f.set_fallback("missing", true).await.err(),
+        Some(CodexReason::IdentityUnverified)
+    );
+    // It is saved while automatic switching is off, and the view says why it cannot act.
+    f.set_fallback(&key, true).await.unwrap();
+    assert!(f.view(&key).fallback);
+    assert!(
+        f.saved_state()
+            .accounts
+            .iter()
+            .any(|x| x.id == key && x.fallback)
+    );
+    let off = CodexPolicy {
+        auto_switch: false,
+        ..policy
+    };
+    let hinted = f
+        .engine
+        .snapshot(false, NOW, &off)
+        .accounts
+        .into_iter()
+        .find(|v| v.id == key)
+        .unwrap();
+    assert!(hinted.fallback);
+    assert_eq!(
+        hinted.fallback_hint,
+        Some(CodexReason::FallbackNeedsAutoSwitch)
+    );
+    // A Flex key on a Codex without Flex cannot be switched to: that is the hint.
+    let index = f.engine.account_index(&key).unwrap();
+    f.engine.saved.accounts[index].use_flex = true;
+    assert_eq!(
+        f.view(&key).fallback_hint,
+        Some(CodexReason::FlexUnsupportedVersion)
+    );
+    f.engine.saved.accounts[index].use_flex = false;
+    // Setting it again changes nothing; a switch or sign-in in progress blocks it.
+    f.set_fallback(&key, true).await.unwrap();
+    f.engine.switching = Some(CodexSwitchView {
+        target_id: a.clone(),
+        stage: CodexSwitchStage::Restarting,
+        started_at: NOW,
+    });
+    assert_eq!(
+        f.set_fallback(&key, false).await.err(),
+        Some(CodexReason::Busy)
+    );
+    assert_eq!(
+        f.view(&key).fallback_toggle.blocked_reason,
+        Some(CodexReason::SwitchInProgress)
+    );
+    f.engine.switching = None;
+    f.set_fallback(&key, false).await.unwrap();
+    assert!(!f.view(&key).fallback);
+    // A record from before this setting has neither field; with both they come back.
+    f.set_fallback(&key, true).await.unwrap();
+    let mut record = serde_json::to_value(&f.engine.saved).unwrap();
+    assert!(record.get("fallback_engaged").is_none());
+    let position = record["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|x| x["id"] == key.as_str())
+        .unwrap();
+    assert_eq!(record["accounts"][position]["fallback"], true);
+    record["accounts"][position]
+        .as_object_mut()
+        .unwrap()
+        .remove("fallback");
+    f.vault.save(RECORD, &record).unwrap();
+    let loaded = CodexEngine::load(&f.vault);
+    assert!(loaded.writable && loaded.saved.accounts.iter().all(|x| !x.fallback));
+    assert!(loaded.saved.fallback_engaged.is_none());
+    record["accounts"][position]["fallback"] = json!(true);
+    record["fallback_engaged"] = json!({"key_id":key,"from_account_id":a,"since":42});
+    f.vault.save(RECORD, &record).unwrap();
+    let loaded = CodexEngine::load(&f.vault);
+    assert!(
+        loaded
+            .saved
+            .accounts
+            .iter()
+            .any(|x| x.id == key && x.fallback)
+    );
+    assert_eq!(
+        loaded.saved.fallback_engaged,
+        Some(FallbackEngaged {
+            key_id: key.clone(),
+            from_account_id: a.clone(),
+            since: 42
+        })
+    );
+    // No key material in the snapshot.
+    let json = serde_json::to_string(&f.engine.snapshot(false, NOW, &policy)).unwrap();
+    assert!(!json.contains("SENTINEL") && !json.contains("sk-proj"));
+    f.claude_untouched();
+}
+
+/// One background tick, then a pause so the follow-up reading of the new active account
+/// (which holds the job lock) is over before the next tick.
+async fn settled_tick(handle: &RuntimeHandle) {
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    handle.codex_tick().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+}
+
+#[tokio::test]
+async fn the_background_tick_falls_back_to_the_key_notifies_and_returns_when_an_account_recovers() {
+    let (mut f, _a, b, key) = exhausted_world(false).await;
+    f.factory
+        .enqueue(Plan::quota(Ok(quota(Some("ws-b"), 12, 11))));
+    let daemon = f.daemon.clone();
+    let settings = Settings {
+        language: "en".into(),
+        ..Settings::default()
+    };
+    let (_temp, handle) = runtime(&mut f, settings).await;
+    let mut notifications = handle.notifications();
+    settled_tick(&handle).await;
+    let notice = notifications.try_recv().unwrap();
+    assert_eq!(notice.title, "Codex switched to API key Work key");
+    assert_eq!(
+        notice.body,
+        "Every ChatGPT account is at its limit. Codex now bills per token. PrimerSwitch returns by itself when an account recovers. · open terminals reconnect automatically."
+    );
+    assert!(notifications.try_recv().is_err());
+    let snapshot = handle.get_codex_snapshot();
+    assert_eq!(snapshot.selected_id.as_deref(), Some(key.as_str()));
+    assert_eq!(
+        snapshot
+            .fallback_engaged
+            .as_ref()
+            .map(|e| e.key_id.as_str()),
+        Some(key.as_str())
+    );
+    assert_eq!(f.active(), key_file(FAKE_KEY));
+    assert_eq!(*daemon.calls.lock().unwrap(), vec!["state", "restart"]);
+    // The key is never read for usage, and no notice or secret says otherwise.
+    assert!(!f.factory.calls().iter().any(|call| call == "quota"));
+    // b recovers: within the cooldown nothing comes back.
+    handle
+        .edit_codex_for_test(|engine, _| record_reading(engine, &b, main_quota(10, 10), NOW))
+        .await;
+    settled_tick(&handle).await;
+    assert_eq!(
+        handle.get_codex_snapshot().selected_id.as_deref(),
+        Some(key.as_str())
+    );
+    assert_eq!(daemon.calls.lock().unwrap().len(), 2);
+    assert!(notifications.try_recv().is_err());
+    // After the cooldown the tick returns, by itself, and says so.
+    handle
+        .edit_codex_for_test(|engine, _| {
+            engine.saved.last_auto_switch_at = Some(NOW - AUTO_SWITCH_COOLDOWN);
+        })
+        .await;
+    settled_tick(&handle).await;
+    let notice = notifications.try_recv().unwrap();
+    assert_eq!(notice.title, "Codex switched to user-b@example.invalid");
+    assert_eq!(
+        notice.body,
+        "Account user-b@example.invalid has usage again. Switched back from API key Work key. · open terminals reconnect automatically."
+    );
+    let snapshot = handle.get_codex_snapshot();
+    assert_eq!(snapshot.selected_id.as_deref(), Some(b.as_str()));
+    assert!(snapshot.fallback_engaged.is_none());
+    assert_eq!(f.active(), auth("user-b", "ws-b", "saved"));
+    assert_eq!(daemon.calls.lock().unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn a_romanian_owner_gets_the_fallback_notice_in_romanian() {
+    let (mut f, _a, _b, key) = exhausted_world(false).await;
+    let settings = Settings {
+        language: "ro".into(),
+        ..Settings::default()
+    };
+    let (_temp, handle) = runtime(&mut f, settings).await;
+    let mut notifications = handle.notifications();
+    settled_tick(&handle).await;
+    let notice = notifications.try_recv().unwrap();
+    assert_eq!(notice.title, "Codex a comutat pe cheia API Work key");
+    assert!(
+        notice.body.starts_with(
+            "Toate conturile ChatGPT sunt la limită. Codex facturează acum per token."
+        ),
+        "{}",
+        notice.body
+    );
+    assert_eq!(
+        handle.get_codex_snapshot().selected_id.as_deref(),
+        Some(key.as_str())
+    );
+}
+
+#[tokio::test]
+async fn a_failed_fallback_notifies_once_and_is_not_retried_within_the_cooldown() {
+    let (mut f, a, _b, _key) = exhausted_world(true).await;
+    // The config cannot be edited, so Flex cannot be set: the switch must not happen.
+    f.write_config(b"service_tier = 5\n");
+    let login = f.active();
+    let daemon = f.daemon.clone();
+    let (_temp, handle) = runtime(
+        &mut f,
+        Settings {
+            language: "en".into(),
+            ..Settings::default()
+        },
+    )
+    .await;
+    let unswitched = |handle: &RuntimeHandle| {
+        assert_eq!(f.active(), login);
+        assert_eq!(
+            f.config(),
+            b"service_tier = 5
+"
+        );
+        let snapshot = handle.get_codex_snapshot();
+        assert_eq!(snapshot.selected_id.as_deref(), Some(a.as_str()));
+        assert!(snapshot.fallback_engaged.is_none());
+        assert!(daemon.calls.lock().unwrap().is_empty());
+    };
+    let mut notifications = handle.notifications();
+    settled_tick(&handle).await;
+    let notice = notifications.try_recv().unwrap();
+    assert_eq!(
+        notice.body,
+        "Could not switch Codex to Work key automatically. Open PrimerSwitch for details."
+    );
+    assert!(notifications.try_recv().is_err());
+    unswitched(&handle);
+    // Within the cooldown: no attempt, no notice, no daemon call.
+    settled_tick(&handle).await;
+    assert!(notifications.try_recv().is_err());
+    unswitched(&handle);
+    // After the cooldown it tries once more; the same failure is not announced again.
+    handle
+        .edit_codex_for_test(|engine, _| {
+            engine.saved.last_auto_switch_at = Some(NOW - AUTO_SWITCH_COOLDOWN);
+        })
+        .await;
+    settled_tick(&handle).await;
+    assert!(notifications.try_recv().is_err());
+    unswitched(&handle);
+}
+
+#[tokio::test]
+async fn without_a_usable_fallback_key_the_tick_still_only_reports_all_limited() {
+    let (mut f, _a, _b, key) = exhausted_world(false).await;
+    f.set_fallback(&key, false).await.unwrap();
+    let login = f.active();
+    let daemon = f.daemon.clone();
+    let (_temp, handle) = runtime(
+        &mut f,
+        Settings {
+            language: "en".into(),
+            ..Settings::default()
+        },
+    )
+    .await;
+    let mut notifications = handle.notifications();
+    settled_tick(&handle).await;
+    let notice = notifications.try_recv().unwrap();
+    assert!(
+        notice
+            .body
+            .starts_with("All Codex accounts are at their limit.")
+    );
+    assert_eq!(f.active(), login);
+    assert!(daemon.calls.lock().unwrap().is_empty());
+    assert!(handle.get_codex_snapshot().fallback_engaged.is_none());
+}
+
+#[tokio::test]
+async fn the_runtime_handle_saves_the_fallback_setting_for_keys_only() {
+    let mut f = Fixture::new();
+    let a = f.id_of("ws-a");
+    f.add_key("Work key", FAKE_KEY).await.unwrap();
+    let key = f.key_id(FAKE_KEY);
+    let (_temp, handle) = runtime(&mut f, Settings::default()).await;
+    let snapshot = handle.codex_set_api_key_fallback(&key, true).await.unwrap();
+    let view = snapshot.accounts.iter().find(|v| v.id == key).unwrap();
+    assert!(view.fallback && view.fallback_toggle.enabled);
+    let json = serde_json::to_value(&snapshot).unwrap();
+    let row = json["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["id"] == key.as_str())
+        .unwrap()
+        .clone();
+    assert_eq!(row["fallback"], true);
+    assert_eq!(row["fallbackToggle"]["enabled"], true);
+    assert!(json["fallbackEngaged"].is_null());
+    assert_eq!(
+        handle.codex_set_api_key_fallback(&a, true).await.err(),
+        Some(CodexReason::UnsupportedAuth)
+    );
+    let snapshot = handle
+        .codex_set_api_key_fallback(&key, false)
+        .await
+        .unwrap();
+    assert!(
+        !snapshot
+            .accounts
+            .iter()
+            .find(|v| v.id == key)
+            .unwrap()
+            .fallback
+    );
 }

@@ -490,7 +490,7 @@ export const ro: Record<keyof typeof en, string> = {
     'Adăugarea unui cont nu schimbă contul folosit de Codex.',
   codexApiKeyTitle: 'Adaugă o cheie API OpenAI',
   codexApiKeyDescription:
-    'Codex facturează cheia API pe token, în afara abonamentului ChatGPT. PrimerSwitch nu comută singur pe ea; o alegi tu cu Comută.',
+    'Codex facturează cheia API pe token, în afara abonamentului ChatGPT. PrimerSwitch nu comută singur pe ea decât dacă activezi „Folosește ca rezervă” pentru această cheie; altfel o alegi tu cu Comută.',
   codexApiKeyNameLabel: 'Nume',
   codexApiKeyLabel: 'Cheie API',
   codexApiKeyHelp:
@@ -568,4 +568,19 @@ export const ro: Record<keyof typeof en, string> = {
     'Flex este activ. Sesiunile Codex noi folosesc Flex; sesiunile deja deschise își păstrează nivelul.',
   codexFlexOff:
     "Flex este dezactivat din nou. O sesiune pornită cât timp Flex era activ poate eșua pe ChatGPT cu 'Unsupported service_tier: flex'; pornește o sesiune nouă.",
+  codexReason_fallbackNeedsAutoSwitch:
+    'Rezerva automată funcționează doar cât timp comutarea automată este pornită. Pornește-o din setările de automatizare Codex.',
+  codexFallbackLabel: 'Folosește ca rezervă',
+  codexFallbackHelp:
+    'Când toate conturile ChatGPT sunt la limită, PrimerSwitch comută singur pe această cheie și revine când un cont se reface. Codex facturează această cheie per token.',
+  codexFallbackTag: 'Rezervă',
+  codexFallbackConfirmTitle: 'Permiți facturarea automată pe această cheie?',
+  codexFallbackConfirmText:
+    'Codex facturează această cheie per token, în afara planului tău ChatGPT. PrimerSwitch va comuta singur pe ea când toate conturile ChatGPT sunt la limită și va reveni când unul se reface. Setează un buget lunar pe proiectul OpenAI.',
+  codexFallbackConfirmAction: 'Pornește rezerva',
+  codexFallbackFlexWarning:
+    'O sesiune Codex pornită cât timp această cheie este activă cu Flex eșuează pe ChatGPT după revenirea automată, până pornești una nouă.',
+  codexFallbackBanner:
+    'Se folosește cheia API {name} (facturată per token) din {time}, pentru că toate conturile ChatGPT sunt la limită. PrimerSwitch revine automat când unul se reface.',
+  codexFallbackSwitchBack: 'Revino acum',
 };

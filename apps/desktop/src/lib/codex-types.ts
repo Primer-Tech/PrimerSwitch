@@ -32,6 +32,7 @@ export const codexReasonSchema = z.enum([
   'flexUnsupportedVersion',
   'flexConfigFailed',
   'flexRestoreFailed',
+  'fallbackNeedsAutoSwitch',
 ]);
 export type CodexReason = z.infer<typeof codexReasonSchema>;
 export const codexResetOutcomeSchema = z.enum([
@@ -101,6 +102,12 @@ export const codexAccountSchema = z
     useFlex: z.boolean().optional(),
     /** Whether the Flex setting can be changed now, and why not. */
     flex: codexCapabilitySchema.optional(),
+    /** API key only: PrimerSwitch may switch to this key by itself when every ChatGPT account is at its limit. */
+    fallback: z.boolean().optional(),
+    /** Whether the fallback setting can be changed now, and why not. */
+    fallbackToggle: codexCapabilitySchema.optional(),
+    /** Why the fallback setting has no effect or no use right now (for example automatic switching is off). */
+    fallbackHint: codexReasonSchema.nullable().optional(),
     quota: z
       .object({
         ordinaryUsageAllowed: z.boolean().nullable(),
@@ -186,6 +193,12 @@ export const codexSnapshotSchema = z
     selectedId: id.nullable(),
     /** The account automatic switching uses next, ranked natively. */
     nextId: id.nullable(),
+    /** An API key is the active login because every ChatGPT account hit its limit. */
+    fallbackEngaged: z
+      .object({ keyId: id, since: z.number().int() })
+      .strict()
+      .nullable()
+      .optional(),
     /** Every account automatic switching may use, best first; `order[0]` is `nextId`. */
     order: z.array(id),
     activeModel: text.nullable(),

@@ -96,6 +96,21 @@ pub(crate) enum CodexAutomation {
         /// The account whose blocking windows reopen first, and when.
         frees_first: Option<(String, i64)>,
     },
+    /// Every ChatGPT account is proven at its limit: move to a saved API key that the
+    /// owner set as the fallback. This bills per token, so it has its own guards.
+    Fallback(CodexAutoSwitch),
+}
+/// What an automatic plan is allowed to do. Only the key kinds may involve an API key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CodexAutoKind {
+    /// ChatGPT account to ChatGPT account, because the active one reached its limit.
+    Switch,
+    /// Back to a preferred ChatGPT account after its five-hour window recovered.
+    Return,
+    /// ChatGPT account to the fallback API key.
+    KeyFallback,
+    /// Fallback API key back to a ChatGPT account that has usage again.
+    KeyReturn,
 }
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CodexAutoSwitch {
@@ -106,6 +121,33 @@ pub(crate) struct CodexAutoSwitch {
     /// The active account's highest main-window usage; below the threshold when only
     /// a reached-limit flag triggered the switch.
     pub peak: Option<i32>,
+    pub kind: CodexAutoKind,
+}
+/// The login an automatic plan was made for. The file must still hold it just before it
+/// is replaced: a ChatGPT owner (by binding) or an API key (by value).
+enum ExpectedLogin {
+    Chatgpt(Binding),
+    Key(Zeroizing<Vec<u8>>),
+}
+impl ExpectedLogin {
+    fn matches(&self, bytes: &[u8]) -> bool {
+        match self {
+            Self::Chatgpt(expected) => OpaqueAuth::parse(bytes.to_vec()).is_ok_and(|auth| {
+                Binding::from_auth(&auth).is_ok_and(|owner| owner.same_owner(expected))
+            }),
+            Self::Key(saved) => same_api_key(saved, bytes),
+        }
+    }
+}
+/// The outcome of `CodexEngine::key_fallback`.
+enum KeyFallback {
+    /// No fallback applies (or no key could take it).
+    No,
+    /// Not proven yet: an account whose reading has passed its reset time is read first.
+    Refresh(String),
+    /// Not proven yet, and that account was read a moment ago: look again later.
+    Wait,
+    Engage(CodexAutoSwitch),
 }
 
 /// The main Codex limit. Either window may be absent; duration determines its role.
@@ -239,6 +281,10 @@ struct SavedAccount {
     /// API key only: Codex's `service_tier` is "flex" while this key is the active login.
     #[serde(default, skip_serializing_if = "is_false")]
     use_flex: bool,
+    /// API key only: the key PrimerSwitch moves Codex to by itself when every ChatGPT
+    /// account is at its limit, and leaves again when one recovers.
+    #[serde(default, skip_serializing_if = "is_false")]
+    fallback: bool,
 }
 fn is_false(value: &bool) -> bool {
     !*value
@@ -310,6 +356,16 @@ struct Saved {
     /// what to put back, kept across restarts so a crash never leaves Flex on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     flex_applied: Option<FlexMark>,
+    /// Set while the automatic fallback has put Codex on an API key; cleared as soon as
+    /// the active login is anything else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fallback_engaged: Option<FallbackEngaged>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct FallbackEngaged {
+    key_id: String,
+    from_account_id: String,
+    since: i64,
 }
 impl Default for Saved {
     fn default() -> Self {
@@ -319,6 +375,7 @@ impl Default for Saved {
             return_hold_until: None,
             last_auto_switch_at: None,
             flex_applied: None,
+            fallback_engaged: None,
         }
     }
 }
@@ -642,6 +699,8 @@ pub(crate) enum CodexCommand {
     AddApiKey(String, Zeroizing<String>),
     /// Turn Flex processing on or off for one saved API key.
     SetApiKeyFlex(String, bool),
+    /// Make a saved API key the automatic fallback, or stop it being one.
+    SetApiKeyFallback(String, bool),
     Delete(String),
     UpdateAccountAutomation(String, AccountAutomationView),
     ResumeAutomaticReturns,
@@ -818,6 +877,7 @@ impl CodexEngine {
                 preferred_return_reset_at: None,
                 preferred_return_handled_reset_at: None,
                 use_flex: false,
+                fallback: false,
             });
             engine.verified_now.insert(id);
         }
@@ -954,6 +1014,32 @@ impl CodexEngine {
             }
         });
         reason.map_or_else(CodexCapability::allowed, CodexCapability::blocked)
+    }
+    /// Whether the fallback setting of `account` can be changed now, and why not.
+    fn fallback_toggle(&self, account: &SavedAccount) -> CodexCapability {
+        let reason = self.common_block().or_else(|| {
+            if self.switching.is_some() {
+                Some(CodexReason::SwitchInProgress)
+            } else if account.auth_kind != AuthKind::ApiKey {
+                Some(CodexReason::UnsupportedAuth)
+            } else {
+                None
+            }
+        });
+        reason.map_or_else(CodexCapability::allowed, CodexCapability::blocked)
+    }
+    /// Why a fallback key could not act now, although the setting can be saved: automatic
+    /// switching is off, or the key cannot be switched to.
+    fn fallback_hint(&self, account: &SavedAccount, policy: &CodexPolicy) -> Option<CodexReason> {
+        if account.auth_kind != AuthKind::ApiKey {
+            None
+        } else if !policy.auto_switch {
+            Some(CodexReason::FallbackNeedsAutoSwitch)
+        } else if self.selected_id.as_deref() == Some(&account.id) {
+            None
+        } else {
+            self.switch_capability(account).blocked_reason
+        }
     }
     /// The active login is an API key that uses Flex.
     fn flex_wanted(&self) -> bool {
@@ -1147,28 +1233,142 @@ impl CodexEngine {
                     target_name: target.name.clone(),
                     previous_name: active.name.clone(),
                     peak: main_windows(quota).map(|w| w.used_percent).max(),
+                    kind: CodexAutoKind::Switch,
                 })
             }
             Some(target) => CodexAutomation::Refresh(target.id.clone()),
-            None if self.others_known_unusable(policy.threshold) => CodexAutomation::Exhausted {
-                frees_first: self
-                    .saved
-                    .accounts
-                    .iter()
-                    .filter(|a| a.auth_kind == AuthKind::ManagedChatgpt && a.automation.enabled)
-                    .filter_map(|a| {
-                        Some((
-                            frees_at(
-                                a.quota.as_ref()?,
-                                a.automation.effective_threshold(policy.threshold),
-                            )?,
-                            a,
-                        ))
-                    })
-                    .min_by_key(|(at, _)| *at)
-                    .map(|(at, a)| (a.name.clone(), at)),
-            },
+            None if self.others_known_unusable(policy.threshold) => {
+                match self.key_fallback(now, policy) {
+                    KeyFallback::Engage(plan) => CodexAutomation::Fallback(plan),
+                    KeyFallback::Refresh(id) => CodexAutomation::Refresh(id),
+                    // A recovery is checked first: neither engage nor claim "all limited".
+                    KeyFallback::Wait => CodexAutomation::Idle,
+                    KeyFallback::No => CodexAutomation::Exhausted {
+                        frees_first: self
+                            .saved
+                            .accounts
+                            .iter()
+                            .filter(|a| {
+                                a.auth_kind == AuthKind::ManagedChatgpt && a.automation.enabled
+                            })
+                            .filter_map(|a| {
+                                Some((
+                                    frees_at(
+                                        a.quota.as_ref()?,
+                                        a.automation.effective_threshold(policy.threshold),
+                                    )?,
+                                    a,
+                                ))
+                            })
+                            .min_by_key(|(at, _)| *at)
+                            .map(|(at, a)| (a.name.clone(), at)),
+                    },
+                }
+            }
             None => CodexAutomation::Idle,
+        }
+    }
+    /// Moving to the fallback API key bills per token, so every condition is decided
+    /// here from scratch (the guarded switch asks again just before writing):
+    /// automatic switching on; the active login is a saved ChatGPT account with a fresh
+    /// reading at its threshold; no ChatGPT account can take over; every other ChatGPT
+    /// account is proven at its limit by a reading that has not reached its reset time;
+    /// and a key the owner set as the fallback can be switched to. The cooldown, a switch
+    /// or sign-in in progress and a blocked setup are checked by the caller.
+    fn key_fallback(&self, now: i64, policy: &CodexPolicy) -> KeyFallback {
+        let Some(active) = self.selected() else {
+            return KeyFallback::No;
+        };
+        if !policy.auto_switch
+            || self.common_block().is_some()
+            || active.auth_kind != AuthKind::ManagedChatgpt
+            || self.quota_state(active, now) != CodexQuotaState::Fresh
+        {
+            return KeyFallback::No;
+        }
+        let Some(quota) = active
+            .quota
+            .as_ref()
+            .filter(|q| reaches(q, active.automation.effective_threshold(policy.threshold)))
+        else {
+            return KeyFallback::No;
+        };
+        if self.next_candidate(policy).is_some() || !self.others_known_unusable(policy.threshold) {
+            return KeyFallback::No;
+        }
+        let Some(key) = self
+            .saved
+            .accounts
+            .iter()
+            .filter(|a| {
+                a.auth_kind == AuthKind::ApiKey
+                    && a.fallback
+                    && a.automation.enabled
+                    && !self.account_errors.contains_key(&a.id)
+                    && self.switch_capability(a).enabled
+            })
+            .min_by_key(|a| (a.automation.priority.unwrap_or(u16::MAX), &a.id))
+        else {
+            return KeyFallback::No;
+        };
+        // A reading proves "limited" only until its window reopens: read that account
+        // again before any money is spent.
+        if let Some(recovering) = self
+            .saved
+            .accounts
+            .iter()
+            .filter(|a| {
+                a.id != active.id
+                    && a.auth_kind == AuthKind::ManagedChatgpt
+                    && a.automation.enabled
+                    && reset_passed(a, now)
+            })
+            .min_by_key(|a| (a.quota_read_at.unwrap_or(i64::MIN), &a.id))
+        {
+            return if self.recovery_read_due(recovering, now) {
+                KeyFallback::Refresh(recovering.id.clone())
+            } else {
+                KeyFallback::Wait
+            };
+        }
+        KeyFallback::Engage(CodexAutoSwitch {
+            previous_id: active.id.clone(),
+            target_id: key.id.clone(),
+            target_name: key.name.clone(),
+            previous_name: active.name.clone(),
+            peak: main_windows(quota).map(|w| w.used_percent).max(),
+            kind: CodexAutoKind::KeyFallback,
+        })
+    }
+    /// Leaving the fallback key: the key is the active login with the fallback setting
+    /// on, the manual hold has passed and a ChatGPT account has headroom (the same
+    /// ranking as ordinary switching). A stale reading of the best account is read again.
+    fn key_return(&self, active: &SavedAccount, now: i64, policy: &CodexPolicy) -> CodexAutomation {
+        if !policy.auto_switch
+            || active.auth_kind != AuthKind::ApiKey
+            || !active.fallback
+            || self
+                .saved
+                .return_hold_until
+                .is_some_and(|until| until > now)
+        {
+            return CodexAutomation::Idle;
+        }
+        match self.next_candidate(policy) {
+            Some(target) if self.quota_state(target, now) == CodexQuotaState::Fresh => {
+                CodexAutomation::Return(CodexAutoSwitch {
+                    previous_id: active.id.clone(),
+                    target_id: target.id.clone(),
+                    target_name: target.name.clone(),
+                    previous_name: active.name.clone(),
+                    peak: None,
+                    kind: CodexAutoKind::KeyReturn,
+                })
+            }
+            Some(target) if self.recovery_read_due(target, now) => {
+                CodexAutomation::Refresh(target.id.clone())
+            }
+            _ => CodexAutomation::Idle,
         }
     }
     /// Returning is opt-in, only to an explicitly higher priority, and requires an
@@ -1179,6 +1379,9 @@ impl CodexEngine {
         now: i64,
         policy: &CodexPolicy,
     ) -> CodexAutomation {
+        if active.auth_kind == AuthKind::ApiKey {
+            return self.key_return(active, now, policy);
+        }
         if active.auth_kind != AuthKind::ManagedChatgpt
             || !active.binding.complete()
             || self
@@ -1241,6 +1444,7 @@ impl CodexEngine {
                     target_name: target.name.clone(),
                     previous_name: active.name.clone(),
                     peak: None,
+                    kind: CodexAutoKind::Return,
                 });
             }
             if self.recovery_read_due(target, now) {
@@ -1352,6 +1556,23 @@ impl CodexEngine {
         result.switching = self.switching.clone();
         result.last_switch = self.last_switch.clone();
         result.return_hold_until = self.saved.return_hold_until.filter(|until| *until > now);
+        result.fallback_engaged = self
+            .saved
+            .fallback_engaged
+            .as_ref()
+            .filter(|engaged| {
+                !self.demo
+                    && self.selected_id.as_deref() == Some(&engaged.key_id)
+                    && self
+                        .saved
+                        .accounts
+                        .iter()
+                        .any(|a| a.id == engaged.key_id && a.fallback)
+            })
+            .map(|engaged| CodexFallbackView {
+                key_id: engaged.key_id.clone(),
+                since: engaged.since,
+            });
         result.environment = self.environment.clone();
         if self.demo {
             result.executable_version = Some(MIN_CODEX_VERSION.into());
@@ -1435,6 +1656,9 @@ impl CodexEngine {
                     switchable: self.switch_capability(account),
                     use_flex: account.use_flex,
                     flex: self.flex_capability(account),
+                    fallback: account.fallback,
+                    fallback_toggle: self.fallback_toggle(account),
+                    fallback_hint: self.fallback_hint(account, policy),
                     quota: account.quota.clone(),
                     quota_read_at: account.quota_read_at,
                     quota_state: self.quota_state(account, now),
@@ -1524,6 +1748,9 @@ impl CodexEngine {
             }
             CodexCommand::SetApiKeyFlex(id, enabled) => {
                 self.set_api_key_flex(&id, enabled, vault, now)?;
+            }
+            CodexCommand::SetApiKeyFallback(id, enabled) => {
+                self.set_api_key_fallback(&id, enabled, vault)?;
             }
             CodexCommand::Delete(id) => {
                 if self.pending_login.is_some() || self.switching.is_some() {
@@ -1653,6 +1880,9 @@ impl CodexEngine {
     /// restore is retried here on every tick.
     pub(crate) fn observe(&mut self, vault: &Vault, now: i64) -> Result<(), CodexReason> {
         let observed = self.observe_login(vault, now);
+        if self.switching.is_none() && self.reconcile_fallback() {
+            let _ = self.save(vault);
+        }
         // A Flex failure is reported through the snapshot's warnings, not as an error
         // of following the login.
         let _ = self.reconcile_flex(vault);
@@ -1714,6 +1944,21 @@ impl CodexEngine {
         }
         self.observed_generation = Some(current.generation);
         Ok(())
+    }
+    /// The fallback is over as soon as the active login is not the key it moved to, for
+    /// any reason (the return, a manual switch, a login made outside the app). Returns
+    /// whether the marker was cleared; the caller saves.
+    fn reconcile_fallback(&mut self) -> bool {
+        let over = self.observed_generation.is_some()
+            && self
+                .saved
+                .fallback_engaged
+                .as_ref()
+                .is_some_and(|engaged| self.selected_id.as_deref() != Some(&engaged.key_id));
+        if over {
+            self.saved.fallback_engaged = None;
+        }
+        over
     }
     fn note_external_selection(
         &mut self,
@@ -1790,6 +2035,7 @@ impl CodexEngine {
             preferred_return_reset_at: None,
             preferred_return_handled_reset_at: None,
             use_flex: false,
+            fallback: false,
         });
         Ok(self.saved.accounts.len() - 1)
     }
@@ -2185,6 +2431,31 @@ impl CodexEngine {
             }
             return Err(error);
         }
+        self.save(vault)
+    }
+    /// Make a saved API key the automatic fallback (or not). The setting is saved even
+    /// while automatic switching is off or the key cannot be switched to; the snapshot
+    /// says why it cannot act yet.
+    fn set_api_key_fallback(
+        &mut self,
+        id: &str,
+        enabled: bool,
+        vault: &Vault,
+    ) -> Result<(), CodexReason> {
+        if self.pending_login.is_some() || self.switching.is_some() {
+            return Err(CodexReason::Busy);
+        }
+        let index = self.account_index(id)?;
+        if self.saved.accounts[index].auth_kind != AuthKind::ApiKey {
+            return Err(CodexReason::UnsupportedAuth);
+        }
+        if self.saved.accounts[index].fallback == enabled {
+            return Ok(());
+        }
+        if let Some(reason) = self.common_block() {
+            return Err(reason);
+        }
+        self.saved.accounts[index].fallback = enabled;
         self.save(vault)
     }
     /// Import every account saved by lampese "Codex Switcher". For an account that is
@@ -2640,47 +2911,78 @@ impl CodexEngine {
     pub(crate) fn begin_automatic_switch(
         &mut self,
         plan: &CodexAutoSwitch,
-        returning: bool,
         policy: &CodexPolicy,
         vault: &Vault,
         now: i64,
     ) -> Result<Option<SwitchJob>, CodexReason> {
-        self.begin_switch_guarded(&plan.target_id, vault, now, Some((plan, returning, policy)))
+        self.begin_switch_guarded(&plan.target_id, vault, now, Some((plan, policy)))
     }
+    /// The last line of defence of every automatic switch, asked again just before the
+    /// login is written. The plan kind decides what may be targeted: an ordinary switch
+    /// or return only ever lands on a saved ChatGPT sign-in; an API key is a target only
+    /// of a fallback plan, and only while every fallback condition still holds.
     fn automatic_target_still_eligible(
         &self,
         plan: &CodexAutoSwitch,
-        returning: bool,
         policy: &CodexPolicy,
         now: i64,
     ) -> bool {
         let Some(active) = self.selected().filter(|a| a.id == plan.previous_id) else {
             return false;
         };
-        // Last line of defence: only a saved ChatGPT sign-in is an automatic target.
-        if !policy.auto_switch
-            || !self
-                .saved
-                .accounts
-                .iter()
-                .any(|a| a.id == plan.target_id && a.auth_kind == AuthKind::ManagedChatgpt)
-        {
+        let Some(target) = self.saved.accounts.iter().find(|a| a.id == plan.target_id) else {
+            return false;
+        };
+        if !policy.auto_switch {
             return false;
         }
-        if returning {
-            matches!(self.automatic_return(active, now, policy), CodexAutomation::Return(current) if current.target_id == plan.target_id)
-        } else {
-            self.quota_state(active, now) == CodexQuotaState::Fresh
-                && active.quota.as_ref().is_some_and(|quota| {
-                    reaches(
-                        quota,
-                        active.automation.effective_threshold(policy.threshold),
+        let chatgpt = |a: &SavedAccount| a.auth_kind == AuthKind::ManagedChatgpt;
+        match plan.kind {
+            CodexAutoKind::Switch => {
+                chatgpt(active)
+                    && chatgpt(target)
+                    && self.quota_state(active, now) == CodexQuotaState::Fresh
+                    && active.quota.as_ref().is_some_and(|quota| {
+                        reaches(
+                            quota,
+                            active.automation.effective_threshold(policy.threshold),
+                        )
+                    })
+                    && self.next_candidate(policy).is_some_and(|candidate| {
+                        candidate.id == plan.target_id
+                            && self.quota_state(candidate, now) == CodexQuotaState::Fresh
+                    })
+            }
+            CodexAutoKind::Return => {
+                chatgpt(active)
+                    && chatgpt(target)
+                    && matches!(
+                        self.automatic_return(active, now, policy),
+                        CodexAutomation::Return(current)
+                            if current.kind == CodexAutoKind::Return
+                                && current.target_id == plan.target_id
                     )
-                })
-                && self.next_candidate(policy).is_some_and(|target| {
-                    target.id == plan.target_id
-                        && self.quota_state(target, now) == CodexQuotaState::Fresh
-                })
+            }
+            CodexAutoKind::KeyFallback => {
+                chatgpt(active)
+                    && target.auth_kind == AuthKind::ApiKey
+                    && target.fallback
+                    && matches!(
+                        self.key_fallback(now, policy),
+                        KeyFallback::Engage(current) if current.target_id == plan.target_id
+                    )
+            }
+            CodexAutoKind::KeyReturn => {
+                active.auth_kind == AuthKind::ApiKey
+                    && active.fallback
+                    && chatgpt(target)
+                    && matches!(
+                        self.automatic_return(active, now, policy),
+                        CodexAutomation::Return(current)
+                            if current.kind == CodexAutoKind::KeyReturn
+                                && current.target_id == plan.target_id
+                    )
+            }
         }
     }
     fn begin_switch_guarded(
@@ -2688,7 +2990,7 @@ impl CodexEngine {
         id: &str,
         vault: &Vault,
         now: i64,
-        automatic: Option<(&CodexAutoSwitch, bool, &CodexPolicy)>,
+        automatic: Option<(&CodexAutoSwitch, &CodexPolicy)>,
     ) -> Result<Option<SwitchJob>, CodexReason> {
         self.ready()?;
         if self.switching.is_some() {
@@ -2698,9 +3000,9 @@ impl CodexEngine {
             return Err(CodexReason::Busy);
         }
         self.requalify()?;
-        if let Some((plan, returning, policy)) = automatic {
+        if let Some((plan, policy)) = automatic {
             self.observe(vault, now)?;
-            if !self.automatic_target_still_eligible(plan, returning, policy, now) {
+            if !self.automatic_target_still_eligible(plan, policy, now) {
                 return Err(CodexReason::ExternalChange);
             }
         }
@@ -2735,12 +3037,12 @@ impl CodexEngine {
         }
         let store = self.store()?;
         let expected_owner = if automatic.is_some() {
-            Some(
-                self.selected()
-                    .ok_or(CodexReason::ExternalChange)?
-                    .binding
-                    .clone(),
-            )
+            let active = self.selected().ok_or(CodexReason::ExternalChange)?;
+            Some(if active.auth_kind == AuthKind::ApiKey {
+                ExpectedLogin::Key(Zeroizing::new(active.auth.clone()))
+            } else {
+                ExpectedLogin::Chatgpt(active.binding.clone())
+            })
         } else {
             None
         };
@@ -2755,11 +3057,9 @@ impl CodexEngine {
                 attempts += 1;
                 let current = store.read().map_err(store_reason)?;
                 if let Some(expected) = &expected_owner {
-                    let same_owner = current.auth_bytes().is_some_and(|bytes| {
-                        OpaqueAuth::parse(bytes.to_vec()).is_ok_and(|auth| {
-                            Binding::from_auth(&auth).is_ok_and(|owner| owner.same_owner(expected))
-                        })
-                    });
+                    let same_owner = current
+                        .auth_bytes()
+                        .is_some_and(|bytes| expected.matches(bytes));
                     if !same_owner {
                         // Follow and preserve the external selection before returning;
                         // it must never become the outgoing login of this auto plan.
@@ -2767,8 +3067,8 @@ impl CodexEngine {
                         self.hold_automatic_returns(now, vault)?;
                         return Err(CodexReason::ExternalChange);
                     }
-                    if let Some((plan, returning, policy)) = automatic
-                        && !self.automatic_target_still_eligible(plan, returning, policy, now)
+                    if let Some((plan, policy)) = automatic
+                        && !self.automatic_target_still_eligible(plan, policy, now)
                     {
                         return Err(CodexReason::ExternalChange);
                     }
@@ -2807,6 +3107,17 @@ impl CodexEngine {
         };
         self.selected_id = Some(id.into());
         self.observed_generation = Some(written.generation);
+        if let Some((plan, _)) = automatic
+            && plan.kind == CodexAutoKind::KeyFallback
+        {
+            // The key is the login now, whether or not the restart that follows works.
+            self.saved.fallback_engaged = Some(FallbackEngaged {
+                key_id: id.into(),
+                from_account_id: plan.previous_id.clone(),
+                since: now,
+            });
+            let _ = self.save(vault);
+        }
         self.last_switch = None;
         self.switching = Some(CodexSwitchView {
             target_id: id.into(),
@@ -2936,6 +3247,8 @@ impl CodexEngine {
         self.refresh_environment();
         let restarted = outcome.daemon_running && matches!(outcome.restart, Some(Ok(())));
         self.switching = None;
+        // The fallback ends with the key being the login, whoever changed it meanwhile.
+        self.reconcile_fallback();
         // Flex follows the login the switch ended on, whoever changed it meanwhile.
         let _ = self.reconcile_flex(vault);
         self.last_switch = Some(CodexLastSwitchView {
@@ -3070,6 +3383,7 @@ fn sanitize(saved: Saved) -> (Saved, Saved) {
     good.return_hold_until = saved.return_hold_until;
     good.last_auto_switch_at = saved.last_auto_switch_at;
     good.flex_applied = saved.flex_applied;
+    good.fallback_engaged = saved.fallback_engaged;
     let mut ids = BTreeSet::new();
     for mut account in saved.accounts.into_iter() {
         let auth = OpaqueAuth::parse(account.auth.clone()).ok();
@@ -3087,6 +3401,14 @@ fn sanitize(saved: Saved) -> (Saved, Saved) {
         } else {
             bad.accounts.push(account);
         }
+    }
+    // The marker is only meaningful while its key is still saved.
+    if good
+        .fallback_engaged
+        .as_ref()
+        .is_some_and(|engaged| !ids.contains(&engaged.key_id))
+    {
+        good.fallback_engaged = None;
     }
     (good, bad)
 }

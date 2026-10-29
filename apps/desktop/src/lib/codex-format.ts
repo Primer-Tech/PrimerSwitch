@@ -38,6 +38,7 @@ const reasonKeys: Record<CodexReason, MessageKey> = {
   flexUnsupportedVersion: 'codexReason_flexUnsupportedVersion',
   flexConfigFailed: 'codexReason_flexConfigFailed',
   flexRestoreFailed: 'codexReason_flexRestoreFailed',
+  fallbackNeedsAutoSwitch: 'codexReason_fallbackNeedsAutoSwitch',
 };
 export function codexResetOutcome(
   outcome: CodexResetOutcome,
@@ -63,6 +64,13 @@ export function codexResetExpiryDate(
     hour: '2-digit',
     minute: '2-digit',
     timeZoneName: 'short',
+  }).format(timestamp * 1000);
+}
+/** The local time of day ("14:05"), for a state that started today. */
+export function codexClock(timestamp: number, locale: Language): string {
+  return new Intl.DateTimeFormat(localeName(locale), {
+    hour: '2-digit',
+    minute: '2-digit',
   }).format(timestamp * 1000);
 }
 /** Friendly, localized text for a native reason; unknown failures stay generic. */

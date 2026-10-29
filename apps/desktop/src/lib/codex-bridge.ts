@@ -11,6 +11,7 @@ export interface CodexCommandArgs {
   codex_import_switcher: undefined;
   codex_add_api_key: { name: string; key: string };
   codex_set_api_key_flex: { id: string; enabled: boolean };
+  codex_set_api_key_fallback: { id: string; enabled: boolean };
   codex_refresh_account: { id: string };
   codex_consume_reset: { id: string };
   codex_refresh_all: undefined;
@@ -40,6 +41,7 @@ const commands: readonly CodexCommand[] = [
   'codex_import_switcher',
   'codex_add_api_key',
   'codex_set_api_key_flex',
+  'codex_set_api_key_fallback',
   'codex_refresh_account',
   'codex_consume_reset',
   'codex_refresh_all',

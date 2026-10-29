@@ -51,6 +51,7 @@ export type CodexPending =
   | 'codex_import_switcher'
   | 'codex_add_api_key'
   | 'codex_set_api_key_flex'
+  | 'codex_set_api_key_fallback'
   | 'codex_refresh_account'
   | 'codex_consume_reset'
   | 'codex_refresh_all'
@@ -86,6 +87,7 @@ type SnapshotCommand =
   | 'codex_delete_account'
   | 'codex_update_account_automation'
   | 'codex_set_api_key_flex'
+  | 'codex_set_api_key_fallback'
   | 'codex_resume_automatic_returns';
 const capabilityFor = {
   codex_discover: null,
@@ -96,6 +98,7 @@ const capabilityFor = {
   codex_delete_account: 'deleteSaved',
   codex_update_account_automation: null,
   codex_set_api_key_flex: null,
+  codex_set_api_key_fallback: null,
   codex_resume_automatic_returns: 'switchAccount',
 } as const satisfies Record<
   SnapshotCommand,
@@ -240,6 +243,12 @@ export function createCodexController(bridge: CodexBridge = codexNativeBridge) {
       if (
         command === 'codex_set_api_key_flex' &&
         (account.authKind !== 'apiKey' || !account.flex?.enabled)
+      )
+        return false;
+      // The same for the automatic fallback to an API key.
+      if (
+        command === 'codex_set_api_key_fallback' &&
+        (account.authKind !== 'apiKey' || !account.fallbackToggle?.enabled)
       )
         return false;
       // The account Codex is signed in with cannot be removed; switch away first.
@@ -530,6 +539,8 @@ export function createCodexController(bridge: CodexBridge = codexNativeBridge) {
     addApiKey,
     setApiKeyFlex: (id: string, enabled: boolean) =>
       action('codex_set_api_key_flex', { id, enabled }),
+    setApiKeyFallback: (id: string, enabled: boolean) =>
+      action('codex_set_api_key_fallback', { id, enabled }),
     refreshAccount: (id: string) => action('codex_refresh_account', { id }),
     refreshAll: () => action('codex_refresh_all'),
     deleteAccount: (id: string) => action('codex_delete_account', { id }),

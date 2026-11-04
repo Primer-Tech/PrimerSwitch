@@ -52,6 +52,24 @@ Known follow-ups (recorded only):
   final-component no-follow flags. This requires a same-user attacker inside the
   sessions tree; the ledger retains only token counts and scan metadata.
 
+Review pass 2 (terra, fix delta only) found four more low findings, none of them
+fixed here because each needs a design choice or touches several exit paths:
+
+- A failed verification read at the end of a switch (`finish_switch`) does not
+  clear the active key, so a full external login cycle inside one tick, before the
+  next good read, can bridge the span. Fix needs the clear on every early return.
+- An interrupted observation is forgotten on restart: the saved span resumes if its
+  end is at most 600 seconds old. A plain app close has the same effect, and the
+  600-second resume is a documented rule. Closing it needs a clean-exit or
+  identity marker, or dropping the resume rule.
+- While a held replay point re-reads a file (at most about 600 seconds after the
+  newest span end), a record whose response hash was already pruned (older than
+  62 days, or evicted past 100,000 hashes) is counted again. Codex does not write
+  timestamps going back that far; only the all-time total could be inflated.
+- An orderly shutdown does not wait for the queued final scan of the outgoing key.
+  The next start scans again (`pending` is set on load), so the counts are only
+  delayed unless the rollout files are deleted first.
+
 ## Unreleased: local Codex API-key consumption (2026-11-04)
 
 API-key details and the active-account card now show local token consumption for

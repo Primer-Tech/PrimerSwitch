@@ -73,6 +73,34 @@ const limitSchema = z
     rateLimitReachedType: text.nullable(),
   })
   .strict();
+const tokenCountSchema = z
+  .number()
+  .int()
+  .nonnegative()
+  .max(Number.MAX_SAFE_INTEGER);
+const tokenTotalsSchema = z
+  .object({
+    input: tokenCountSchema,
+    cached: tokenCountSchema,
+    output: tokenCountSchema,
+    total: tokenCountSchema,
+  })
+  .strict();
+/** Local counters only; credentials, rollout records and billing data stay native. */
+export const codexKeyUsageSchema = z
+  .object({
+    trackedSince: z.number().int().min(0).max(253_402_300_799).nullable(),
+    windows: z
+      .object({
+        last24h: tokenTotalsSchema,
+        last7d: tokenTotalsSchema,
+        last30d: tokenTotalsSchema,
+        total: tokenTotalsSchema,
+      })
+      .strict(),
+    state: z.enum(['idle', 'scanning', 'unavailable']),
+  })
+  .strict();
 export const codexAccountSchema = z
   .object({
     id,
@@ -108,6 +136,8 @@ export const codexAccountSchema = z
     fallbackToggle: codexCapabilitySchema.optional(),
     /** Why the fallback setting has no effect or no use right now (for example automatic switching is off). */
     fallbackHint: codexReasonSchema.nullable().optional(),
+    /** API key only: token consumption counted locally while this key was active. */
+    usage: codexKeyUsageSchema.nullable().optional(),
     quota: z
       .object({
         ordinaryUsageAllowed: z.boolean().nullable(),
@@ -144,7 +174,15 @@ export const codexAccountSchema = z
       })
       .strict(),
   })
-  .strict();
+  .strict()
+  .superRefine((account, context) => {
+    if (account.authKind !== 'apiKey' && account.usage != null)
+      context.addIssue({
+        code: 'custom',
+        path: ['usage'],
+        message: 'Local token consumption is API-key-only',
+      });
+  });
 export const codexLoginSchema = z
   .object({
     id,
@@ -226,6 +264,7 @@ export const codexSnapshotSchema = z
   .strict();
 export type CodexSnapshot = z.infer<typeof codexSnapshotSchema>;
 export type CodexAccount = z.infer<typeof codexAccountSchema>;
+export type CodexKeyUsage = z.infer<typeof codexKeyUsageSchema>;
 export type CodexLogin = z.infer<typeof codexLoginSchema>;
 export type CodexLimit = z.infer<typeof limitSchema>;
 export type CodexWindow = z.infer<typeof windowSchema>;

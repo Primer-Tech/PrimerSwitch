@@ -49,7 +49,37 @@ impl RuntimeHandle {
             engine.codex.error = Some(*error);
         }
         self.publish_codex_only(&mut engine, false);
+        drop(engine);
+        self.spawn_codex_key_usage();
         result
+    }
+    fn spawn_codex_key_usage(&self) {
+        let this = self.clone();
+        tokio::spawn(async move {
+            let _job = this.inner.codex_job.lock().await;
+            this.codex_scan_key_usage().await;
+        });
+    }
+    /// The Codex job lock serializes this file with deletion and other scans.
+    /// The single runtime owner is held only to prepare and accept the result;
+    /// directory walking, JSONL reads and atomic persistence all run off-thread.
+    pub(crate) async fn codex_scan_key_usage(&self) {
+        let job = {
+            let mut engine = self.inner.owner.lock().await;
+            let now = engine.clock.now();
+            let job = engine.codex.plan_key_usage(now);
+            if job.is_some() {
+                self.publish_codex_only(&mut engine, false);
+            }
+            job
+        };
+        let Some(job) = job else { return };
+        let result = tokio::task::spawn_blocking(move || job.run())
+            .await
+            .unwrap_or(Err(switcher_platform::codex::usage::UsageError::ReadFailed));
+        let mut engine = self.inner.owner.lock().await;
+        engine.codex.finish_key_usage(result);
+        self.publish_codex_only(&mut engine, false);
     }
     async fn codex_snapshot_command(
         &self,
@@ -167,7 +197,9 @@ impl RuntimeHandle {
     pub async fn codex_delete_account(&self, id: &str) -> Result<CodexSnapshot, CodexReason> {
         let _job = self.codex_job_lock().await?;
         self.codex_snapshot_command(CodexCommand::Delete(id.into()))
-            .await
+            .await?;
+        self.codex_scan_key_usage().await;
+        Ok(self.get_codex_snapshot())
     }
     pub async fn codex_update_account_automation(
         &self,
@@ -354,6 +386,8 @@ impl RuntimeHandle {
             self.publish_codex_only(&mut engine, false);
             result?
         };
+        // Includes a final scan of the outgoing key immediately after its span closes.
+        self.codex_scan_key_usage().await;
         let Some(job) = job else {
             return Ok(self.get_codex_snapshot());
         };
@@ -379,6 +413,7 @@ impl RuntimeHandle {
                 self.publish_codex_only(&mut engine, false);
                 result?
             };
+            self.codex_scan_key_usage().await;
             if !repair {
                 break;
             }
@@ -408,6 +443,7 @@ impl RuntimeHandle {
         } else {
             let _ = self.run_codex(CodexCommand::Observe).await;
         }
+        self.codex_scan_key_usage().await;
         let due = {
             let engine = self.inner.owner.lock().await;
             let policy = CodexPolicy::from(&engine.saved.settings);
@@ -675,6 +711,21 @@ fn codex_failed_text(ro: bool, name: &str) -> String {
 
 #[cfg(test)]
 impl RuntimeHandle {
+    /// Immediate acquisition lets a paused-worker fixture prove ownership without
+    /// measuring how quickly this thread happens to be scheduled.
+    pub(crate) fn try_edit_codex_for_test(
+        &self,
+        edit: impl FnOnce(&mut CodexEngine, &mut Settings),
+    ) -> bool {
+        let Ok(mut engine) = self.inner.owner.try_lock() else {
+            return false;
+        };
+        let Engine { codex, saved, .. } = &mut *engine;
+        edit(codex, &mut saved.settings);
+        self.publish(&mut engine, false);
+        true
+    }
+
     /// Fixture hook: edit the Codex engine (for example to install one with fake
     /// seams) and the shared settings, then publish.
     pub(crate) async fn edit_codex_for_test(

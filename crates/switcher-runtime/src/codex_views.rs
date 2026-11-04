@@ -122,6 +122,36 @@ pub enum CodexQuotaState {
     Cached,
     Unavailable,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CodexUsageState {
+    Idle,
+    Scanning,
+    Unavailable,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexTokenCounts {
+    pub input: u64,
+    pub cached: u64,
+    pub output: u64,
+    pub total: u64,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexUsageWindows {
+    pub last_24h: CodexTokenCounts,
+    pub last_7d: CodexTokenCounts,
+    pub last_30d: CodexTokenCounts,
+    pub total: CodexTokenCounts,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexKeyUsageView {
+    pub tracked_since: Option<i64>,
+    pub windows: CodexUsageWindows,
+    pub state: CodexUsageState,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexWindowView {
@@ -179,6 +209,9 @@ pub struct CodexAccountView {
     /// The last four characters of an API key, to compare with the key list at
     /// platform.openai.com. Never more than that.
     pub api_key_tail: Option<String>,
+    /// Local token tally only; API keys have no plan-limit reading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<CodexKeyUsageView>,
     /// Raw lowercase plan from Codex (`plus`, `pro`, `prolite`, `team`, ...).
     pub plan_type: Option<String>,
     pub identity_evidence: CodexIdentityEvidence,

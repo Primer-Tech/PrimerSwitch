@@ -4,6 +4,7 @@ mod context;
 mod generation;
 mod process;
 mod store;
+pub mod usage;
 
 pub use config_flex::{CodexConfigFlex, FlexMark};
 pub use context::{
@@ -17,6 +18,10 @@ pub use process::{
     scan_codex_processes,
 };
 pub use store::{CodexAuthSnapshot, CodexFileStore};
+pub use usage::{
+    ActivationSpan, KeyActivationSpans, KeyUsageLedger, UsageCounters, UsageError, UsageLedger,
+    UsageScanReport, UsageStore, UsageWindows, scan_usage,
+};
 
 pub type CodexResult<T> = std::result::Result<T, CodexStoreError>;
 

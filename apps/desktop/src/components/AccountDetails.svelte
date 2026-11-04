@@ -6,6 +6,7 @@
   import Icon from './Icon.svelte';
   import StatusLabel from './StatusLabel.svelte';
   import UsageMeters from './UsageMeters.svelte';
+  import KeyUsage from './KeyUsage.svelte';
   import AccountAutomationEditor from './AccountAutomation.svelte';
   import type { AccountAutomation } from '../lib/types';
   let {
@@ -59,7 +60,11 @@
       <StatusLabel status={row.status} />
     </div>
   </div>
-  {#if !row.apiKey}<UsageMeters {row} {now} {threshold} />{/if}
+  {#if row.apiKey}<KeyUsage usage={row.apiKey.usage} />{:else}<UsageMeters
+      {row}
+      {now}
+      {threshold}
+    />{/if}
   {#each row.notes as note, index (index)}<p
       class="note"
       class:warning-text={note.tone === 'warn'}

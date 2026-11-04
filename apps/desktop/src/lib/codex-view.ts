@@ -252,7 +252,7 @@ function row(
     credits: codexCredits(account, locale),
     apiKey:
       account.authKind === 'apiKey'
-        ? { tail: account.apiKeyTail ?? null }
+        ? { tail: account.apiKeyTail ?? null, usage: account.usage ?? null }
         : null,
     identity: t(
       locale,

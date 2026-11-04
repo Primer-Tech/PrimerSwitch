@@ -23,6 +23,11 @@ impl fmt::Debug for Vault {
 }
 
 impl Vault {
+    /// Application-owned storage location, without exposing the vault key.
+    pub fn directory(&self) -> &std::path::Path {
+        &self.directory
+    }
+
     pub fn open(directory: PathBuf) -> Result<Self> {
         #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
         {

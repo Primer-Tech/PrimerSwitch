@@ -1,4 +1,6 @@
 //! Hermetic runtime fixtures: no real homes, Codex processes, daemons or providers.
+#[path = "codex_usage_tests.rs"]
+mod usage_tests;
 use super::*;
 use crate::{Clock, RuntimeHandle};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};

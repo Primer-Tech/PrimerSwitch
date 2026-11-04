@@ -75,3 +75,10 @@ export function percentage(value: number, locale: Language = 'en'): string {
     maximumFractionDigits: 1,
   }).format(value);
 }
+/** Compact local token counts, with the language's decimal separator and units. */
+export function compactCount(value: number, locale: Language = 'en'): string {
+  return new Intl.NumberFormat(localeName(locale), {
+    notation: 'compact',
+    maximumFractionDigits: 1,
+  }).format(value);
+}

@@ -5,6 +5,7 @@ import { t, type Language, type MessageKey } from './i18n';
 import { age, duration } from './format';
 import { exactPercent } from './automation';
 import type { AccountAutomation, Settings } from './types';
+import type { CodexKeyUsage } from './codex-types';
 
 export type ProviderKey = 'claude' | 'codex';
 
@@ -246,7 +247,10 @@ export interface AccountRowView {
    * An API key account: billed per token, with no plan windows to show. `tail` is the
    * last four characters, to compare with the provider's key list.
    */
-  apiKey?: { tail: string | null } | null;
+  apiKey?: {
+    tail: string | null;
+    usage?: CodexKeyUsage | null;
+  } | null;
   /** Plain-words verification of the saved sign-in. */
   identity: string;
   identityOk: boolean;

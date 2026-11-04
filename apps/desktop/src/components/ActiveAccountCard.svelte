@@ -4,6 +4,7 @@
   import type { AccountRowView, PageView } from '../lib/provider-view';
   import Icon from './Icon.svelte';
   import UsageMeters from './UsageMeters.svelte';
+  import KeyUsage from './KeyUsage.svelte';
   let {
     view,
     now,
@@ -91,7 +92,9 @@
             >{t($language, 'signInAgain')}</button
           >{/if}
       </div>{/if}
-    {#if !active.apiKey}<UsageMeters
+    {#if active.apiKey}<KeyUsage
+        usage={active.apiKey.usage}
+      />{:else}<UsageMeters
         row={active}
         {now}
         threshold={view.threshold}

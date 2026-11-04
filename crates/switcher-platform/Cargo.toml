@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+[features]
+# Explicit opt-in for cross-crate hermetic scanner fixtures; never enabled by production.
+fixture-scanner = []
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true

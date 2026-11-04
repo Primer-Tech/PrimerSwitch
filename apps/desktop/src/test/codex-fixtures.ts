@@ -3,6 +3,7 @@ import type {
   CodexLimit,
   CodexSnapshot,
   CodexReason,
+  CodexKeyUsage,
 } from '../lib/codex-types';
 export const codexCapability = (blockedReason: CodexReason | null = null) => ({
   enabled: blockedReason === null,
@@ -11,6 +12,32 @@ export const codexCapability = (blockedReason: CodexReason | null = null) => ({
 const minute = 60,
   hour = 3600,
   day = 86400;
+/** Sanitized local consumption with no session metadata or billing estimate. */
+export function codexKeyUsage(
+  overrides: Partial<CodexKeyUsage> = {},
+): CodexKeyUsage {
+  return {
+    trackedSince: 1_800_000_000,
+    windows: {
+      last24h: { input: 1_200, cached: 3_400, output: 500, total: 5_100 },
+      last7d: { input: 12_000, cached: 34_000, output: 5_000, total: 51_000 },
+      last30d: {
+        input: 1_200_000,
+        cached: 3_400_000,
+        output: 500_000,
+        total: 5_100_000,
+      },
+      total: {
+        input: 120_000_000,
+        cached: 340_000_000,
+        output: 1_100_000_000,
+        total: 1_560_000_000,
+      },
+    },
+    state: 'idle',
+    ...overrides,
+  };
+}
 /** The main Codex limit: a 5-hour window and a weekly window. */
 export function codexMainLimit(
   fiveHour: number,
@@ -99,6 +126,16 @@ export function codexApiKeyAccount(
     fallback: false,
     fallbackToggle: codexCapability(),
     fallbackHint: null,
+    usage: {
+      trackedSince: null,
+      windows: {
+        last24h: { input: 0, cached: 0, output: 0, total: 0 },
+        last7d: { input: 0, cached: 0, output: 0, total: 0 },
+        last30d: { input: 0, cached: 0, output: 0, total: 0 },
+        total: { input: 0, cached: 0, output: 0, total: 0 },
+      },
+      state: 'idle',
+    },
     ...overrides,
   });
 }

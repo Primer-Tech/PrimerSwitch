@@ -33,6 +33,9 @@ use zeroize::{Zeroize, Zeroizing};
 #[path = "codex_reset.rs"]
 mod reset;
 pub(crate) use reset::ResetJob;
+#[path = "codex_usage.rs"]
+mod key_usage;
+use key_usage::KeyUsageTracking;
 
 const RECORD: &str = "codex-state";
 const QUARANTINE: &str = "codex-state-quarantine";
@@ -290,6 +293,9 @@ struct SavedAccount {
     /// account is at its limit, and leaves again when one recovers.
     #[serde(default, skip_serializing_if = "is_false")]
     fallback: bool,
+    /// Proven intervals on this PC; omission keeps historical vault records compatible.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    usage_spans: Vec<usage::ActivationSpan>,
 }
 fn is_false(value: &bool) -> bool {
     !*value
@@ -755,12 +761,14 @@ pub(crate) struct CodexEngine {
     /// Alternate background slots when both the active account and an inactive
     /// account are due. Frequent active checks must not starve reset recovery.
     last_background_active: Option<bool>,
+    key_usage: KeyUsageTracking,
     #[cfg(test)]
     before_automatic_replace: Option<Box<dyn FnOnce() + Send>>,
 }
 impl CodexEngine {
     pub fn load(vault: &Vault) -> Self {
         let mut engine = Self::empty(false);
+        engine.bind_usage_store(vault);
         match vault.load::<Saved>(RECORD) {
             Ok(Some(saved)) if saved.format == 1 && saved.accounts.len() <= 1000 => {
                 let (saved, quarantined) = sanitize(saved);
@@ -814,6 +822,7 @@ impl CodexEngine {
             last_auto_failure: None,
             policy_threshold: CodexPolicy::default().threshold,
             last_background_active: None,
+            key_usage: KeyUsageTracking::default(),
             #[cfg(test)]
             before_automatic_replace: None,
         }
@@ -883,6 +892,7 @@ impl CodexEngine {
                 preferred_return_handled_reset_at: None,
                 use_flex: false,
                 fallback: false,
+                usage_spans: Vec::new(),
             });
             engine.verified_now.insert(id);
         }
@@ -1686,6 +1696,8 @@ impl CodexEngine {
                     api_key_tail: (account.auth_kind == AuthKind::ApiKey)
                         .then(|| api_key_tail(&account.auth))
                         .flatten(),
+                    usage: (account.auth_kind == AuthKind::ApiKey)
+                        .then(|| self.key_usage_view(account, now)),
                     selected: self.selected_id.as_ref() == Some(&account.id),
                     switchable: self.switch_capability(account),
                     use_flex: account.use_flex,
@@ -1736,6 +1748,9 @@ impl CodexEngine {
             self.writable = false;
             self.reason = Some(CodexReason::VaultUnavailable);
         }
+        if result.is_ok() {
+            self.prune_key_usage(vault);
+        }
         result
     }
     async fn execute(
@@ -1773,6 +1788,7 @@ impl CodexEngine {
             }
             CodexCommand::ImportCurrent => {
                 self.import_current(vault, now)?;
+                self.record_usage_observation(vault, now);
             }
             CodexCommand::ImportSwitcher => {
                 self.import_switcher(vault, now)?;
@@ -1914,27 +1930,30 @@ impl CodexEngine {
     /// restore is retried here on every tick.
     pub(crate) fn observe(&mut self, vault: &Vault, now: i64) -> Result<(), CodexReason> {
         let observed = self.observe_login(vault, now);
+        if matches!(observed, Ok(true)) {
+            self.record_usage_observation(vault, now);
+        }
         if self.switching.is_none() && self.reconcile_fallback() {
             let _ = self.save(vault);
         }
         // A Flex failure is reported through the snapshot's warnings, not as an error
         // of following the login.
         let _ = self.reconcile_flex(vault);
-        observed
+        observed.map(|_| ())
     }
     /// Track the live auth.json: adopt Codex's token rotations into the saved record,
     /// keep an external `codex login` as a new saved account, and repair a hybrid file.
-    fn observe_login(&mut self, vault: &Vault, now: i64) -> Result<(), CodexReason> {
+    fn observe_login(&mut self, vault: &Vault, now: i64) -> Result<bool, CodexReason> {
         if self.demo || !self.writable || self.switching.is_some() {
-            return Ok(());
+            return Ok(false);
         }
         self.refresh_environment();
         let Ok(store) = self.store() else {
-            return Ok(());
+            return Ok(false);
         };
         let current = store.read().map_err(store_reason)?;
         if self.observed_generation.as_ref() == Some(&current.generation) {
-            return Ok(());
+            return Ok(true);
         }
         let previous = self.selected_id.clone();
         let observed_before = self.observed_generation.is_some();
@@ -1944,7 +1963,7 @@ impl CodexEngine {
             if self.note_external_selection(previous.as_deref(), observed_before, now) {
                 self.save_automation(vault)?;
             }
-            return Ok(());
+            return Ok(true);
         };
         match OpaqueAuth::inspect(bytes) {
             Ok(inspection) if inspection.hybrid => {
@@ -1952,7 +1971,7 @@ impl CodexEngine {
                 if self.note_external_selection(previous.as_deref(), observed_before, now) {
                     self.save_automation(vault)?;
                 }
-                return Ok(());
+                return Ok(true);
             }
             Ok(inspection) if inspection.kind != AuthKind::Unsupported => {
                 let auth = OpaqueAuth::parse(bytes.to_vec()).map_err(provider_reason)?;
@@ -1977,7 +1996,7 @@ impl CodexEngine {
             }
         }
         self.observed_generation = Some(current.generation);
-        Ok(())
+        Ok(true)
     }
     /// The fallback is over as soon as the active login is not the key it moved to, for
     /// any reason (the return, a manual switch, a login made outside the app). Returns
@@ -2070,6 +2089,7 @@ impl CodexEngine {
             preferred_return_handled_reset_at: None,
             use_flex: false,
             fallback: false,
+            usage_spans: Vec::new(),
         });
         Ok(self.saved.accounts.len() - 1)
     }
@@ -2390,6 +2410,7 @@ impl CodexEngine {
         self.save(vault)?;
         self.selected_id = Some(self.saved.accounts[index].id.clone());
         self.observed_generation = Some(current.generation);
+        self.record_usage_observation(vault, now);
         Ok(())
     }
     /// Save an OpenAI API key as a new account. It is never selected here; a switch
@@ -3115,6 +3136,21 @@ impl CodexEngine {
                 }
                 if let Some(bytes) = current.auth_bytes() {
                     self.preserve_outgoing(bytes, now)?;
+                    // A manual choice can race a key login not yet observed by the
+                    // minute tick. The outgoing read proves that key at this instant.
+                    let outgoing = self
+                        .saved
+                        .accounts
+                        .iter()
+                        .find(|account| {
+                            account.auth_kind == AuthKind::ApiKey
+                                && split_key_with_tokens(bytes).map_or_else(
+                                    || same_api_key(&account.auth, bytes),
+                                    |(key, _)| same_api_key(&account.auth, &key),
+                                )
+                        })
+                        .map(|account| account.id.clone());
+                    self.record_usage_login(outgoing, vault, now);
                 }
                 self.save(vault)?;
                 let incoming =
@@ -3147,6 +3183,7 @@ impl CodexEngine {
         };
         self.selected_id = Some(id.into());
         self.observed_generation = Some(written.generation);
+        self.record_usage_observation(vault, now);
         if let Some((plan, _)) = automatic
             && plan.kind == CodexAutoKind::KeyFallback
         {
@@ -3235,8 +3272,11 @@ impl CodexEngine {
     ) -> Result<bool, CodexReason> {
         self.set_switch_stage(CodexSwitchStage::Verifying);
         let mut repaired = false;
-        if let Ok(store) = self.store()
-            && let Ok(current) = store.read()
+        let store = self.store();
+        let current = store.as_ref().ok().and_then(|store| store.read().ok());
+        let login_observed = current.is_some();
+        if let Ok(store) = store
+            && let Some(current) = current
             && Some(&current.generation) != self.observed_generation.as_ref()
         {
             match current.auth_bytes().map(OpaqueAuth::inspect) {
@@ -3275,6 +3315,9 @@ impl CodexEngine {
                     self.observed_generation = Some(current.generation);
                 }
             }
+        }
+        if login_observed {
+            self.record_usage_observation(vault, now);
         }
         if repaired && allow_repair && outcome.daemon_running {
             self.switching = Some(CodexSwitchView {
@@ -3436,6 +3479,15 @@ fn sanitize(saved: Saved) -> (Saved, Saved) {
                 .as_ref()
                 .is_some_and(|auth| account.set_auth(auth).is_ok());
         if usable {
+            if account.auth_kind != AuthKind::ApiKey {
+                account.usage_spans.clear();
+            }
+            account
+                .usage_spans
+                .retain(|span| span.start >= 0 && span.end >= span.start);
+            account.usage_spans.sort_by_key(|span| span.start);
+            let excess = account.usage_spans.len().saturating_sub(200);
+            account.usage_spans.drain(..excess);
             ids.insert(account.id.clone());
             good.accounts.push(account);
         } else {

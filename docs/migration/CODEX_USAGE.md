@@ -60,6 +60,37 @@ no authenticated provider run was used for release verification.
 
 An API-key account is switched like any other: **Switch** writes the key to `auth.json` in the same way as a ChatGPT sign-in (the outgoing login is kept first), then restarts the Codex daemon. Switch back to a ChatGPT account the same way. Use is billed per token on your OpenAI API account, outside any ChatGPT plan, so there are no plan limits to show: the account has no usage windows, is never read, and **Refresh** is off for it. You choose it with Switch, or you allow the automatic fallback to it (see below). Ordinary automatic switching and preferred returns never select an API key, and an API key is never a source of headroom. A key from a `codex login --with-api-key` is adopted the same way as an unknown ChatGPT login, without a duplicate when the key is already saved. If an older Codex process (before 0.163) finishes a ChatGPT refresh after the key was written, its new tokens are saved to their ChatGPT account and the key stays selected, so switching back still works. Delete removes the saved key; an API-key login that is still active in `auth.json` stays until you switch.
 
+### Local token consumption
+
+API-key details and the active-account card show **Consumption**: input without
+cache, cached input, output and total tokens for the last 24 hours, 7 days,
+30 days and since tracking began. Reasoning tokens are already part of output.
+The rolling windows use UTC hourly buckets, so the oldest included hour can
+overlap the window boundary by less than an hour. Before a response is counted,
+the block says **No usage counted yet**; it never represents a plan limit.
+
+This is a local tally of complete `token_usage_record` response deltas in this
+Codex home's session rollouts, counted only during intervals when PrimerSwitch
+observed the key as the active login on this PC. An external change ends the
+previous interval at its last observation. On restart, the same key continues
+its interval only if that observation is no more than ten minutes old; a longer
+absence opens a new interval and leaves the gap uncounted. This deliberately
+under-counts unobserved periods. Other PCs, unsaved sessions and processes still
+using another login are not independently measurable. OpenAI's own usage page
+is the authority; the tally makes no network calls and estimates no cost.
+
+PrimerSwitch scans incrementally on a blocking worker, with a 64 MiB/300 ms soft
+budget per pass. Counters, UTC-hour buckets, hashed response identifiers and
+relative rollout-file offsets are stored together in one atomic app-data JSON
+file; credentials, conversation text and project paths are excluded. Activation
+intervals remain with the encrypted saved accounts (at most 200 per key).
+Deleting a saved key removes its intervals and ledger. Hourly buckets are kept
+for 35 days; duplicate hashes are bounded to 100,000 and 62 days. Missing or
+damaged tally storage starts empty without blocking sign-in or switching.
+Individual lines above 256 KiB are discarded without retaining their text; a
+token record exceeding that safety bound is also omitted. Filesystem calls can
+outlast the soft deadline, but the scanner starts no further work after it.
+
 ### Flex processing for an API key
 
 In the details of an API key, **Use Flex processing** makes Codex ask for the cheaper, slower Flex tier while that key is the active login. It needs Codex 0.163.0 or newer. A request can fail when Flex capacity is full, and Codex does not retry that error.

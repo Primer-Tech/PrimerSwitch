@@ -386,8 +386,9 @@ impl RuntimeHandle {
             self.publish_codex_only(&mut engine, false);
             result?
         };
-        // Includes a final scan of the outgoing key immediately after its span closes.
-        self.codex_scan_key_usage().await;
+        // Queue the outgoing key's final scan; filesystem work must not delay
+        // restarting the daemon after the login has already been replaced.
+        self.spawn_codex_key_usage();
         let Some(job) = job else {
             return Ok(self.get_codex_snapshot());
         };
@@ -413,7 +414,7 @@ impl RuntimeHandle {
                 self.publish_codex_only(&mut engine, false);
                 result?
             };
-            self.codex_scan_key_usage().await;
+            self.spawn_codex_key_usage();
             if !repair {
                 break;
             }
@@ -711,6 +712,11 @@ fn codex_failed_text(ro: bool, name: &str) -> String {
 
 #[cfg(test)]
 impl RuntimeHandle {
+    /// Wait for a fixture's paused scan to commit after releasing its handshake.
+    pub(crate) async fn wait_codex_jobs_for_test(&self) {
+        let _job = self.inner.codex_job.lock().await;
+    }
+
     /// Immediate acquisition lets a paused-worker fixture prove ownership without
     /// measuring how quickly this thread happens to be scheduled.
     pub(crate) fn try_edit_codex_for_test(

@@ -780,6 +780,7 @@ impl CodexEngine {
                     let _ = vault.save(RECORD, &saved);
                 }
                 engine.saved = saved;
+                engine.note_usage_saved();
             }
             Ok(None) => (),
             _ => {
@@ -917,13 +918,15 @@ impl CodexEngine {
             self.observe_return_window(index, now);
         }
     }
-    fn save(&self, vault: &Vault) -> Result<(), CodexReason> {
+    fn save(&mut self, vault: &Vault) -> Result<(), CodexReason> {
         if !self.writable {
             return Err(CodexReason::VaultUnavailable);
         }
         vault
             .save(RECORD, &self.saved)
-            .map_err(|_| CodexReason::VaultUnavailable)
+            .map_err(|_| CodexReason::VaultUnavailable)?;
+        self.note_usage_saved();
+        Ok(())
     }
     fn ready(&self) -> Result<&Installation, CodexReason> {
         if self.demo || !self.writable {
@@ -1787,7 +1790,12 @@ impl CodexEngine {
                 self.cancel_login(&id).await?;
             }
             CodexCommand::ImportCurrent => {
-                self.import_current(vault, now)?;
+                if let Err(error) = self.import_current(vault, now) {
+                    if error != CodexReason::Busy {
+                        self.interrupt_usage_observation();
+                    }
+                    return Err(error);
+                }
                 self.record_usage_observation(vault, now);
             }
             CodexCommand::ImportSwitcher => {
@@ -1930,9 +1938,6 @@ impl CodexEngine {
     /// restore is retried here on every tick.
     pub(crate) fn observe(&mut self, vault: &Vault, now: i64) -> Result<(), CodexReason> {
         let observed = self.observe_login(vault, now);
-        if matches!(observed, Ok(true)) {
-            self.record_usage_observation(vault, now);
-        }
         if self.switching.is_none() && self.reconcile_fallback() {
             let _ = self.save(vault);
         }
@@ -1944,6 +1949,15 @@ impl CodexEngine {
     /// Track the live auth.json: adopt Codex's token rotations into the saved record,
     /// keep an external `codex login` as a new saved account, and repair a hybrid file.
     fn observe_login(&mut self, vault: &Vault, now: i64) -> Result<bool, CodexReason> {
+        let observed = self.read_live_login(vault, now);
+        if matches!(observed, Ok(true)) {
+            self.record_usage_observation(vault, now);
+        } else {
+            self.interrupt_usage_observation();
+        }
+        observed
+    }
+    fn read_live_login(&mut self, vault: &Vault, now: i64) -> Result<bool, CodexReason> {
         if self.demo || !self.writable || self.switching.is_some() {
             return Ok(false);
         }

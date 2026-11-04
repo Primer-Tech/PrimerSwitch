@@ -101,7 +101,7 @@ impl KeyUsageLedger {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct FileProgress {
     /// Last complete newline; a normal half line never advances this offset.
     offset: u64,
@@ -148,6 +148,16 @@ impl Default for UsageLedger {
 }
 
 impl UsageLedger {
+    /// Compares durable state only; live directory discovery is not serialized.
+    pub fn same_persisted_state(&self, other: &Self) -> bool {
+        self.format == other.format
+            && self.keys == other.keys
+            && self.files == other.files
+            && self.seen == other.seen
+            && self.scan_after == other.scan_after
+            && self.source_hash == other.source_hash
+    }
+
     pub fn remove_key(&mut self, id: &str) {
         self.keys.remove(id);
     }
@@ -232,17 +242,23 @@ impl UsageStore {
     /// Usage is an optional estimate: missing, unreadable, damaged and unknown
     /// formats all start empty and can never prevent credential switching.
     pub fn load(&self) -> UsageLedger {
+        self.load_for_scan().0
+    }
+
+    /// The flag requests an initial atomic repair when no valid ledger exists.
+    /// A valid unchanged ledger can skip saving even on the first scan.
+    pub fn load_for_scan(&self) -> (UsageLedger, bool) {
         if fs::symlink_metadata(&self.path).map_or(true, |metadata| {
             !metadata.is_file() || is_link(&metadata) || metadata.len() > MAX_LEDGER_BYTES
         }) {
-            return UsageLedger::default();
+            return (UsageLedger::default(), true);
         }
         let Some(bytes) = crate::files::read_optional(&self.path).ok().flatten() else {
-            return UsageLedger::default();
+            return (UsageLedger::default(), true);
         };
         match serde_json::from_slice::<UsageLedger>(&bytes) {
-            Ok(ledger) if ledger.format == FORMAT => ledger,
-            _ => UsageLedger::default(),
+            Ok(ledger) if ledger.format == FORMAT => (ledger, false),
+            _ => (UsageLedger::default(), true),
         }
     }
 
@@ -700,6 +716,17 @@ fn read_file(
     let mut line = Zeroizing::new(Vec::with_capacity(MAX_LINE));
     let mut chunk = Zeroizing::new(vec![0u8; READ_CHUNK]);
     let mut oversized = progress.discard_offset.is_some();
+    let open_end = spans
+        .values()
+        .flatten()
+        .filter(|span| span.start <= span.end)
+        .map(|span| span.end)
+        .max()
+        .filter(|end| *end >= now.saturating_sub(600));
+    let mut line_start = progress.offset;
+    // Count later owned records, but never checkpoint beyond the first line
+    // awaiting a future span extension. Deduplication makes replay safe.
+    let mut replay_from = None;
     while position < len && !budget.exhausted() {
         let limit =
             (len - position).min((budget.max_bytes - budget.bytes).min(READ_CHUNK as u64)) as usize;
@@ -716,14 +743,18 @@ fn read_file(
         for &byte in &chunk[..read] {
             position += 1;
             if byte == b'\n' {
-                if !oversized {
-                    consume_record(&line, spans, now, report);
+                if !oversized
+                    && consume_record(&line, spans, open_end, now, report)
+                    && replay_from.is_none()
+                {
+                    replay_from = Some(line_start);
                 }
                 use zeroize::Zeroize;
                 line.as_mut_slice().zeroize();
                 line.clear();
                 oversized = false;
-                progress.offset = position;
+                line_start = position;
+                progress.offset = replay_from.unwrap_or(position);
                 progress.discard_offset = None;
                 if budget.started.elapsed() >= budget.duration {
                     break;
@@ -740,7 +771,7 @@ fn read_file(
                 }
             }
         }
-        if oversized {
+        if oversized && replay_from.is_none() {
             progress.discard_offset = Some(position);
         }
     }
@@ -785,21 +816,32 @@ fn stable_hash(bytes: &[u8]) -> u64 {
     u64::from_le_bytes(digest[..8].try_into().expect("eight digest bytes"))
 }
 
-fn consume_record(line: &[u8], spans: &KeyActivationSpans, now: i64, report: &mut UsageScanReport) {
+/// Returns true for a valid record whose ownership may be decided by extending
+/// the latest recently observed activation span. Keep its line for replay.
+fn consume_record(
+    line: &[u8],
+    spans: &KeyActivationSpans,
+    open_end: Option<i64>,
+    now: i64,
+    report: &mut UsageScanReport,
+) -> bool {
     if !line.windows(NEEDLE.len()).any(|window| window == NEEDLE) {
-        return;
+        return false;
     }
     let Ok(record) = serde_json::from_slice::<Record<'_>>(line) else {
-        return;
+        return false;
     };
     if record.kind != "token_usage_record" || record.payload.response_id.is_empty() {
-        return;
+        return false;
     }
     let Some(timestamp) = parse_timestamp(record.timestamp) else {
-        return;
+        return false;
     };
+    if open_end.is_some_and(|end| timestamp > end) && timestamp <= now.saturating_add(5) {
+        return true;
+    }
     if timestamp > now {
-        return;
+        return false;
     }
     let owner = spans
         .iter()
@@ -809,10 +851,10 @@ fn consume_record(line: &[u8], spans: &KeyActivationSpans, now: i64, report: &mu
             })
         })
         .max();
-    let Some((_, id)) = owner else { return };
+    let Some((_, id)) = owner else { return false };
     let hash = response_hash(record.payload.response_id);
     if report.ledger.seen.contains_key(&hash) {
-        return;
+        return false;
     }
     // Insert only matched records. Skipped non-key periods cannot prevent later
     // appends, and no plaintext response identifier is retained in the ledger.
@@ -842,6 +884,7 @@ fn consume_record(line: &[u8], spans: &KeyActivationSpans, now: i64, report: &mu
             .saturating_add_assign(counters);
     }
     report.records_added = report.records_added.saturating_add(1);
+    false
 }
 
 /// Strict RFC3339 to Unix seconds, without adding a date-time dependency.
@@ -1166,6 +1209,231 @@ mod tests {
     }
 
     #[test]
+    fn recent_span_end_replays_next_second_after_extension_including_persisted_restart() {
+        for persisted_restart in [false, true] {
+            let fixture = Fixture::new();
+            let prefix = record("resp-first", "2026-11-04T12:00:59Z");
+            let pending = record("resp-next", NOW_TEXT);
+            let path = fixture.write("one", prefix.clone() + &pending);
+            let mut intervals = spans();
+            intervals.get_mut("key-a").unwrap()[0].end = now() - 1;
+            let first = scan_with_budget(
+                &fixture.sessions,
+                &intervals,
+                UsageLedger::default(),
+                now(),
+                MAX_BYTES,
+                Duration::MAX,
+            )
+            .unwrap();
+            assert_eq!(first.records_added, 1);
+            assert_eq!(first.ledger.keys["key-a"].all_time, counters(1));
+            assert_eq!(
+                first.ledger.files.values().next().unwrap().offset,
+                prefix.len() as u64
+            );
+            let ledger = if persisted_restart {
+                fixture.store.save(&first.ledger).unwrap();
+                let loaded = fixture.store.load();
+                assert!(loaded.same_persisted_state(&first.ledger));
+                loaded
+            } else {
+                first.ledger
+            };
+            intervals.get_mut("key-a").unwrap()[0].end = now();
+            let second = scan_with_budget(
+                &fixture.sessions,
+                &intervals,
+                ledger,
+                now(),
+                MAX_BYTES,
+                Duration::MAX,
+            )
+            .unwrap();
+            assert_eq!(second.records_added, 1);
+            assert_eq!(second.ledger.keys["key-a"].all_time, counters(2));
+            assert_eq!(
+                second.ledger.files.values().next().unwrap().offset,
+                fs::metadata(path).unwrap().len()
+            );
+        }
+    }
+
+    #[test]
+    fn stale_span_end_skips_unowned_records_and_advances_to_eof() {
+        let fixture = Fixture::new();
+        let path = fixture.write("one", record("resp-unowned", NOW_TEXT));
+        let mut intervals = spans();
+        intervals.get_mut("key-a").unwrap()[0].end = now() - 601;
+        let report = scan_with_budget(
+            &fixture.sessions,
+            &intervals,
+            UsageLedger::default(),
+            now(),
+            MAX_BYTES,
+            Duration::MAX,
+        )
+        .unwrap();
+        assert_eq!(report.records_added, 0);
+        assert_eq!(
+            report.ledger.files.values().next().unwrap().offset,
+            fs::metadata(path).unwrap().len()
+        );
+    }
+
+    #[test]
+    fn held_replay_rereads_twice_and_deduplicates_later_owned_records() {
+        let fixture = Fixture::new();
+        let prefix = record("resp-prefix", "2026-11-04T12:00:59Z");
+        fixture.write(
+            "one",
+            prefix.clone()
+                + &record("resp-undecided", NOW_TEXT)
+                + &record("resp-later-in-file", "2026-11-04T12:00:59Z"),
+        );
+        let mut intervals = spans();
+        intervals.get_mut("key-a").unwrap()[0].end = now() - 1;
+        let mut ledger = UsageLedger::default();
+        for pass in 0..3 {
+            let report = scan_with_budget(
+                &fixture.sessions,
+                &intervals,
+                ledger,
+                now(),
+                MAX_BYTES,
+                Duration::MAX,
+            )
+            .unwrap();
+            assert!(report.bytes_read > 0);
+            assert_eq!(report.records_added, if pass == 0 { 2 } else { 0 });
+            assert_eq!(report.ledger.keys["key-a"].all_time, counters(2));
+            assert_eq!(
+                report.ledger.files.values().next().unwrap().offset,
+                prefix.len() as u64
+            );
+            ledger = report.ledger;
+        }
+        intervals.get_mut("key-a").unwrap()[0].end = now();
+        let final_pass = scan_with_budget(
+            &fixture.sessions,
+            &intervals,
+            ledger,
+            now(),
+            MAX_BYTES,
+            Duration::MAX,
+        )
+        .unwrap();
+        assert_eq!(final_pass.records_added, 1);
+        assert_eq!(final_pass.ledger.keys["key-a"].all_time, counters(3));
+    }
+
+    #[test]
+    fn held_replay_does_not_persist_oversized_discard_past_pending_record() {
+        let fixture = Fixture::new();
+        let prefix = record("resp-prefix", "2026-11-04T12:00:59Z");
+        let pending = record("resp-undecided", NOW_TEXT);
+        let path = fixture.write("one", prefix.clone() + &pending);
+        append(&path, vec![b'x'; MAX_LINE * 3]);
+        let mut intervals = spans();
+        intervals.get_mut("key-a").unwrap()[0].end = now() - 1;
+        let first = scan_with_budget(
+            &fixture.sessions,
+            &intervals,
+            UsageLedger::default(),
+            now(),
+            (MAX_LINE * 2) as u64,
+            Duration::MAX,
+        )
+        .unwrap();
+        assert!(first.budget_exhausted);
+        let progress = first.ledger.files.values().next().unwrap();
+        assert_eq!(progress.offset, prefix.len() as u64);
+        assert_eq!(progress.discard_offset, None);
+        fixture.store.save(&first.ledger).unwrap();
+        intervals.get_mut("key-a").unwrap()[0].end = now();
+        let second = scan_with_budget(
+            &fixture.sessions,
+            &intervals,
+            fixture.store.load(),
+            now(),
+            MAX_BYTES,
+            Duration::MAX,
+        )
+        .unwrap();
+        assert_eq!(second.records_added, 1);
+        assert_eq!(second.ledger.keys["key-a"].all_time, counters(2));
+    }
+
+    #[test]
+    fn replay_uses_greatest_end_across_keys_and_five_second_future_tolerance() {
+        for (timestamp, held) in [
+            ("2026-11-04T12:01:05Z", true),
+            ("2026-11-04T12:01:06Z", false),
+        ] {
+            let fixture = Fixture::new();
+            let path = fixture.write("one", record("resp-edge", timestamp));
+            let mut intervals = spans();
+            intervals.get_mut("key-a").unwrap()[0].end = now() - 601;
+            intervals.insert(
+                "key-b".into(),
+                vec![ActivationSpan {
+                    start: now() - 600,
+                    end: now() - 600,
+                }],
+            );
+            let report = scan_with_budget(
+                &fixture.sessions,
+                &intervals,
+                UsageLedger::default(),
+                now(),
+                MAX_BYTES,
+                Duration::MAX,
+            )
+            .unwrap();
+            assert_eq!(report.records_added, 0);
+            assert_eq!(
+                report.ledger.files.values().next().unwrap().offset,
+                if held {
+                    0
+                } else {
+                    fs::metadata(path).unwrap().len()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn persisted_state_comparison_includes_all_serialized_fields_and_ignores_walker() {
+        let fixture = Fixture::new();
+        let baseline = UsageLedger::default();
+        let mut changed = baseline.clone();
+        changed.walker = WalkContinuation(Arc::new(Mutex::new(Some(
+            DiscoveryWalker::new(&fixture.sessions).unwrap(),
+        ))));
+        assert!(baseline.same_persisted_state(&changed));
+        let mutations: [fn(&mut UsageLedger); 6] = [
+            |ledger| ledger.format += 1,
+            |ledger| {
+                ledger.keys.insert("key".into(), KeyUsageLedger::default());
+            },
+            |ledger| {
+                ledger.files.insert("file".into(), FileProgress::default());
+            },
+            |ledger| {
+                ledger.seen.insert(1, 2);
+            },
+            |ledger| ledger.scan_after = Some("file".into()),
+            |ledger| ledger.source_hash = Some(1),
+        ];
+        for mutate in mutations {
+            let mut changed = baseline.clone();
+            mutate(&mut changed);
+            assert!(!baseline.same_persisted_state(&changed));
+            assert!(!changed.same_persisted_state(&baseline));
+        }
+    }
+
+    #[test]
     fn records_outside_spans_advance_offsets_and_late_appends_are_counted() {
         let fixture = Fixture::new();
         let interval = BTreeMap::from([(
@@ -1207,16 +1475,41 @@ mod tests {
     fn no_spans_does_not_even_validate_or_walk_the_source() {
         let fixture = Fixture::new();
         let path = fixture.sessions.join("not/a/qualified/../source");
-        let result = scan_usage(
+        let result = scan_with_budget(
             &path,
             &KeyActivationSpans::new(),
             UsageLedger::default(),
             now(),
+            MAX_BYTES,
+            Duration::MAX,
         )
         .unwrap();
         assert_eq!(result.bytes_read, 0);
         assert!(result.errors.is_empty());
         assert!(result.ledger.files.is_empty());
+    }
+
+    #[test]
+    fn scan_load_requests_repair_only_when_no_valid_persisted_ledger_exists() {
+        let fixture = Fixture::new();
+        let (missing, repair) = fixture.store.load_for_scan();
+        assert!(repair);
+        assert!(missing.same_persisted_state(&UsageLedger::default()));
+        fixture.store.save(&missing).unwrap();
+        let (valid, repair) = fixture.store.load_for_scan();
+        assert!(!repair);
+        assert!(valid.same_persisted_state(&missing));
+        fs::write(&fixture.store.path, format!("damaged {SECRET}")).unwrap();
+        let (corrupt, repair) = fixture.store.load_for_scan();
+        assert!(repair);
+        assert!(corrupt.same_persisted_state(&UsageLedger::default()));
+        fs::write(&fixture.store.path, br#"{"format":999}"#).unwrap();
+        assert!(fixture.store.load_for_scan().1);
+        File::create(&fixture.store.path)
+            .unwrap()
+            .set_len(MAX_LEDGER_BYTES + 1)
+            .unwrap();
+        assert!(fixture.store.load_for_scan().1);
     }
 
     #[test]
@@ -1514,8 +1807,15 @@ mod tests {
         );
         ledger.remove_key("delete");
         ledger.retain_keys(&BTreeSet::from(["retain".into()]));
-        let report =
-            scan_usage(&fixture.sessions, &KeyActivationSpans::new(), ledger, now()).unwrap();
+        let report = scan_with_budget(
+            &fixture.sessions,
+            &KeyActivationSpans::new(),
+            ledger,
+            now(),
+            MAX_BYTES,
+            Duration::MAX,
+        )
+        .unwrap();
         assert_eq!(report.ledger.keys.len(), 1);
         assert_eq!(report.ledger.keys["retain"].all_time, counters(7));
         assert!(report.ledger.files.is_empty());
@@ -1612,11 +1912,13 @@ mod tests {
         fixture.write("second", record("resp-second", NOW_TEXT));
         let third = fixture.scan(second.ledger);
         assert_eq!(third.ledger.files.len(), 1);
-        let fourth = scan_usage(
+        let fourth = scan_with_budget(
             &fixture.sessions.join("missing"),
             &spans(),
             third.ledger,
             now(),
+            MAX_BYTES,
+            Duration::MAX,
         )
         .unwrap();
         assert!(fourth.ledger.files.is_empty());

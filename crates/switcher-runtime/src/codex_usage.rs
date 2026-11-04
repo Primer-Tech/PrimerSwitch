@@ -12,6 +12,7 @@ use switcher_platform::codex::usage::{
 
 const MAX_SPANS: usize = 200;
 const RESUME_SECONDS: i64 = 600;
+const SAVE_END_SECONDS: i64 = 300;
 const JS_MAX_INTEGER: u64 = (1 << 53) - 1;
 const LAST_DISPLAYABLE_SECOND: i64 = 253_402_300_799;
 
@@ -22,6 +23,9 @@ pub(super) struct KeyUsageTracking {
     /// None before the first actual read of the login in this process.
     observed: bool,
     active: Option<String>,
+    /// Updated only by a successful vault save (or loading that saved record).
+    saved_ends: BTreeMap<String, ActivationSpan>,
+    ledger_dirty: bool,
     pending: bool,
     scanning: bool,
     unavailable: bool,
@@ -36,6 +40,7 @@ pub(crate) struct KeyUsageJob {
     ids: BTreeSet<String>,
     ledger: Option<UsageLedger>,
     now: i64,
+    dirty: bool,
     #[cfg(test)]
     before_scan: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -83,7 +88,10 @@ impl KeyUsageJob {
         if let Some(hook) = self.before_scan {
             hook();
         }
-        let mut ledger = self.ledger.unwrap_or_else(|| self.store.load());
+        let (mut ledger, repair) = self
+            .ledger
+            .map_or_else(|| self.store.load_for_scan(), |ledger| (ledger, false));
+        let previous = ledger.clone();
         ledger.retain_keys(&self.ids);
         let (ledger, more, unavailable) = if self.spans.is_empty() {
             // Deletion still commits even when there is nothing left to scan.
@@ -97,7 +105,9 @@ impl KeyUsageJob {
                 !report.errors.is_empty(),
             )
         };
-        self.store.save(&ledger)?;
+        if self.dirty || repair || !ledger.same_persisted_state(&previous) {
+            self.store.save(&ledger)?;
+        }
         Ok(KeyUsageResult {
             ledger,
             more,
@@ -114,6 +124,28 @@ impl KeyUsageResult {
 }
 
 impl CodexEngine {
+    pub(super) fn note_usage_saved(&mut self) {
+        self.key_usage.saved_ends = self
+            .saved
+            .accounts
+            .iter()
+            .filter(|a| a.auth_kind == AuthKind::ApiKey)
+            .filter_map(|a| a.usage_spans.last().map(|span| (a.id.clone(), *span)))
+            .collect();
+    }
+
+    pub(super) fn interrupt_usage_observation(&mut self) {
+        if self.demo || !self.writable || self.switching.is_some() {
+            return;
+        }
+        self.key_usage.observed = true;
+        // A later unchanged login must open a new interval, rather than bridge
+        // a period during which an external login could not be observed.
+        if self.key_usage.active.take().is_some() {
+            self.key_usage.pending = true;
+        }
+    }
+
     pub(super) fn bind_usage_store(&mut self, vault: &Vault) {
         if self.key_usage.store.is_none() && !self.demo {
             self.key_usage.store = Some(UsageStore::new(
@@ -146,6 +178,7 @@ impl CodexEngine {
         let first = !self.key_usage.observed;
         let changed = self.key_usage.active != key;
         let mut spans_changed = false;
+        let mut save_needed = changed;
         // A closed span stays at its last proven observation, avoiding attribution
         // of the unobserved interval before an external login change.
         if changed && self.key_usage.active.is_some() {
@@ -165,6 +198,7 @@ impl CodexEngine {
                     previous.usage_spans.pop();
                 }
                 spans_changed = true;
+                save_needed = true;
             }
         }
         if let Some(id) = &key {
@@ -195,14 +229,19 @@ impl CodexEngine {
                 let excess = account.usage_spans.len().saturating_sub(MAX_SPANS);
                 account.usage_spans.drain(..excess);
                 spans_changed = true;
+                save_needed = true;
             }
+            let last = account.usage_spans.last().unwrap();
+            save_needed |= self.key_usage.saved_ends.get(id).is_none_or(|saved| {
+                saved.start != last.start || last.end.saturating_sub(saved.end) >= SAVE_END_SECONDS
+            });
         }
         self.key_usage.observed = true;
         self.key_usage.active = key;
-        if spans_changed {
+        if spans_changed || changed {
             self.key_usage.pending = true;
             // Optional tracking must never make startup or switching fail.
-            if self.save(vault).is_err() {
+            if save_needed && self.save(vault).is_err() {
                 self.key_usage.unavailable = true;
             }
         }
@@ -217,6 +256,7 @@ impl CodexEngine {
             let before = ledger.keys.len();
             ledger.retain_keys(&ids);
             self.key_usage.pending |= before != ledger.keys.len();
+            self.key_usage.ledger_dirty |= before != ledger.keys.len();
         }
     }
 
@@ -258,6 +298,7 @@ impl CodexEngine {
             ids: self.usage_key_ids(),
             ledger: self.key_usage.ledger.clone(),
             now,
+            dirty: std::mem::take(&mut self.key_usage.ledger_dirty),
             #[cfg(test)]
             before_scan: self.key_usage.before_scan.take(),
         })
@@ -278,6 +319,7 @@ impl CodexEngine {
                 self.key_usage.unavailable = result.unavailable;
             }
             Err(_) => {
+                self.key_usage.ledger_dirty = true;
                 self.key_usage.pending = true;
                 self.key_usage.unavailable = true;
             }

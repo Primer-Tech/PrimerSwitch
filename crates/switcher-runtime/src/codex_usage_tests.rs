@@ -3,6 +3,7 @@ use super::*;
 use switcher_platform::codex::usage::{
     ActivationSpan, KeyUsageLedger, UsageCounters, UsageLedger, UsageStore,
 };
+use switcher_platform::codex::{CodexSourceRole, CodexWatchedSource};
 
 fn spans(f: &Fixture, id: &str) -> Vec<ActivationSpan> {
     f.engine.saved.accounts[f.engine.account_index(id).unwrap()]
@@ -168,6 +169,270 @@ async fn only_proven_key_selections_open_extend_and_close_activation_spans() {
 }
 
 #[tokio::test]
+async fn failed_login_observation_does_not_bridge_an_unobserved_external_login() {
+    assert_observation_gap(true).await;
+}
+
+#[tokio::test]
+async fn failed_login_observation_does_not_bridge_even_an_unchanged_login() {
+    assert_observation_gap(false).await;
+}
+
+async fn assert_observation_gap(external_login: bool) {
+    let mut f = Fixture::new();
+    f.add_key("Key", FAKE_KEY).await.unwrap();
+    let key = f.key_id(FAKE_KEY);
+    f.switch(&key).await.unwrap();
+    f.engine.observe(&f.vault, 300).unwrap();
+    let auth_path = f.home.join("auth.json");
+    fs::remove_file(&auth_path).unwrap();
+    fs::create_dir(&auth_path).unwrap();
+    assert!(f.engine.observe(&f.vault, 350).is_err());
+    assert_eq!(
+        spans(&f, &key),
+        vec![ActivationSpan {
+            start: 200,
+            end: 300
+        }]
+    );
+    fs::remove_dir(&auth_path).unwrap();
+    if external_login {
+        f.write_active(&auth("user-a", "ws-a", "unobserved"));
+    }
+    f.write_active(&key_file(FAKE_KEY));
+    f.engine.observe(&f.vault, 600).unwrap();
+    let expected = vec![
+        ActivationSpan {
+            start: 200,
+            end: 300,
+        },
+        ActivationSpan {
+            start: 600,
+            end: 600,
+        },
+    ];
+    assert_eq!(spans(&f, &key), expected);
+    assert_eq!(
+        f.saved_state()
+            .accounts
+            .iter()
+            .find(|a| a.id == key)
+            .unwrap()
+            .usage_spans,
+        expected
+    );
+    // The unobserved interval is never charged, including an unchanged key.
+    rollout(
+        &f,
+        &(usage_record("before-gap", "1970-01-01T00:05:00Z")
+            + &usage_record("during-gap", "1970-01-01T00:07:30Z")
+            + &usage_record("after-gap", "1970-01-01T00:10:00Z")),
+    );
+    scan(&mut f, 600);
+    assert_eq!(f.view(&key).usage.unwrap().windows.total.total, 28);
+    f.claude_untouched();
+}
+
+#[tokio::test]
+async fn unavailable_home_and_failed_import_interrupt_key_observation() {
+    for unavailable_home in [false, true] {
+        let mut f = Fixture::new();
+        f.add_key("Key", FAKE_KEY).await.unwrap();
+        let key = f.key_id(FAKE_KEY);
+        f.switch(&key).await.unwrap();
+        f.engine.observe(&f.vault, 300).unwrap();
+        if unavailable_home {
+            let installation = f.engine.installation.take();
+            f.engine.observe(&f.vault, 350).unwrap();
+            f.engine.installation = installation;
+        } else {
+            let path = f.home.join("auth.json");
+            fs::remove_file(&path).unwrap();
+            fs::create_dir(&path).unwrap();
+            assert!(
+                f.engine
+                    .command(CodexCommand::ImportCurrent, &f.vault, 350)
+                    .await
+                    .is_err()
+            );
+            fs::remove_dir(&path).unwrap();
+            f.write_active(&key_file(FAKE_KEY));
+        }
+        f.engine.observe(&f.vault, 600).unwrap();
+        assert_eq!(
+            spans(&f, &key),
+            vec![
+                ActivationSpan {
+                    start: 200,
+                    end: 300
+                },
+                ActivationSpan {
+                    start: 600,
+                    end: 600
+                }
+            ]
+        );
+    }
+}
+
+#[tokio::test]
+async fn skipped_observation_during_switch_demo_or_read_only_keeps_existing_evidence() {
+    for mode in ["switch", "demo", "read-only"] {
+        let mut f = Fixture::new();
+        f.add_key("Key", FAKE_KEY).await.unwrap();
+        let key = f.key_id(FAKE_KEY);
+        let job = f.engine.begin_switch(&key, &f.vault, 200).unwrap().unwrap();
+        let outcome = job.run().await;
+        if mode != "switch" {
+            f.engine
+                .finish_switch(&job, &outcome, &f.vault, 210, true)
+                .unwrap();
+        }
+        f.engine.demo = mode == "demo";
+        f.engine.writable = mode != "read-only";
+        let path = f.home.join("auth.json");
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        f.engine.observe(&f.vault, 350).unwrap();
+        fs::remove_dir(&path).unwrap();
+        f.write_active(&key_file(FAKE_KEY));
+        f.engine.demo = false;
+        f.engine.writable = true;
+        if mode == "switch" {
+            f.engine
+                .finish_switch(&job, &outcome, &f.vault, 600, true)
+                .unwrap();
+        } else {
+            f.engine.observe(&f.vault, 600).unwrap();
+        }
+        assert_eq!(
+            spans(&f, &key),
+            vec![ActivationSpan {
+                start: 200,
+                end: 600
+            }]
+        );
+    }
+}
+
+fn saved_span(f: &Fixture, key: &str) -> ActivationSpan {
+    *f.saved_state()
+        .accounts
+        .iter()
+        .find(|a| a.id == key)
+        .unwrap()
+        .usage_spans
+        .last()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn ordinary_ticks_keep_spans_current_without_vault_writes_until_saved_end_lags_300_seconds() {
+    let mut f = Fixture::new();
+    f.add_key("Key", FAKE_KEY).await.unwrap();
+    let key = f.key_id(FAKE_KEY);
+    f.switch(&key).await.unwrap();
+    let path = f.vault.directory().join("codex-state.vault");
+    let ciphertext = fs::read(&path).unwrap();
+    for at in [211, 270, 330, 390, 450, 509] {
+        f.engine.observe(&f.vault, at).unwrap();
+        assert_eq!(spans(&f, &key)[0].end, at);
+        assert_eq!(saved_span(&f, &key).end, 210);
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            ciphertext,
+            "ordinary tick rewrote vault"
+        );
+        scan(&mut f, at); // Every extension must still schedule a scan.
+    }
+    f.engine.observe(&f.vault, 510).unwrap();
+    assert_eq!(saved_span(&f, &key).end, 510);
+    assert_ne!(fs::read(&path).unwrap(), ciphertext);
+    // Any other successful account save also checkpoints the end actually written.
+    f.engine.observe(&f.vault, 550).unwrap();
+    f.engine.save(&f.vault).unwrap();
+    let ciphertext = fs::read(&path).unwrap();
+    f.engine.observe(&f.vault, 849).unwrap();
+    assert_eq!(saved_span(&f, &key).end, 550);
+    assert_eq!(fs::read(&path).unwrap(), ciphertext);
+    f.engine.observe(&f.vault, 850).unwrap();
+    assert_eq!(saved_span(&f, &key).end, 850);
+    f.engine.observe(&f.vault, 900).unwrap();
+    f.write_active(&auth("user-a", "ws-a", "external"));
+    f.engine.observe(&f.vault, 950).unwrap();
+    assert_eq!(
+        saved_span(&f, &key).end,
+        900,
+        "closing saves the last proven end"
+    );
+}
+
+#[tokio::test]
+async fn restart_uses_the_saved_end_even_when_the_in_memory_end_was_newer() {
+    for gap in [600, 601] {
+        let mut f = Fixture::new();
+        f.add_key("Key", FAKE_KEY).await.unwrap();
+        let key = f.key_id(FAKE_KEY);
+        f.switch(&key).await.unwrap();
+        f.engine.observe(&f.vault, 500).unwrap();
+        assert_eq!(saved_span(&f, &key).end, 210);
+        reopen(&mut f, 210 + gap);
+        if gap == 600 {
+            assert_eq!(
+                spans(&f, &key),
+                vec![ActivationSpan {
+                    start: 200,
+                    end: 810
+                }]
+            );
+        } else {
+            assert_eq!(
+                spans(&f, &key),
+                vec![
+                    ActivationSpan {
+                        start: 200,
+                        end: 210
+                    },
+                    ActivationSpan {
+                        start: 811,
+                        end: 811
+                    }
+                ]
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn idle_scans_preserve_the_ledger_file_generation_including_after_restart() {
+    let mut f = Fixture::new();
+    f.add_key("Key", FAKE_KEY).await.unwrap();
+    let key = f.key_id(FAKE_KEY);
+    f.switch(&key).await.unwrap();
+    rollout(&f, &usage_record("first", "1970-01-01T00:03:25Z"));
+    scan(&mut f, 210);
+    let path = f.vault.directory().join("codex-key-usage.json");
+    let (receipt, _) = CodexWatchedSource::capture(CodexSourceRole::User, path.clone()).unwrap();
+    for now in [211, 212] {
+        f.engine.observe(&f.vault, now).unwrap();
+        scan(&mut f, now);
+        receipt
+            .revalidate()
+            .expect("idle scan must not replace the ledger");
+    }
+    reopen(&mut f, 213);
+    scan(&mut f, 213);
+    receipt
+        .revalidate()
+        .expect("unchanged catch-up must not rewrite the ledger");
+    assert_eq!(f.view(&key).usage.unwrap().windows.total.total, 14);
+    // Native generation catches replacement even when serialized bytes match.
+    let store = UsageStore::new(path);
+    store.save(&store.load()).unwrap();
+    assert!(receipt.revalidate().is_err());
+}
+
+#[tokio::test]
 async fn a_restart_resumes_at_ten_minutes_but_never_bridges_a_longer_gap() {
     for gap in [600, 601] {
         let mut f = Fixture::new();
@@ -318,7 +583,7 @@ async fn importing_a_live_key_selects_and_records_it_including_late_chatgpt_refr
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn switching_away_from_a_key_schedules_a_final_scan_before_daemon_completion() {
     let mut f = Fixture::new();
     let chatgpt = f.id_of("ws-a");
@@ -327,24 +592,65 @@ async fn switching_away_from_a_key_schedules_a_final_scan_before_daemon_completi
     f.switch(&key).await.unwrap();
     scan(&mut f, 210);
     assert!(f.engine.plan_key_usage(210).is_none());
-    let job = f
-        .engine
-        .begin_switch(&chatgpt, &f.vault, 300)
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        spans(&f, &key),
-        vec![ActivationSpan {
-            start: 200,
-            end: 299
-        }]
+    // Flushed after the prior scan: only the queued final scan can count it.
+    rollout(&f, &usage_record("outgoing", "1970-01-01T00:03:25Z"));
+    f.factory
+        .enqueue(Plan::quota(Ok(quota(Some("ws-a"), 0, 0))));
+    let calls_before = f.daemon.calls.lock().unwrap().len();
+    let daemon = f.daemon.clone();
+    let store = UsageStore::new(f.vault.directory().join("codex-key-usage.json"));
+    let (_temp, handle) = runtime(&mut f, Settings::default()).await;
+    let (started_tx, mut started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let started_tx = Mutex::new(Some(started_tx));
+    let release_rx = Mutex::new(release_rx);
+    handle
+        .edit_codex_for_test(move |engine, _| {
+            engine.usage_scan_hook(Arc::new(move || {
+                let restarted = daemon.calls.lock().unwrap()[calls_before..].contains(&"restart");
+                if let Some(sender) = started_tx.lock().unwrap().take() {
+                    let _ = sender.send(restarted);
+                }
+                let _ = release_rx.lock().unwrap().recv();
+            }));
+        })
+        .await;
+    let switching = handle.clone();
+    let mut switch = tokio::spawn(async move { switching.codex_switch_account(&chatgpt).await });
+    let (finished_before_scan, restarted, early_result) = tokio::select! {
+        result = &mut switch => (true, started_rx.await.unwrap(), Some(result)),
+        restarted = &mut started_rx => (false, restarted.unwrap(), None),
+    };
+    let released = release_tx.send(());
+    let result = match early_result {
+        Some(result) => result,
+        None => switch.await,
+    };
+    handle.wait_codex_jobs_for_test().await;
+    assert!(released.is_ok());
+    assert!(
+        finished_before_scan,
+        "daemon completion waited for the usage worker"
     );
-    scan(&mut f, 300);
-    let outcome = job.run().await;
-    f.engine
-        .finish_switch(&job, &outcome, &f.vault, 310, true)
-        .unwrap();
-    assert_eq!(spans(&f, &key)[0].end, 299);
+    assert!(
+        restarted,
+        "scan ran between login replacement and daemon restart"
+    );
+    assert!(result.unwrap().is_ok());
+    assert_eq!(store.load().keys[&key].all_time.total, 14);
+    handle
+        .edit_codex_for_test(move |engine, _| {
+            let account = &engine.saved.accounts[engine.account_index(&key).unwrap()];
+            assert_eq!(
+                account.usage_spans,
+                vec![ActivationSpan {
+                    start: 200,
+                    end: NOW - 1
+                }]
+            );
+        })
+        .await;
+    handle.shutdown_codex().await;
     f.claude_untouched();
 }
 
@@ -482,6 +788,15 @@ async fn synthetic_rollouts_produce_exact_key_windows_without_quota_or_secret_di
     // An optional ledger write failure exposes only a fixed reason and keeps switching usable.
     fs::remove_file(&ledger_path).unwrap();
     fs::create_dir(&ledger_path).unwrap();
+    // A changed offset/record still requires persistence; unchanged scans now
+    // deliberately avoid writing even when the optional store is unavailable.
+    use std::io::Write;
+    fs::OpenOptions::new()
+        .append(true)
+        .open(f.home.join("sessions/1970/02/09/rollout-fixture.jsonl"))
+        .unwrap()
+        .write_all(usage_record("new-record", "1970-02-10T00:00:00Z").as_bytes())
+        .unwrap();
     f.engine.observe(&f.vault, 40 * DAY + 1).unwrap();
     let error = f
         .engine

@@ -370,16 +370,44 @@ fn codex_id(id: &str) -> Reply<()> {
     }
 }
 
+fn open_main_window(app: &tauri::AppHandle) -> tauri::Result<()> {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    } else {
+        tauri::WebviewWindowBuilder::from_config(app, &app.config().app.windows[0])?
+            .on_navigation(|url| {
+                navigation_allowed(url.scheme(), url.host_str(), url.port_or_known_default())
+            })
+            .build()?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ExitDecision {
+    KeepRunning,
+    StartGracefulShutdown,
+    AllowExit,
+}
+
+fn exit_decision(code: Option<i32>, exiting: bool, background_mode: bool) -> ExitDecision {
+    if exiting {
+        ExitDecision::AllowExit
+    } else if background_mode && code.is_none() {
+        ExitDecision::KeepRunning
+    } else {
+        ExitDecision::StartGracefulShutdown
+    }
+}
+
 fn main() {
     let demo = std::env::args().skip(1).any(|arg| arg == "--demo");
     let exiting = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.unminimize();
-                let _ = window.show();
-                let _ = window.set_focus();
-            }
+            let _ = open_main_window(app);
         }))
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
@@ -437,11 +465,42 @@ fn main() {
             let events = app.handle().clone();
             let notice_app = app.handle().clone();
             app.manage(runtime);
-            tauri::WebviewWindowBuilder::from_config(app.handle(), &app.config().app.windows[0])?
-                .on_navigation(|url| {
-                    navigation_allowed(url.scheme(), url.host_str(), url.port_or_known_default())
-                })
-                .build()?;
+            open_main_window(app.handle())?;
+            #[cfg(windows)]
+            {
+                use tauri::menu::{Menu, MenuItem};
+                use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+
+                let open = MenuItem::with_id(app, "open", "Open PrimerSwitch", true, None::<&str>)?;
+                let quit = MenuItem::with_id(app, "quit", "Quit PrimerSwitch", true, None::<&str>)?;
+                let menu = Menu::with_items(app, &[&open, &quit])?;
+                let icon = app.default_window_icon().ok_or_else(|| {
+                    std::io::Error::other("PrimerSwitch default window icon is missing")
+                })?;
+                TrayIconBuilder::new()
+                    .icon(icon.clone())
+                    .tooltip("PrimerSwitch")
+                    .menu(&menu)
+                    .show_menu_on_left_click(false)
+                    .on_menu_event(|app, event| match event.id.as_ref() {
+                        "open" => {
+                            let _ = open_main_window(app);
+                        }
+                        "quit" => app.exit(0),
+                        _ => {}
+                    })
+                    .on_tray_icon_event(|tray, event| {
+                        if let TrayIconEvent::Click {
+                            button: MouseButton::Left,
+                            button_state: MouseButtonState::Up,
+                            ..
+                        } = event
+                        {
+                            let _ = open_main_window(tray.app_handle());
+                        }
+                    })
+                    .build(app)?;
+            }
             tauri::async_runtime::spawn(async move {
                 loop {
                     match changes.recv().await {
@@ -494,16 +553,26 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("PrimerSwitch could not initialize its native window")
         .run(move |app, event| {
-            if let tauri::RunEvent::ExitRequested { api, .. } = event
-                && !exiting.swap(true, std::sync::atomic::Ordering::AcqRel)
-            {
-                api.prevent_exit();
-                let app = app.clone();
-                let runtime = app.state::<RuntimeHandle>().inner().clone();
-                tauri::async_runtime::spawn(async move {
-                    runtime.shutdown_codex().await;
-                    app.exit(0);
-                });
+            if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
+                match exit_decision(
+                    code,
+                    exiting.load(std::sync::atomic::Ordering::Acquire),
+                    cfg!(windows),
+                ) {
+                    ExitDecision::KeepRunning => api.prevent_exit(),
+                    ExitDecision::StartGracefulShutdown => {
+                        if !exiting.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                            api.prevent_exit();
+                            let app = app.clone();
+                            let runtime = app.state::<RuntimeHandle>().inner().clone();
+                            tauri::async_runtime::spawn(async move {
+                                runtime.shutdown_codex().await;
+                                app.exit(0);
+                            });
+                        }
+                    }
+                    ExitDecision::AllowExit => {}
+                }
             }
         });
 }
@@ -523,7 +592,28 @@ fn navigation_allowed(scheme: &str, host: Option<&str>, port: Option<u16>) -> bo
 
 #[cfg(test)]
 mod tests {
-    use super::navigation_allowed;
+    use super::{ExitDecision, exit_decision, navigation_allowed};
+    #[test]
+    fn exit_decisions_cover_all_inputs() {
+        use ExitDecision::{AllowExit, KeepRunning, StartGracefulShutdown};
+        let cases = [
+            (None, false, false, StartGracefulShutdown),
+            (None, false, true, KeepRunning),
+            (None, true, false, AllowExit),
+            (None, true, true, AllowExit),
+            (Some(0), false, false, StartGracefulShutdown),
+            (Some(0), false, true, StartGracefulShutdown),
+            (Some(0), true, false, AllowExit),
+            (Some(0), true, true, AllowExit),
+            (Some(1), false, false, StartGracefulShutdown),
+            (Some(1), false, true, StartGracefulShutdown),
+            (Some(1), true, false, AllowExit),
+            (Some(1), true, true, AllowExit),
+        ];
+        for (code, exiting, background_mode, expected) in cases {
+            assert_eq!(exit_decision(code, exiting, background_mode), expected);
+        }
+    }
     #[test]
     fn renderer_cannot_navigate_to_remote_or_fake_local_origins() {
         assert!(navigation_allowed("tauri", Some("localhost"), None));

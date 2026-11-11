@@ -22,6 +22,8 @@
   import DeleteDialog from './DeleteDialog.svelte';
   import Modal from './Modal.svelte';
   import Icon from './Icon.svelte';
+  import ClaudeLaunch from './ClaudeLaunch.svelte';
+  import { launchNoticeView } from '../lib/claude-launch';
   let {
     controller,
     now,
@@ -126,6 +128,12 @@
     returnFocus = trigger;
     void controller.beginLogin(accountId);
   }
+  // Launch starts the account in its own window; it never switches the login.
+  function launch(row: AccountRowView, trigger: HTMLElement | null) {
+    detailsId = null;
+    returnFocus = trigger;
+    controller.openLaunch(row.id);
+  }
   function askDelete(row: AccountRowView, trigger: HTMLElement | null) {
     returnFocus = trigger;
     detailsId = null;
@@ -172,6 +180,13 @@
         text: errorText(notice, snapshot?.accounts ?? [], $language),
         dismiss: () => (dismissedNotice = `${errorKey(notice!)}|${notice!.at}`),
       });
+    const launched = launchNoticeView(
+      $controller.launchNotice,
+      snapshot?.accounts ?? [],
+      $language,
+      () => controller.dismissLaunchNotice(),
+    );
+    if (launched) list.push(launched);
     if (view.allLimited)
       list.push({
         key: 'limited',
@@ -316,6 +331,7 @@
   }}
   onrefresh={(row) => void run('refresh', row)}
   ondelete={askDelete}
+  onlaunch={launch}
   onresume={() => void controller.resumeAutomaticReturns()}
 >
   {#snippet providerCard()}
@@ -375,6 +391,7 @@
       }}
       onsignin={() => signIn(details!.id, returnFocus)}
       ondelete={() => askDelete(details!, returnFocus)}
+      onlaunch={() => launch(details!, returnFocus)}
       onautomation={(automation) =>
         controller.updateAutomation(details!.id, automation)}
       automationError={$controller.error
@@ -570,6 +587,7 @@
     </form>
   </Modal>
 {/if}
+<ClaudeLaunch {controller} {returnFocus} />
 {#if $controller.preview}
   <Modal
     title={t($language, 'importTitle')}

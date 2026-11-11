@@ -264,6 +264,12 @@ export interface AccountRowView {
   canRefresh: boolean;
   canDelete: boolean;
   deleteReason: string | null;
+  /** Claude only: the weekly Fable window; its value is null while unknown. */
+  fable?: MeterView;
+  /** Claude only: the account can start in its own window (the active one too). */
+  canLaunch?: boolean;
+  /** Why launching is unavailable for as long as the account stays like this. */
+  launchReason?: string | null;
 }
 
 export interface OrderEntry {

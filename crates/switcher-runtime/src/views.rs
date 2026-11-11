@@ -107,6 +107,10 @@ pub struct UsageView {
     pub weekly_overall_resets_at: Option<i64>,
     pub weekly_model_resets_at: Option<i64>,
     pub scoped_limits: Vec<ScopedLimitView>,
+    /// The provider's own weekly Fable row, whatever model is selected. `None` means the
+    /// reading has no such row: unknown, never zero, and never another window's value.
+    #[serde(default)]
+    pub fable: Option<ScopedLimitView>,
 }
 impl UsageView {
     pub(crate) fn new(u: &UsageResponse, model: Option<&str>) -> Self {
@@ -140,6 +144,11 @@ impl UsageView {
                     resets_at: l.resets_at,
                 })
                 .collect(),
+            fable: u.fable_limit().map(|l| ScopedLimitView {
+                label: l.label().into(),
+                percent: l.percent,
+                resets_at: l.resets_at,
+            }),
         }
     }
 }
@@ -243,6 +252,29 @@ pub struct Snapshot {
     pub notice: Option<ErrorView>,
     pub demo: bool,
     pub consumption_plan: Vec<String>,
+    /// Launching a saved account in its own Claude window is available in this build.
+    #[serde(default)]
+    pub launch_supported: bool,
+}
+/// Why a dedicated profile must be authorized (again) before it can launch.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ProfileAuthReason {
+    /// No authorization exists yet.
+    FirstUse,
+    /// The profile is signed in as another account or workspace.
+    IdentityChanged,
+    /// The provider no longer accepts the profile's sign-in.
+    Expired,
+}
+/// Result of a launch request. `Cancelled` (no folder chosen) has no side effects.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", tag = "status")]
+pub enum LaunchOutcome {
+    Launched,
+    Authorized,
+    Cancelled,
+    AuthorizationRequired { reason: ProfileAuthReason },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -266,7 +298,7 @@ pub struct Notification {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{Value, json};
     fn usage(
         overall: f64,
         model: f64,
@@ -340,6 +372,112 @@ mod tests {
             None
         );
     }
+    fn with_limits(limits: Value) -> UsageResponse {
+        serde_json::from_value(json!({
+            "five_hour":{"utilization":20,"resets_at":1000},
+            "seven_day":{"utilization":30,"resets_at":7000},
+            "limits":limits
+        }))
+        .unwrap()
+    }
+    fn weekly(kind: &str, name: Option<&str>, percent: f64, resets_at: Value) -> Value {
+        let mut limit =
+            json!({"kind":kind,"group":"weekly","percent":percent,"resets_at":resets_at});
+        if let Some(name) = name {
+            limit["scope"] = json!({"model":{"display_name":name}});
+        }
+        limit
+    }
+
+    #[test]
+    fn fable_is_the_providers_own_row_whichever_model_is_selected() {
+        let u = with_limits(json!([
+            weekly("weekly_all", None, 62.0, json!(7000)),
+            weekly("weekly_scoped", Some("Sonnet"), 90.0, json!(3000)),
+            weekly("weekly_scoped", Some("Fable"), 41.5, json!(5000)),
+        ]));
+        for model in [None, Some("opus"), Some("sonnet"), Some("claude-fable-5-2")] {
+            let view = UsageView::new(&u, model);
+            let fable = view.fable.as_ref().expect("fable row");
+            assert_eq!(
+                (fable.label.as_str(), fable.percent, fable.resets_at),
+                ("Fable", 41.5, Some(5000)),
+                "{model:?}"
+            );
+            // The overall week and the selected model keep their own values.
+            assert_eq!(view.weekly_overall, 62.0);
+            assert_eq!(view.scoped_limits.len(), 2);
+        }
+        // Selected Opus: the model window is the overall week, never Fable's number.
+        assert_eq!(UsageView::new(&u, Some("opus")).weekly_model, 62.0);
+        let serialized = serde_json::to_value(UsageView::new(&u, None)).unwrap();
+        assert_eq!(serialized["fable"]["percent"], 41.5);
+        assert_eq!(serialized["fable"]["resetsAt"], 5000);
+    }
+
+    #[test]
+    fn a_missing_fable_row_is_unknown_never_zero_and_never_another_window() {
+        for limits in [
+            Value::Null,
+            json!([]),
+            json!([weekly("weekly_all", None, 62.0, json!(7000))]),
+            json!([weekly("weekly_scoped", Some("Sonnet"), 99.0, json!(3000))]),
+            // A row for a similar-looking name is not Fable.
+            json!([weekly(
+                "weekly_scoped",
+                Some("Code review"),
+                10.0,
+                json!(3000)
+            )]),
+        ] {
+            let u = with_limits(limits.clone());
+            for model in [None, Some("fable"), Some("sonnet")] {
+                let view = UsageView::new(&u, model);
+                assert!(view.fable.is_none(), "{limits} {model:?}");
+                assert_eq!(serde_json::to_value(&view).unwrap()["fable"], Value::Null);
+            }
+        }
+        // No limits list at all (for example a reading built from response headers).
+        let headers_only: UsageResponse = serde_json::from_value(json!({
+            "five_hour":{"utilization":20,"resets_at":1000},
+            "seven_day":{"utilization":30,"resets_at":7000}
+        }))
+        .unwrap();
+        assert!(UsageView::new(&headers_only, Some("fable")).fable.is_none());
+    }
+
+    #[test]
+    fn fable_keeps_its_own_reset_and_an_unknown_reset_stays_unknown() {
+        let u = with_limits(json!([
+            weekly("weekly_all", None, 62.0, json!(7000)),
+            weekly("weekly_scoped", Some("Fable"), 12.0, Value::Null),
+        ]));
+        let fable = UsageView::new(&u, Some("opus")).fable.unwrap();
+        assert_eq!((fable.percent, fable.resets_at), (12.0, None));
+        // An explicit zero is a reported zero; the reset time is still its own.
+        let u = with_limits(json!([
+            weekly("weekly_all", None, 62.0, json!(7000)),
+            weekly("weekly_scoped", Some("Fable"), 0.0, json!(9000)),
+        ]));
+        let fable = UsageView::new(&u, None).fable.unwrap();
+        assert_eq!((fable.percent, fable.resets_at), (0.0, Some(9000)));
+        // The row is matched by the provider's model name or kind, case-insensitively,
+        // and only among scoped weekly limits.
+        let u = with_limits(json!([
+            weekly("weekly_fable", None, 33.0, json!(4000)),
+            {"kind":"five_hour_fable","group":"five_hour","percent":99.0,"resets_at":1},
+        ]));
+        let fable = UsageView::new(&u, None).fable.unwrap();
+        assert_eq!((fable.percent, fable.resets_at), (33.0, Some(4000)));
+        let u = with_limits(json!([weekly(
+            "weekly_scoped",
+            Some("FABLE 5"),
+            7.0,
+            json!(1)
+        )]));
+        assert_eq!(UsageView::new(&u, None).fable.unwrap().percent, 7.0);
+    }
+
     #[test]
     fn tied_binding_windows_require_both_reset_times_and_show_the_later_one() {
         for (overall, model, expected) in [

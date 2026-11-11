@@ -54,6 +54,11 @@ impl CliPaths {
         "CLAUDE_CODE_HOST_GATEWAY_LINEAGE",
     ];
 
+    /// Variables a dedicated profile launch removes from the child environment.
+    pub(crate) fn context_variables() -> &'static [&'static str] {
+        Self::CONTEXT_VARIABLES
+    }
+
     /// Names the first blocking variable (never its value) so the user can fix it.
     fn blocking_variable(get: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<&'static str> {
         Self::CONTEXT_VARIABLES

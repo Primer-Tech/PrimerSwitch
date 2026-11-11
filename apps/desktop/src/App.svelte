@@ -36,6 +36,7 @@
       !!snapshot?.busy ||
       !!snapshot?.demo ||
       $controller.login.open ||
+      $controller.launch.open ||
       !snapshot,
   );
 
@@ -75,6 +76,7 @@
     tabsDisabled={!!$controller.pending ||
       !!snapshot?.busy ||
       $controller.login.open ||
+      $controller.launch.open ||
       !!$codexController.pending}
     onprovider={(next) => (provider = next)}
     settingsDisabled={!snapshot}
@@ -89,7 +91,8 @@
     externalDemo={!!snapshot?.demo}
     externalBlocked={!!$controller.pending ||
       !!snapshot?.busy ||
-      $controller.login.open}
+      $controller.login.open ||
+      $controller.launch.open}
   />{/if}
 
 {#if savedSettings}<div class="settings-confirmation" role="status">

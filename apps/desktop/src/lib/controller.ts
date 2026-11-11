@@ -15,6 +15,8 @@ import {
   type CommandArgs,
 } from './bridge';
 import {
+  launchModelSchema,
+  launchOutcomeSchema,
   loginSchema,
   previewSchema,
   snapshotSchema,
@@ -22,10 +24,14 @@ import {
   type AccountAutomation,
   type AccountView,
   type ErrorView,
+  type LaunchModel,
+  type LaunchOutcome,
+  type ProfileAuthReason,
   type Snapshot,
   type LoginSession,
   type ImportPreview,
 } from './types';
+import { launchBlock, launchBlockText } from './claude-launch';
 
 /** Stable Claude runtime error and notice codes; each one is a catalog key. */
 const errorCodes: ReadonlySet<string> = new Set<MessageKey>([
@@ -51,6 +57,11 @@ const errorCodes: ReadonlySet<string> = new Set<MessageKey>([
   'switchInterrupted',
   'switchRecoveryPending',
   'outgoingUnverified',
+  'launchUnsupported',
+  'launchNotInstalled',
+  'launchFolderInvalid',
+  'launchHistorySplit',
+  'launchFailed',
 ]);
 /** Messages that name a fixed variable or settings entry. */
 const namedTemplates = [
@@ -109,6 +120,45 @@ function namedMessage(text: string, locale: Language): string | null {
   return null;
 }
 
+/** `choose`: model and folder; `authorize`: consent to a browser sign-in; `code`: paste it. */
+export type LaunchStage = 'choose' | 'authorize' | 'code';
+/**
+ * One launch of a saved account in its own Claude window. It is separate from the
+ * Add/Repair `login` state and never goes through `switch_account`.
+ */
+export interface LaunchState {
+  open: boolean;
+  /** The saved account to launch; the native side re-checks it on every command. */
+  accountId: string | null;
+  model: LaunchModel;
+  stage: LaunchStage;
+  /** Why the launch profile has to be authorized; set while `stage` is not `choose`. */
+  reason: ProfileAuthReason | null;
+  /** The browser sign-in bound to `accountId`; null once the native side consumed it. */
+  session: LoginSession | null;
+  working: boolean;
+  /** The command in flight: the folder choice and start, the browser, or the code. */
+  step: 'launch' | 'browser' | 'code' | null;
+  /** A quiet outcome of the last step that is not an error. */
+  info: 'cancelled' | 'authorized' | null;
+  error: string | null;
+}
+/** A launch that finished; shown until dismissed. */
+export interface LaunchNotice {
+  accountId: string;
+}
+const closedLaunch: LaunchState = {
+  open: false,
+  accountId: null,
+  model: 'default',
+  stage: 'choose',
+  reason: null,
+  session: null,
+  working: false,
+  step: null,
+  info: null,
+  error: null,
+};
 export interface ViewState {
   snapshot: Snapshot | null;
   pending: string | null;
@@ -121,6 +171,8 @@ export interface ViewState {
     working: boolean;
     error: string | null;
   };
+  launch: LaunchState;
+  launchNotice: LaunchNotice | null;
   preview: ImportPreview | null;
 }
 /** Display only native safe errors; never serialize arbitrary thrown objects. */
@@ -159,6 +211,8 @@ export function createController(bridge: Bridge = nativeBridge) {
       working: false,
       error: null,
     },
+    launch: closedLaunch,
+    launchNotice: null,
     preview: null,
   };
   const store = writable(state);
@@ -223,7 +277,7 @@ export function createController(bridge: Bridge = nativeBridge) {
     command: C,
     args?: CommandArgs[C],
   ): Promise<boolean> {
-    if (blocked() || state.login.open) return false;
+    if (blocked() || state.login.open || state.launch.open) return false;
     set({ pending: command, error: null });
     try {
       const raw = await bridge.call(command, args);
@@ -239,7 +293,7 @@ export function createController(bridge: Bridge = nativeBridge) {
     }
   }
   async function beginLogin(accountId: string | null = null) {
-    if (blocked() || state.login.open) return;
+    if (blocked() || state.login.open || state.launch.open) return;
     if (
       accountId !== null &&
       !state.snapshot?.accounts.some((account) => account.id === accountId)
@@ -419,15 +473,242 @@ export function createController(bridge: Bridge = nativeBridge) {
         });
     }
   }
+  // Launching a saved account in its own Claude window. These steps never call
+  // switch_account and never touch the Add/Repair `login` state above.
+  let launchGeneration = 0;
+  const setLaunch = (patch: Partial<LaunchState>) =>
+    set({ launch: { ...state.launch, ...patch } });
+  const launchError = (error: unknown) => {
+    const text = safeError(error, locale());
+    // The generic wording points to Add account, which cannot help a launch.
+    return text === t(locale(), 'loginIdentityMismatch')
+      ? t(locale(), 'launchWrongLogin')
+      : text;
+  };
+  /** The native side consumes a sign-in once it answers, so it never outlives one reply. */
+  const consumed = {
+    session: null,
+    working: false,
+    step: null,
+  } as const;
+  /** Drops what the native side still holds for a launch: its session, or just the waiting launch. */
+  async function dropNativeLaunch(session: LoginSession | null) {
+    accept(
+      await bridge.call('cancel_claude_profile_login', {
+        id: session?.id ?? '',
+      }),
+    );
+  }
+  /** A reply that arrives after its dialog was cancelled, replaced or disposed. */
+  function lateOutcome(outcome: LaunchOutcome, accountId: string) {
+    if (outcome.status === 'launched') set({ launchNotice: { accountId } });
+    // A launch that now waits for a sign-in nobody will finish would resume later.
+    else if (
+      outcome.status === 'authorizationRequired' &&
+      (disposed || !state.launch.open)
+    )
+      void bridge
+        .call('cancel_claude_profile_login', { id: '' })
+        .catch(() => {});
+  }
+  function applyOutcome(outcome: LaunchOutcome, accountId: string) {
+    if (outcome.status === 'launched') {
+      set({ launch: { ...closedLaunch }, launchNotice: { accountId } });
+    } else if (outcome.status === 'authorizationRequired') {
+      setLaunch({
+        ...consumed,
+        stage: 'authorize',
+        reason: outcome.reason,
+        info: null,
+        error: null,
+      });
+    } else {
+      // Cancelled (no folder was chosen) or authorized without a waiting launch:
+      // nothing was started, and the same dialog can try again.
+      setLaunch({
+        ...consumed,
+        stage: 'choose',
+        reason: null,
+        info: outcome.status,
+        error: null,
+      });
+    }
+  }
+  function openLaunch(accountId: string): boolean {
+    if (blocked() || state.login.open || state.launch.open) return false;
+    const account = state.snapshot?.accounts.find(
+      (candidate) => candidate.id === accountId,
+    );
+    if (!state.snapshot || !account || launchBlock(state.snapshot, account))
+      return false;
+    launchGeneration++;
+    set({
+      launch: { ...closedLaunch, open: true, accountId },
+      launchNotice: null,
+      error: null,
+    });
+    return true;
+  }
+  function setLaunchModel(model: LaunchModel) {
+    const parsed = launchModelSchema.safeParse(model);
+    const { open, working, stage } = state.launch;
+    if (parsed.success && open && !working && stage === 'choose')
+      setLaunch({ model: parsed.data, info: null });
+  }
+  async function startLaunch() {
+    const { open, working, stage, accountId, model } = state.launch;
+    if (disposed || !open || working || stage !== 'choose' || !accountId)
+      return;
+    const snapshot = state.snapshot;
+    const account = snapshot?.accounts.find(
+      (candidate) => candidate.id === accountId,
+    );
+    const block = snapshot && account ? launchBlock(snapshot, account) : null;
+    if (!account || block || snapshot?.busy || state.pending) {
+      setLaunch({
+        error: !account
+          ? codeMessage('missingAccount', locale())
+          : block
+            ? launchBlockText(block, locale())
+            : t(locale(), 'switchBusy'),
+      });
+      return;
+    }
+    const mine = ++launchGeneration;
+    setLaunch({ working: true, step: 'launch', info: null, error: null });
+    let raw: unknown;
+    try {
+      raw = await bridge.call('claude_launch', { id: accountId, model });
+    } catch (error) {
+      if (mine === launchGeneration && !disposed)
+        setLaunch({ working: false, step: null, error: launchError(error) });
+      return;
+    }
+    const outcome = launchOutcomeSchema.safeParse(raw);
+    if (mine !== launchGeneration || disposed) {
+      if (outcome.success) lateOutcome(outcome.data, accountId);
+      return;
+    }
+    if (outcome.success) applyOutcome(outcome.data, accountId);
+    else
+      setLaunch({
+        working: false,
+        step: null,
+        error: t(locale(), 'unsafeData'),
+      });
+  }
+  /** Opens the account-bound browser sign-in; calling it again replaces an earlier one. */
+  async function beginLaunchAuthorization() {
+    const { open, working, stage, accountId } = state.launch;
+    if (disposed || !open || working || stage === 'choose' || !accountId)
+      return;
+    const mine = ++launchGeneration;
+    setLaunch({ working: true, step: 'browser', info: null, error: null });
+    try {
+      const session = loginSchema.parse(
+        await bridge.call('begin_claude_profile_login', { accountId }),
+      );
+      if (mine !== launchGeneration || disposed)
+        await bridge.call('cancel_claude_profile_login', { id: session.id });
+      else setLaunch({ stage: 'code', session, working: false, step: null });
+    } catch (error) {
+      if (mine === launchGeneration && !disposed)
+        setLaunch({
+          stage: 'authorize',
+          session: null,
+          working: false,
+          step: null,
+          error: launchError(error),
+        });
+    }
+  }
+  async function finishLaunchAuthorization(code: string) {
+    const { open, working, stage, session, accountId } = state.launch;
+    if (
+      disposed ||
+      !open ||
+      working ||
+      stage !== 'code' ||
+      !session ||
+      !accountId ||
+      state.snapshot?.demo
+    )
+      return;
+    const cleaned = code.replace(/\s/g, '');
+    if (!/^[^#]+#[^#]+$/.test(cleaned)) {
+      setLaunch({ error: t(locale(), 'fullCodeRequired') });
+      return;
+    }
+    const mine = ++launchGeneration;
+    setLaunch({ working: true, step: 'code', info: null, error: null });
+    let raw: unknown;
+    try {
+      raw = await bridge.call('finish_claude_profile_login', {
+        id: session.id,
+        code: cleaned,
+      });
+    } catch (error) {
+      // Wrong login, expired code or a failed start: the session is gone, so another
+      // attempt needs a new browser sign-in. A waiting launch is kept for it.
+      if (mine === launchGeneration && !disposed)
+        setLaunch({ ...consumed, error: launchError(error) });
+      return;
+    }
+    const outcome = launchOutcomeSchema.safeParse(raw);
+    if (mine !== launchGeneration || disposed) {
+      if (outcome.success) lateOutcome(outcome.data, accountId);
+      return;
+    }
+    if (outcome.success) applyOutcome(outcome.data, accountId);
+    else setLaunch({ ...consumed, error: t(locale(), 'unsafeData') });
+  }
+  /** Leaves an authorization step for the model choice, dropping what waits natively. */
+  async function backToLaunch() {
+    const { open, working, stage, session } = state.launch;
+    if (disposed || !open || working || stage === 'choose') return;
+    launchGeneration++;
+    setLaunch({
+      ...consumed,
+      stage: 'choose',
+      reason: null,
+      info: null,
+      error: null,
+    });
+    try {
+      await dropNativeLaunch(session);
+    } catch (error) {
+      if (state.launch.open) setLaunch({ error: launchError(error) });
+    }
+  }
+  async function cancelLaunch() {
+    const { open, stage, session } = state.launch;
+    if (!open) return;
+    launchGeneration++;
+    set({ launch: { ...closedLaunch } });
+    // Before a folder was chosen nothing is held natively. A reply that is still on
+    // its way is handled when it arrives (see lateOutcome).
+    if (stage === 'choose') return;
+    try {
+      await dropNativeLaunch(session);
+    } catch (error) {
+      set({ error: launchError(error) });
+    }
+  }
   function dispose() {
     if (disposed) return;
     const session = state.login.session;
+    const launch = state.launch;
     disposed = true;
     generation++;
+    launchGeneration++;
     if (poll) clearInterval(poll);
     unlisten?.();
     if (session)
       void bridge.call('cancel_login', { id: session.id }).catch(() => {});
+    if (launch.open && launch.stage !== 'choose')
+      void bridge
+        .call('cancel_claude_profile_login', { id: launch.session?.id ?? '' })
+        .catch(() => {});
   }
   return {
     subscribe: store.subscribe,
@@ -440,6 +721,14 @@ export function createController(bridge: Bridge = nativeBridge) {
     cancelLogin,
     restartLogin,
     finishLogin,
+    openLaunch,
+    setLaunchModel,
+    startLaunch,
+    beginLaunchAuthorization,
+    finishLaunchAuthorization,
+    backToLaunch,
+    cancelLaunch,
+    dismissLaunchNotice: () => set({ launchNotice: null }),
     dismissError: () => set({ error: null }),
     dismissPreview: () => set({ preview: null }),
     dispose,

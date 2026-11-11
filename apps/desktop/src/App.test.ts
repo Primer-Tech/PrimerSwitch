@@ -71,8 +71,8 @@ describe('desktop workflows', () => {
   it('shows the shared windows, the per-model weekly row and the exact backend usage order', async () => {
     setup();
     await screen.findAllByText('a@example.invalid');
-    // Active card 3, two table rows of 2, Next up 2.
-    expect(screen.getAllByRole('meter')).toHaveLength(9);
+    // Active card 3, two table rows of 3 (with the weekly Fable window), Next up 2.
+    expect(screen.getAllByRole('meter')).toHaveLength(11);
     const active = activeCard();
     expect(
       active.getByRole('meter', { name: '5-hour window' }),
@@ -89,7 +89,14 @@ describe('desktop workflows', () => {
       within(screen.getByRole('table'))
         .getAllByRole('columnheader')
         .map((header) => header.textContent?.trim()),
-    ).toEqual(['Account', '5-hour window', 'Weekly', 'Status', 'Actions']);
+    ).toEqual([
+      'Account',
+      '5-hour window',
+      'Weekly',
+      'Weekly Fable',
+      'Status',
+      'Actions',
+    ]);
     const order = within(screen.getByRole('region', { name: 'Next in order' }));
     expect(
       order.getAllByRole('listitem').map((item) => item.textContent),
@@ -960,7 +967,7 @@ describe('desktop workflows', () => {
     vi.useFakeTimers();
     const { call } = setup();
     await vi.advanceTimersByTimeAsync(0);
-    expect(screen.getAllByRole('meter')).toHaveLength(9);
+    expect(screen.getAllByRole('meter')).toHaveLength(11);
     const before = call.mock.calls.length;
     await vi.advanceTimersByTimeAsync(2000);
     expect(call).toHaveBeenCalledTimes(before);

@@ -893,7 +893,21 @@ describe('Codex accounts page', () => {
       'Automation',
       'Credits & renewal',
     ]);
-    expect(claude.columns).toEqual(codex.columns);
+    expect(codex.columns).toEqual([
+      'Account',
+      '5-hour window',
+      'Weekly',
+      'Status',
+      'Actions',
+    ]);
+    expect(claude.columns).toEqual([
+      'Account',
+      '5-hour window',
+      'Weekly',
+      'Weekly Fable',
+      'Status',
+      'Actions',
+    ]);
     expect(claude).toMatchObject({
       order: true,
       refreshAll: true,

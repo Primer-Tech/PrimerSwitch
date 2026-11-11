@@ -601,4 +601,60 @@ export const ro: Record<keyof typeof en, string> = {
   codexFallbackBannerPaused:
     'Se folosește cheia API {name} (facturată per token) din {time}. Comutarea automată este oprită, așa că PrimerSwitch nu va reveni singur. Pornește-o din setările de automatizare sau revino tu.',
   codexFallbackSwitchBack: 'Revino acum',
+
+  // Launching a saved Claude account in its own window, and its weekly Fable usage.
+  launchClaude: 'Pornește Claude',
+  launchLabel: 'Pornește Claude cu {name}',
+  launchTitle: 'Pornește Claude',
+  launchIntro:
+    'Pornește o sesiune nouă Claude Code autentificată cu acest cont. Autentificarea Claude curentă nu se schimbă.',
+  launchModel: 'Model',
+  launchModelDefault: 'Implicit (setările tale Claude comune)',
+  launchModelOpus: 'Opus',
+  launchModelSonnet: 'Sonnet',
+  launchModelFable: 'Fable',
+  launchSharing:
+    'Fereastra nouă are propria autentificare. Folosește în comun abilitățile (skills), memoria și istoricul proiectelor, pluginurile, hook-urile și setările serverelor MCP. Unele servicii MCP și conectori web pot cere o autentificare proprie pentru acest cont.',
+  launchQuotaHint:
+    'Ca să păstrezi cota acestui cont pentru ferestrele pornite de aici, dezactivează comutarea automată pentru el în Detalii.',
+  launchFolderNext: 'Alegi dosarul proiectului la pasul următor.',
+  launchAction: 'Pornește',
+  launchWaitingFolder: 'Se așteaptă dosarul ales de tine…',
+  launchNoFolder: 'Nu a fost ales niciun dosar, așa că nu s-a pornit nimic.',
+  launchAuthorizedInfo:
+    'Contul este autorizat pentru pornire. Alege Pornește ca să lansezi Claude.',
+  launchAuthFirstUse:
+    'Prima pornire pentru {name} cere o autentificare separată în browser, independentă de autentificarea curentă. Poate fi cerută din nou dacă expiră.',
+  launchAuthIdentityChanged:
+    'Această autentificare de pornire aparține altui cont sau spațiu de lucru Claude. Autentifică-te din nou ca {name}.',
+  launchAuthExpired:
+    'Autentificarea de pornire pentru {name} nu mai este acceptată. Autentifică-te din nou ca să continui.',
+  launchAuthNote:
+    'Browserul se deschide pentru a autoriza acest cont. Apoi Claude pornește în dosarul ales. Dacă autentificarea expiră mai târziu, ți se va cere din nou.',
+  launchOpenBrowser: 'Deschide browserul',
+  launchStepThree: 'Confirmă pentru a autoriza și a porni Claude.',
+  launchAuthorizing: 'Se autorizează și se pornește Claude…',
+  launchAuthorize: 'Autorizează și pornește',
+  launchBack: 'Înapoi',
+  launchWrongLogin:
+    'Autentificarea din browser a fost pentru alt cont sau alt spațiu de lucru Claude. Autentifică-te cu contul afișat mai sus și alege spațiul lui de lucru.',
+  launchNeedsSignIn: 'Autentifică-te din nou înainte de a porni acest cont.',
+  launchNeedsVerified:
+    'Așteaptă până când identitatea acestui cont este verificată.',
+  launchStarted:
+    'Claude a pornit în propria fereastră pentru {name}. Autentificarea Claude curentă a rămas neschimbată.',
+  launchStartedAnonymous:
+    'Claude a pornit în propria fereastră. Autentificarea Claude curentă a rămas neschimbată.',
+  launchUnsupported:
+    'Lansarea Claude din PrimerSwitch nu este disponibilă pe acest sistem.',
+  launchNotInstalled:
+    'Claude Code nativ nu a fost găsit. Instalează-l, apoi încearcă din nou.',
+  launchFolderInvalid: 'Alege un dosar de proiect existent.',
+  launchHistorySplit:
+    'Acest profil are deja propriul istoric de proiecte Claude. Mută-l sau îmbină-l în istoricul comun, apoi lansează din nou.',
+  launchFailed:
+    'Claude nu a putut fi pornit. Verifică dacă Claude Code este instalat, apoi încearcă din nou.',
+  weeklyFable: 'Fable săptămânal',
+  fableUnavailable:
+    'Utilizarea săptămânală Fable nu a fost raportată în ultima citire.',
 };

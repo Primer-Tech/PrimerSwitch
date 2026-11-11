@@ -1,5 +1,7 @@
 //! Native storage and recoverable Claude CLI switching. No provider requests occur here.
 mod active;
+mod claude_launch;
+mod claude_profile;
 pub mod codex;
 mod files;
 #[cfg(any(target_os = "linux", test))]
@@ -9,6 +11,14 @@ mod protection;
 mod vault;
 
 pub use active::{ActiveSnapshot, ActiveStore, Recovery};
+pub use claude_launch::{
+    ClaudeLauncher, LaunchModel, LaunchSpec, SystemLauncher, build_launch_spec,
+    find_claude_executable_in, validate_launch_folder,
+};
+pub use claude_profile::{
+    ClaudeProfile, ClaudeProfilePaths, HISTORY_DIRECTORIES, LaunchPlan, ProfileCredential,
+    ProfileState, SHARED_DIRECTORIES, SharedResources,
+};
 pub use paths::{CliPaths, app_data_dir};
 pub use vault::Vault;
 

@@ -1,4 +1,6 @@
 use crate::views::*;
+#[path = "claude_launch_runtime.rs"]
+mod claude_launch_runtime;
 #[path = "codex_runtime.rs"]
 mod codex_runtime;
 use crate::{
@@ -21,7 +23,9 @@ use std::{
 };
 use switcher_core::*;
 use switcher_platform::{
-    ActiveSnapshot, ActiveStore, CliPaths, PlatformError, Recovery, Vault, app_data_dir,
+    ActiveSnapshot, ActiveStore, ClaudeLauncher, ClaudeProfile, CliPaths, LaunchModel,
+    PlatformError, ProfileState, Recovery, SystemLauncher, Vault, app_data_dir, build_launch_spec,
+    validate_launch_folder,
 };
 use tokio::sync::{Mutex, Notify, broadcast};
 
@@ -111,6 +115,18 @@ pub enum RuntimeError {
     PendingReset,
     #[error("The Claude Code version could not be detected. Install a recognized version.")]
     CliVersion,
+    #[error("Launching Claude from PrimerSwitch is not available on this system.")]
+    LaunchUnsupported,
+    #[error("Native Claude Code was not found. Install it, then try again.")]
+    LaunchNotInstalled,
+    #[error("Choose an existing project folder.")]
+    LaunchFolder,
+    #[error("Claude could not be started. Check that Claude Code is installed, then try again.")]
+    LaunchFailed,
+    #[error(
+        "This profile already has its own Claude project history. Move or merge it into the shared history, then launch again."
+    )]
+    LaunchHistorySplit,
 }
 
 impl RuntimeError {
@@ -138,6 +154,11 @@ impl RuntimeError {
             Self::Import=>"Importul nu mai este valid. Selectează din nou dosarul.".into(),
             Self::PendingReset=>"Cererea anterioară de resetare trebuie confirmată înainte de o nouă încercare.".into(),
             Self::CliVersion=>"Versiunea Claude Code nu a putut fi detectată. Instalează o versiune recunoscută.".into(),
+            Self::LaunchUnsupported=>"Lansarea Claude din PrimerSwitch nu este disponibilă pe acest sistem.".into(),
+            Self::LaunchNotInstalled=>"Claude Code nativ nu a fost găsit. Instalează-l, apoi încearcă din nou.".into(),
+            Self::LaunchFolder=>"Alege un dosar de proiect existent.".into(),
+            Self::LaunchHistorySplit=>"Acest profil are deja propriul istoric de proiecte Claude. Mută-l sau îmbină-l în istoricul comun, apoi lansează din nou.".into(),
+            Self::LaunchFailed=>"Claude nu a putut fi pornit. Verifică dacă Claude Code este instalat, apoi încearcă din nou.".into(),
         }
     }
     /// Stable renderer catalog key; the renderer never needs the message text.
@@ -162,6 +183,11 @@ impl RuntimeError {
             Self::Import => "importExpired",
             Self::PendingReset => "pendingResetError",
             Self::CliVersion => "cliVersionError",
+            Self::LaunchUnsupported => "launchUnsupported",
+            Self::LaunchNotInstalled => "launchNotInstalled",
+            Self::LaunchFolder => "launchFolderInvalid",
+            Self::LaunchFailed => "launchFailed",
+            Self::LaunchHistorySplit => "launchHistorySplit",
         }
     }
     /// The only interpolated value: a fixed variable or settings name.
@@ -183,7 +209,7 @@ impl RuntimeError {
 }
 
 /// Every parameterless error, for mapping persisted text back to a stable code.
-const KNOWN_ERRORS: [RuntimeError; 17] = [
+const KNOWN_ERRORS: [RuntimeError; 22] = [
     RuntimeError::Storage,
     RuntimeError::UnavailableStorage,
     RuntimeError::UnsupportedContext,
@@ -201,6 +227,11 @@ const KNOWN_ERRORS: [RuntimeError; 17] = [
     RuntimeError::Import,
     RuntimeError::PendingReset,
     RuntimeError::CliVersion,
+    RuntimeError::LaunchUnsupported,
+    RuntimeError::LaunchNotInstalled,
+    RuntimeError::LaunchFolder,
+    RuntimeError::LaunchFailed,
+    RuntimeError::LaunchHistorySplit,
 ];
 /// Texts persisted by earlier releases, before codes replaced them.
 const LEGACY_ERROR_TEXT: [(&str, &str); 14] = [
@@ -370,6 +401,12 @@ struct Engine {
     pending_login: Option<PendingLogin>,
     pending_login_target: Option<LoginTarget>,
     login_intent: Arc<AtomicU64>,
+    /// Dedicated launch profiles and the process launcher; `None` where launching is
+    /// unavailable (demo, read-only, unsupported platform).
+    launch: Option<LaunchConfig>,
+    profile_login: Option<ProfileLogin>,
+    pending_launch: Option<PendingLaunch>,
+    profile_intent: Arc<AtomicU64>,
     preview: Option<Preview>,
     revision: u64,
     error: Option<ErrorView>,
@@ -383,6 +420,20 @@ struct Engine {
     last_exhausted_notice: Option<i64>,
     last_full_at: Option<i64>,
     notifications: broadcast::Sender<Notification>,
+}
+struct LaunchConfig {
+    profiles_dir: PathBuf,
+    launcher: Arc<dyn ClaudeLauncher>,
+}
+struct ProfileLogin {
+    login: PendingLogin,
+    target: LoginTarget,
+}
+/// The folder chosen in the native dialog, held in Rust while the profile is authorized.
+struct PendingLaunch {
+    account_id: String,
+    model: LaunchModel,
+    folder: PathBuf,
 }
 struct LoginTarget {
     id: String,
@@ -413,6 +464,8 @@ struct Inner {
     account_refresh_generation: RwLock<BTreeMap<String, u64>>,
     login_intent: Arc<AtomicU64>,
     login_id: RwLock<Option<String>>,
+    profile_intent: Arc<AtomicU64>,
+    profile_login_id: RwLock<Option<String>>,
     scheduler_started: AtomicBool,
     claude_wake: Arc<Notify>,
 }
@@ -436,11 +489,17 @@ enum Command {
     Preview(PathBuf),
     ApplyPreview(String),
     Tick(bool),
+    LaunchPrecheck(String),
+    Launch(String, LaunchModel, PathBuf),
+    BeginProfileLogin(u64, String),
+    FinishProfileLogin(String, String, u64),
+    CancelProfileLogin(String),
 }
 enum Output {
     Snapshot(Box<Snapshot>),
     Login(LoginSession),
     Preview(ImportPreview),
+    Launch(LaunchOutcome),
 }
 
 impl RuntimeHandle {
@@ -449,6 +508,7 @@ impl RuntimeHandle {
     pub async fn open() -> Result<Self, RuntimeError> {
         let paths = CliPaths::discover()?;
         let vault_directory = app_data_dir()?;
+        let profiles_directory = vault_directory.join("claude-profiles");
         let vault = tokio::task::spawn_blocking(move || Vault::open(vault_directory))
             .await
             .map_err(|_| RuntimeError::UnavailableStorage)??;
@@ -462,6 +522,11 @@ impl RuntimeHandle {
             Arc::new(SystemClock),
             true,
         )?;
+        // Native console launching exists on Windows only; elsewhere the action stays
+        // disabled with an explanation.
+        if cfg!(windows) {
+            handle.configure_claude_launch(profiles_directory, Arc::new(SystemLauncher));
+        }
         handle.start_scheduler();
         Ok(handle)
     }
@@ -511,6 +576,7 @@ impl RuntimeHandle {
             }
         }
         let login_intent = Arc::new(AtomicU64::new(0));
+        let profile_intent = Arc::new(AtomicU64::new(0));
         let (notifications, _) = broadcast::channel(64);
         let (snapshots, _) = broadcast::channel(64);
         let codex = CodexEngine::load(&vault);
@@ -531,6 +597,10 @@ impl RuntimeHandle {
             pending_login: None,
             pending_login_target: None,
             login_intent: login_intent.clone(),
+            launch: None,
+            profile_login: None,
+            pending_launch: None,
+            profile_intent: profile_intent.clone(),
             preview: None,
             revision: 0,
             error: None,
@@ -579,6 +649,8 @@ impl RuntimeHandle {
                 account_refresh_generation: RwLock::new(BTreeMap::new()),
                 login_intent,
                 login_id: RwLock::new(None),
+                profile_intent,
+                profile_login_id: RwLock::new(None),
                 scheduler_started: AtomicBool::new(false),
                 claude_wake: Arc::new(Notify::new()),
             }),
@@ -587,6 +659,7 @@ impl RuntimeHandle {
     pub fn demo() -> Self {
         let now = chrono::Utc::now().timestamp();
         let login_intent = Arc::new(AtomicU64::new(0));
+        let profile_intent = Arc::new(AtomicU64::new(0));
         let (notifications, _) = broadcast::channel(64);
         let (snapshots, _) = broadcast::channel(64);
         let mut saved = Persisted::default();
@@ -642,6 +715,10 @@ impl RuntimeHandle {
             pending_login: None,
             pending_login_target: None,
             login_intent: login_intent.clone(),
+            launch: None,
+            profile_login: None,
+            pending_launch: None,
+            profile_intent: profile_intent.clone(),
             preview: None,
             revision: 0,
             error: None,
@@ -671,6 +748,8 @@ impl RuntimeHandle {
                 account_refresh_generation: RwLock::new(BTreeMap::new()),
                 login_intent,
                 login_id: RwLock::new(None),
+                profile_intent,
+                profile_login_id: RwLock::new(None),
                 scheduler_started: AtomicBool::new(false),
                 claude_wake: Arc::new(Notify::new()),
             }),
@@ -807,6 +886,18 @@ impl RuntimeHandle {
             command,
             Command::Settings(_) | Command::Automation(_, _) | Command::ResumeReturns
         );
+        // Dedicated-profile commands only change in-memory launch intent and that
+        // account's own profile files. They must not rewrite the global vault: its
+        // in-memory view differs from the saved file (for example identity proofs cleared
+        // at startup), and none of that is theirs to persist.
+        let profile_only = matches!(
+            command,
+            Command::LaunchPrecheck(_)
+                | Command::Launch(..)
+                | Command::BeginProfileLogin(..)
+                | Command::FinishProfileLogin(..)
+                | Command::CancelProfileLogin(_)
+        );
         // The previous outcome stays visible while busy and is replaced at the end, so
         // a persistent background failure does not flicker on every tick.
         engine.failed_account = None;
@@ -819,9 +910,19 @@ impl RuntimeHandle {
             .write()
             .unwrap_or_else(|p| p.into_inner()) =
             engine.pending_login.as_ref().map(|p| p.id.clone());
-        let result = match engine.persist() {
-            Ok(()) => result,
-            Err(e) => Err(e),
+        *self
+            .inner
+            .profile_login_id
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) =
+            engine.profile_login.as_ref().map(|p| p.login.id.clone());
+        let result = if profile_only {
+            result
+        } else {
+            match engine.persist() {
+                Ok(()) => result,
+                Err(e) => Err(e),
+            }
         };
         let now = engine.clock.now();
         engine.error = match &result {
@@ -973,6 +1074,99 @@ impl RuntimeHandle {
             self.inner.login_intent.fetch_add(1, Ordering::AcqRel);
         }
         self.snapshot_command(Command::CancelLogin(id.into())).await
+    }
+    /// Attaches the dedicated-profile launcher (production: the system launcher under the
+    /// app data directory). Without it, launching reports itself as unsupported.
+    pub fn configure_claude_launch(
+        &self,
+        profiles_dir: PathBuf,
+        launcher: Arc<dyn ClaudeLauncher>,
+    ) {
+        let mut engine = self
+            .inner
+            .owner
+            .try_lock()
+            .expect("launch is configured before the owner is shared");
+        engine.launch = Some(LaunchConfig {
+            profiles_dir,
+            launcher,
+        });
+        self.publish(&mut engine, false);
+    }
+    /// Read-only: whether this account could launch (supported, installed, not signed
+    /// out). Run before asking for a folder so a doomed launch never shows a dialog.
+    pub async fn precheck_claude_launch(&self, id: &str) -> Result<(), RuntimeError> {
+        self.snapshot_command(Command::LaunchPrecheck(id.into()))
+            .await
+            .map(|_| ())
+    }
+    /// `folder` must come from the native folder dialog. A profile that is not yet
+    /// authorized holds the choice in Rust and reports `AuthorizationRequired`.
+    pub async fn launch_claude(
+        &self,
+        id: &str,
+        model: LaunchModel,
+        folder: PathBuf,
+    ) -> Result<LaunchOutcome, RuntimeError> {
+        match self
+            .run(Command::Launch(id.into(), model, folder), None)
+            .await?
+        {
+            Output::Launch(outcome) => Ok(outcome),
+            _ => unreachable!(),
+        }
+    }
+    pub async fn begin_claude_profile_login(&self, id: &str) -> Result<LoginSession, RuntimeError> {
+        match self
+            .run(
+                Command::BeginProfileLogin(
+                    self.inner.profile_intent.fetch_add(1, Ordering::AcqRel) + 1,
+                    id.into(),
+                ),
+                None,
+            )
+            .await?
+        {
+            Output::Login(session) => Ok(session),
+            _ => unreachable!(),
+        }
+    }
+    /// Completes the dedicated authorization and, when a launch was waiting for it,
+    /// performs that launch.
+    pub async fn finish_claude_profile_login(
+        &self,
+        id: &str,
+        code: &str,
+    ) -> Result<LaunchOutcome, RuntimeError> {
+        match self
+            .run(
+                Command::FinishProfileLogin(
+                    id.into(),
+                    code.into(),
+                    self.inner.profile_intent.load(Ordering::Acquire),
+                ),
+                None,
+            )
+            .await?
+        {
+            Output::Launch(outcome) => Ok(outcome),
+            _ => unreachable!(),
+        }
+    }
+    /// Safe at any time. An empty or unknown id only drops a launch that was waiting.
+    pub async fn cancel_claude_profile_login(&self, id: &str) -> Result<Snapshot, RuntimeError> {
+        if self
+            .inner
+            .profile_login_id
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_deref()
+            == Some(id)
+        {
+            self.inner.profile_intent.fetch_add(1, Ordering::AcqRel);
+        }
+        self.snapshot_command(Command::CancelProfileLogin(id.into()))
+            .await
     }
     /// Path must come from the native backend folder picker, never frontend IPC.
     pub async fn preview_legacy_import(
@@ -1338,6 +1532,7 @@ impl Engine {
             notice: self.notice.clone(),
             demo: self.demo,
             consumption_plan: plan,
+            launch_supported: self.launch.is_some(),
         }
     }
     async fn command(&mut self, command: Command) -> Result<Option<Output>, RuntimeError> {
@@ -1360,6 +1555,8 @@ impl Engine {
             }
             Command::Delete(id) => {
                 let i = self.index(&id)?;
+                // Credentials of a dedicated profile never outlive the saved account.
+                self.forget_launch_profile(&id)?;
                 self.saved.accounts.remove(i);
                 self.saved.readings.remove(&id);
                 if self.active_id.as_deref() == Some(&id) {
@@ -1565,6 +1762,25 @@ impl Engine {
                 return self.preview_import(path).map(|p| Some(Output::Preview(p)));
             }
             Command::ApplyPreview(id) => self.apply_preview(&id)?,
+            Command::LaunchPrecheck(id) => self.precheck_launch(&id)?,
+            Command::Launch(id, model, folder) => {
+                return self
+                    .launch_profile(id, model, folder)
+                    .await
+                    .map(|outcome| Some(Output::Launch(outcome)));
+            }
+            Command::BeginProfileLogin(epoch, id) => {
+                return self
+                    .begin_profile_login(epoch, &id)
+                    .map(|session| Some(Output::Login(session)));
+            }
+            Command::FinishProfileLogin(id, code, epoch) => {
+                return self
+                    .finish_profile_login(&id, &code, epoch)
+                    .await
+                    .map(|outcome| Some(Output::Launch(outcome)));
+            }
+            Command::CancelProfileLogin(id) => self.cancel_profile_login(&id),
         }
         Ok(None)
     }

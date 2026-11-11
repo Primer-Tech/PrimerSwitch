@@ -582,4 +582,59 @@ export const en = {
   codexFallbackBannerPaused:
     'Using API key {name} (billed per token) since {time}. Automatic switching is off, so PrimerSwitch will not return by itself. Turn it on in the automation settings, or switch back yourself.',
   codexFallbackSwitchBack: 'Switch back now',
+
+  // Launching a saved Claude account in its own window, and its weekly Fable usage.
+  launchClaude: 'Launch Claude',
+  launchLabel: 'Launch Claude with {name}',
+  launchTitle: 'Launch Claude',
+  launchIntro:
+    'Start a new Claude Code session signed in as this account. Your current Claude login is not changed.',
+  launchModel: 'Model',
+  launchModelDefault: 'Default (your shared Claude settings)',
+  launchModelOpus: 'Opus',
+  launchModelSonnet: 'Sonnet',
+  launchModelFable: 'Fable',
+  launchSharing:
+    'The new window has its own sign-in. It shares your skills, project memory and history, plugins, hooks and MCP server settings. Some MCP services and web connectors may ask for their own sign-in for this account.',
+  launchQuotaHint:
+    'To keep this account’s quota for launched windows, turn off automatic switching for it in its Details.',
+  launchFolderNext: 'You choose the project folder next.',
+  launchAction: 'Launch',
+  launchWaitingFolder: 'Waiting for the folder you choose…',
+  launchNoFolder: 'No folder was chosen, so nothing was started.',
+  launchAuthorizedInfo:
+    'This account is authorized for launching. Choose Launch to start Claude.',
+  launchAuthFirstUse:
+    'The first launch for {name} needs a separate browser sign-in, independent of your current login. It can be requested again if it expires.',
+  launchAuthIdentityChanged:
+    'This launch sign-in belongs to a different Claude account or workspace. Sign in again as {name}.',
+  launchAuthExpired:
+    'The launch sign-in for {name} is no longer accepted. Sign in again to continue.',
+  launchAuthNote:
+    'Your browser opens to authorize this account. Claude then starts in the folder you chose. If the sign-in expires later, you are asked again.',
+  launchOpenBrowser: 'Open browser',
+  launchStepThree: 'Confirm to authorize and start Claude.',
+  launchAuthorizing: 'Authorizing and starting Claude…',
+  launchAuthorize: 'Authorize and launch',
+  launchBack: 'Back',
+  launchWrongLogin:
+    'That browser sign-in was for a different Claude account or workspace. Sign in as the account shown above and choose its workspace.',
+  launchNeedsSignIn: 'Sign in again before launching this account.',
+  launchNeedsVerified: 'Wait until this account’s identity is verified.',
+  launchStarted:
+    'Claude started in its own window for {name}. Your current Claude login is unchanged.',
+  launchStartedAnonymous:
+    'Claude started in its own window. Your current Claude login is unchanged.',
+  launchUnsupported:
+    'Launching Claude from PrimerSwitch is not available on this system.',
+  launchNotInstalled:
+    'Native Claude Code was not found. Install it, then try again.',
+  launchFolderInvalid: 'Choose an existing project folder.',
+  launchHistorySplit:
+    'This profile already has its own Claude project history. Move or merge it into the shared history, then launch again.',
+  launchFailed:
+    'Claude could not be started. Check that Claude Code is installed, then try again.',
+  weeklyFable: 'Weekly Fable',
+  fableUnavailable:
+    'Weekly Fable usage was not reported in the latest reading.',
 } as const;

@@ -44,6 +44,7 @@
     ondetails,
     onrefresh,
     ondelete,
+    onlaunch,
     onresume,
   }: {
     view: PageView;
@@ -77,6 +78,8 @@
     ondetails: RowAction;
     onrefresh: RowAction;
     ondelete: RowAction;
+    /** Claude only: start a saved account in its own window. */
+    onlaunch?: RowAction;
     onresume: () => void;
   } = $props();
 </script>
@@ -131,6 +134,7 @@
             {ondetails}
             {onrefresh}
             {ondelete}
+            {onlaunch}
           />{:else if view.loaded}<div class="panel empty-accounts">
             <span class="empty-account-icon" aria-hidden="true"
               ><Icon name="accounts" size={22} /></span

@@ -283,6 +283,14 @@ impl UsageResponse {
                     || name.contains(&needle))
         })
     }
+    /// The provider's own weekly row for the Fable model, independent of which model is
+    /// selected. Only a reported scoped weekly limit counts: a missing row is unknown
+    /// (`None`), never zero and never the account-wide or another model's value.
+    pub fn fable_limit(&self) -> Option<&UsageLimit> {
+        self.scoped_weekly_limits().into_iter().find(|l| {
+            l.label().to_lowercase().contains("fable") || l.kind.to_lowercase().contains("fable")
+        })
+    }
     pub fn weekly_utilization_for_model(&self, model: Option<&str>) -> f64 {
         self.scoped_limit(model)
             .map_or(self.weekly_utilization(), |l| {

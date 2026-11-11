@@ -2,6 +2,7 @@
 import { t, type Language } from './i18n';
 import { planLabel } from './format';
 import { codeMessage } from './controller';
+import { launchBlock, launchBlockText, needsSignIn } from './claude-launch';
 import {
   defaultAutomation,
   providerThreshold,
@@ -78,12 +79,24 @@ function row(
   model: string | null,
   { locale, now, switchingId = null }: ClaudeViewOptions,
   threshold: number,
+  launchContext: Pick<Snapshot, 'demo' | 'launchSupported'>,
 ): AccountRowView {
   const usage = account.usage;
-  const signIn =
-    !!account.signInRequired ||
-    (account.active && account.error === 'activeSessionExpired');
+  const signIn = needsSignIn(account);
   const limit = limitOf(account);
+  const launch = launchBlock(launchContext, account);
+  // The provider's own weekly Fable row, whatever model is active. Unknown stays
+  // unknown: no value and no reset, never zero or another window's reading.
+  const fable = usage?.fable ?? null;
+  const scoped = usage?.scopedLimits ?? [];
+  const fableListed =
+    !fable ||
+    scoped.some(
+      (entry) =>
+        entry.label === fable.label &&
+        entry.percent === fable.percent &&
+        entry.resetsAt === fable.resetsAt,
+    );
   const kind: StatusKind = signIn
     ? 'signIn'
     : account.active
@@ -170,7 +183,8 @@ function row(
       null,
       bindingModel,
     ),
-    extras: (usage?.scopedLimits ?? []).map((limit) =>
+    // Every scoped limit stays in the details, Fable's included (listed once).
+    extras: (fableListed ? scoped : [...scoped, fable!]).map((limit) =>
       meter(
         `scoped:${limit.label}`,
         `${weekly} · ${limit.label}`,
@@ -178,6 +192,13 @@ function row(
         limit.resetsAt,
         'violet',
       ),
+    ),
+    fable: meter(
+      'fable',
+      `${weekly} · ${fable?.label ?? t(locale, 'launchModelFable')}`,
+      fable?.percent ?? null,
+      fable?.resetsAt ?? null,
+      'violet',
     ),
     status: statusView(
       {
@@ -224,6 +245,9 @@ function row(
         ? null
         : t(locale, account.error ? 'switchUnverified' : 'switchChecking'),
     canSignIn: signIn,
+    // Unlike a switch, the account in use can be launched too.
+    canLaunch: launch === null,
+    launchReason: launch ? launchBlockText(launch, locale) : null,
     canRefresh: true,
     // Same rule as Codex: switch away before removing the account in use.
     canDelete: !account.active,
@@ -267,6 +291,7 @@ export function claudeView(
       snapshot.activeModel,
       options,
       providerThreshold(settings, 'claude'),
+      snapshot,
     ),
   );
   const recommendations = reconcileRecommendations(

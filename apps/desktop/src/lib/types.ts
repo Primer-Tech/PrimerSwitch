@@ -93,6 +93,15 @@ export const accountSchema = z
             .object({ label: z.string(), percent, resetsAt: timestamp })
             .strict(),
         ),
+        /**
+         * The provider's own weekly Fable row, whatever model is selected. Missing
+         * or null means unknown: never zero, and never another window's value.
+         */
+        fable: z
+          .object({ label: z.string(), percent, resetsAt: timestamp })
+          .strict()
+          .nullable()
+          .optional(),
       })
       .strict()
       .nullable(),
@@ -135,6 +144,8 @@ export const snapshotSchema = z
     demo: z.boolean(),
     consumptionPlan: z.array(z.string()).optional(),
     returnHoldUntil: timestamp.optional(),
+    /** Launching a saved account in its own Claude window exists in this build. */
+    launchSupported: z.boolean().optional(),
   })
   .strict();
 export type Snapshot = z.infer<typeof snapshotSchema>;
@@ -161,6 +172,30 @@ export const defaults: Settings = {
 export const loginSchema = z
   .object({ id: z.string().min(1), url: z.string().url() })
   .strict();
+/** Models a launched Claude window can start with; `default` keeps shared settings. */
+export const launchModelSchema = z.enum(['default', 'opus', 'sonnet', 'fable']);
+export type LaunchModel = z.infer<typeof launchModelSchema>;
+export const launchModels: readonly LaunchModel[] = launchModelSchema.options;
+/** Why a launch profile must be authorized (again) before it can start. */
+export const profileAuthReasonSchema = z.enum([
+  'firstUse',
+  'identityChanged',
+  'expired',
+]);
+export type ProfileAuthReason = z.infer<typeof profileAuthReasonSchema>;
+/** Result of a launch or of finishing a launch authorization. */
+export const launchOutcomeSchema = z.discriminatedUnion('status', [
+  z.object({ status: z.literal('launched') }).strict(),
+  z.object({ status: z.literal('authorized') }).strict(),
+  z.object({ status: z.literal('cancelled') }).strict(),
+  z
+    .object({
+      status: z.literal('authorizationRequired'),
+      reason: profileAuthReasonSchema,
+    })
+    .strict(),
+]);
+export type LaunchOutcome = z.infer<typeof launchOutcomeSchema>;
 export const previewSchema = z
   .object({
     id: z.string().min(1),

@@ -17,6 +17,7 @@
     ondetails,
     onrefresh,
     ondelete,
+    onlaunch,
   }: {
     rows: AccountRowView[];
     now: number;
@@ -29,8 +30,12 @@
     ondetails: RowAction;
     onrefresh: RowAction;
     ondelete: RowAction;
+    /** Claude only: start the account in its own window. Absent: no such action. */
+    onlaunch?: RowAction;
   } = $props();
   const uid = $props.id();
+  // Claude rows carry a weekly Fable window; the Codex table has no such column.
+  let showFable = $derived(rows.some((row) => !!row.fable));
   let menuId = $state<string | null>(null);
   let triggers: Record<string, HTMLButtonElement | null> = $state({});
   function closeMenu(focusTrigger: boolean) {
@@ -70,15 +75,15 @@
 </script>
 
 <svelte:window onkeydown={keydown} onpointerdown={pointerdown} />
-<div class="table-wrap">
-  <table class="account-table">
+<div class="table-wrap" class:with-fable={showFable}>
+  <table class="account-table" class:with-fable={showFable}>
     <thead
       ><tr
         ><th scope="col">{t($language, 'account')}</th><th scope="col"
           >{t($language, 'fiveHourWindow')}</th
-        ><th scope="col">{t($language, 'weekly')}</th><th scope="col"
-          >{t($language, 'status')}</th
-        ><th scope="col"
+        ><th scope="col">{t($language, 'weekly')}</th>{#if showFable}<th
+            scope="col">{t($language, 'weeklyFable')}</th
+          >{/if}<th scope="col">{t($language, 'status')}</th><th scope="col"
           ><span class="sr-only">{t($language, 'actions')}</span></th
         ></tr
       ></thead
@@ -118,7 +123,14 @@
               {now}
               threshold={row.effectiveThreshold}
             /></td
-          ><td class="cell-status"
+          >{#if showFable}<td class="cell-meter cell-fable"
+              >{#if row.fable}<QuotaBar
+                  compact
+                  meter={row.fable}
+                  {now}
+                  threshold={row.effectiveThreshold}
+                />{/if}</td
+            >{/if}<td class="cell-status"
             ><StatusLabel status={row.status} id={status} />
             <span class="automation-meta"
               >{t(
@@ -159,6 +171,21 @@
                     >{row.switching
                       ? t($language, 'switching')
                       : t($language, 'switch')}</button
+                  ></span
+                >{/if}{#if onlaunch}<span
+                  class="switch-wrap"
+                  title={row.launchReason ??
+                    (locked
+                      ? (lockReason ?? undefined)
+                      : t($language, 'launchClaude'))}
+                  ><button
+                    class="icon-button launch-button"
+                    disabled={locked || !row.canLaunch}
+                    aria-label={t($language, 'launchLabel', {
+                      name: row.name,
+                    })}
+                    onclick={(event) => onlaunch(row, event.currentTarget)}
+                    ><Icon name="terminal" size={16} /></button
                   ></span
                 >{/if}
               <div
@@ -332,6 +359,111 @@
     border-color: color-mix(in srgb, var(--danger) 45%, var(--line));
     background: color-mix(in srgb, var(--danger) 8%, var(--surface));
   }
+  .launch-button {
+    width: 30px;
+    min-width: 30px;
+    min-height: 30px;
+  }
+  .launch-button:not(:disabled) {
+    color: var(--accent);
+  }
+  /* Claude: one more weekly column, so the others give up some room. */
+  .account-table.with-fable th:first-child {
+    width: 22%;
+  }
+  .account-table.with-fable th:nth-child(2),
+  .account-table.with-fable th:nth-child(3),
+  .account-table.with-fable th:nth-child(4),
+  .account-table.with-fable th:nth-child(5) {
+    width: 13.5%;
+  }
+  .account-table.with-fable th:last-child {
+    width: 24%;
+  }
+  .account-table.with-fable .switch-button {
+    min-width: 60px;
+    padding: 5px 8px;
+  }
+  /* Six columns need room. The table measures itself (no script involved): when
+     it is narrow, whatever the window size, its rows stack as cards, like the
+     narrow-window rules below. Only the Claude table is a container. */
+  .table-wrap.with-fable {
+    container-type: inline-size;
+  }
+  @container (min-width: 600px) {
+    @media (min-width: 721px) {
+      .account-table.with-fable .cell-meter {
+        padding-right: 10px !important;
+      }
+    }
+  }
+  @container (max-width: 599px) {
+    .account-table.with-fable,
+    .account-table.with-fable tbody {
+      display: block;
+      min-width: 0;
+    }
+    .account-table.with-fable thead {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      overflow: hidden;
+      clip-path: inset(50%);
+      white-space: nowrap;
+    }
+    .account-table.with-fable tr {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      grid-template-areas:
+        'account account actions'
+        'short long fable'
+        'status status status';
+      column-gap: 14px;
+      row-gap: 10px;
+      padding: 12px;
+      border-top: 1px solid var(--line);
+    }
+    .account-table.with-fable tbody tr:first-child {
+      border-top: 0;
+    }
+    .account-table.with-fable td {
+      display: block;
+      border: 0;
+      padding: 0 !important;
+      min-width: 0;
+    }
+    .account-table.with-fable .cell-account {
+      grid-area: account;
+    }
+    .account-table.with-fable .cell-meter :global(.quota-name) {
+      display: block;
+    }
+    .account-table.with-fable .cell-meter:nth-child(2) {
+      grid-area: short;
+    }
+    .account-table.with-fable .cell-meter:nth-child(3) {
+      grid-area: long;
+    }
+    .account-table.with-fable .cell-fable {
+      grid-area: fable;
+    }
+    .account-table.with-fable .cell-status {
+      grid-area: status;
+    }
+    .account-table.with-fable .cell-actions {
+      grid-area: actions;
+      align-self: center;
+    }
+    .account-table.with-fable tr.current-row td:first-child {
+      box-shadow: none;
+    }
+    .account-table.with-fable tr.current-row {
+      box-shadow: inset 3px 0 0 var(--accent);
+    }
+    .account-table.with-fable .table-identity .avatar {
+      display: flex;
+    }
+  }
   .row-menu {
     position: relative;
   }
@@ -431,6 +563,15 @@
     }
     .cell-meter:nth-child(3) {
       grid-area: long;
+    }
+    .account-table.with-fable tr {
+      grid-template-areas:
+        'account account actions'
+        'short long fable'
+        'status status status';
+    }
+    .cell-fable {
+      grid-area: fable;
     }
     .cell-status {
       grid-area: status;

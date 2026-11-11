@@ -10,3 +10,5 @@ pub use views::*;
 
 pub use codex_engine::CodexLoginLaunch;
 pub use codex_views::*;
+/// The fixed model choices of a launch; the renderer can name nothing else.
+pub use switcher_platform::LaunchModel;

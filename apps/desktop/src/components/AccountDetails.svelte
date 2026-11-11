@@ -22,6 +22,7 @@
     onsignin,
     ondelete,
     onautomation,
+    onlaunch,
     automationSupported = true,
     automationError = null,
   }: {
@@ -40,6 +41,8 @@
     onautomation: (
       automation: AccountAutomation,
     ) => Promise<AccountAutomation | null>;
+    /** Claude only: start the account in its own window. Absent: no such action. */
+    onlaunch?: (trigger: HTMLElement) => void;
     automationSupported?: boolean;
     automationError?: string | null;
   } = $props();
@@ -65,6 +68,12 @@
       {now}
       {threshold}
     />{/if}
+  {#if row.fable && row.fable.value === null && !row.apiKey}<p
+      class="note"
+      id={`${uid}-fable`}
+    >
+      {t($language, 'fableUnavailable')}
+    </p>{/if}
   {#each row.notes as note, index (index)}<p
       class="note"
       class:warning-text={note.tone === 'warn'}
@@ -115,6 +124,21 @@
       ><Icon name="trash" size={15} />{t($language, 'deleteAccount')}</button
     >
     <div class="primary-actions">
+      {#if onlaunch}<span
+          class="switch-wrap"
+          title={row.launchReason ??
+            (locked ? (lockReason ?? undefined) : undefined)}
+          ><button
+            disabled={locked || !row.canLaunch}
+            aria-label={t($language, 'launchLabel', { name: row.name })}
+            aria-describedby={row.launchReason ? `${uid}-launch` : undefined}
+            onclick={(event) => onlaunch(event.currentTarget)}
+            ><Icon name="terminal" size={15} />{t(
+              $language,
+              'launchClaude',
+            )}</button
+          ></span
+        >{/if}
       {#if row.canRefresh}<button
           disabled={locked}
           title={locked ? (lockReason ?? undefined) : undefined}
@@ -148,6 +172,9 @@
       id={`${uid}-switch`}
     >
       {row.switchReason}
+    </p>{/if}
+  {#if onlaunch && row.launchReason}<p class="help reason" id={`${uid}-launch`}>
+      {row.launchReason}
     </p>{/if}
   {#if row.deleteReason}<p class="help reason" id={`${uid}-delete`}>
       {row.deleteReason}

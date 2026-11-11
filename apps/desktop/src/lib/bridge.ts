@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import type { AccountAutomation, Settings } from './types';
+import type { AccountAutomation, LaunchModel, Settings } from './types';
 import { t } from './i18n';
 
 export interface CommandArgs {
@@ -17,6 +17,12 @@ export interface CommandArgs {
   begin_login: { accountId?: string | null } | undefined;
   finish_login: { id: string; code: string };
   cancel_login: { id: string };
+  /** The native side picks the folder and starts the process; no path is sent. */
+  claude_launch: { id: string; model: LaunchModel };
+  begin_claude_profile_login: { accountId: string };
+  finish_claude_profile_login: { id: string; code: string };
+  /** An empty id drops a launch that waits for authorization without a session. */
+  cancel_claude_profile_login: { id: string };
   preview_legacy_import: undefined;
   apply_legacy_import: { previewId: string };
 }
@@ -39,6 +45,10 @@ const commands: readonly Command[] = [
   'begin_login',
   'finish_login',
   'cancel_login',
+  'claude_launch',
+  'begin_claude_profile_login',
+  'finish_claude_profile_login',
+  'cancel_claude_profile_login',
   'preview_legacy_import',
   'apply_legacy_import',
 ];

@@ -211,6 +211,67 @@ describe('Claude resets view-model', () => {
     expect(view.lastOutcome).toBe('reset response unconfirmed — retry pending');
   });
 
+  it('works out what the one button does: which kinds, retry, and why it is off', () => {
+    const blocked = (
+      kind: ResetOffer['kind'],
+      reason: ResetOffer['unavailableReason'],
+    ) => offer({ kind, usableNow: false, unavailableReason: reason });
+    const several = resetsView(
+      withOffers([
+        blocked('session', 'needsLimit'),
+        offer({ kind: 'fable' }),
+        offer({ kind: 'full', earlyUse: { percentLeft: 35 } }),
+      ]),
+      now,
+      'en',
+    );
+    expect(several.usable.map((r) => r.kind)).toEqual(['fable', 'full']);
+    expect(several.retry).toBe(false);
+    expect(several.sharedReason).toBeNull();
+    // Only the kind that repeats an unconfirmed request is usable: the button retries.
+    const pending = resetsView(
+      withOffers(
+        [offer({ kind: 'weekly' }), blocked('fable', 'pendingClaim')],
+        { pending: true },
+      ),
+      now,
+      'en',
+    );
+    expect(pending.usable.map((r) => r.kind)).toEqual(['weekly']);
+    expect(pending.retry).toBe(true);
+    // Without a pending request a single usable kind is an ordinary use.
+    expect(
+      resetsView(withOffers([offer({ kind: 'weekly' })]), now, 'en').retry,
+    ).toBe(false);
+    // Nothing usable: the one reason all kinds share, or none when they differ.
+    const same = resetsView(
+      withOffers([
+        blocked('session', 'needsLimit'),
+        blocked('fable', 'needsLimit'),
+      ]),
+      now,
+      'en',
+    );
+    expect(same.usable).toEqual([]);
+    expect(same.sharedReason).toBe('Usable once you reach a limit it refills.');
+    const differ = resetsView(
+      withOffers([
+        blocked('session', 'needsLimit'),
+        blocked('fable', 'cannotClear'),
+      ]),
+      now,
+      'en',
+    );
+    expect(differ.usable).toEqual([]);
+    expect(differ.sharedReason).toBeNull();
+    const none = resetsView(withOffers([]), now, 'en');
+    expect(none.usable).toEqual([]);
+    expect(none.sharedReason).toBeNull();
+    expect(none.retry).toBe(false);
+    // A usable kind leaves no reason to give.
+    expect(several.sharedReason).toBeNull();
+  });
+
   it('is fully localized in Romanian with comma-below letters', () => {
     const view = resetsView(
       withOffers([

@@ -76,6 +76,15 @@ export interface ResetsView {
   cooldownUntil: number | null;
   /** The runtime's own words for the last attempt. */
   lastOutcome: string | null;
+  /** The rows that can be used now, in display order. */
+  usable: ResetRowView[];
+  /** The one usable kind repeats an unconfirmed request. */
+  retry: boolean;
+  /**
+   * While nothing can be used: the reason every kind gives, when it is the same one;
+   * null when the reasons differ or there is no kind at all.
+   */
+  sharedReason: string | null;
 }
 
 function reasonText(
@@ -142,13 +151,22 @@ export function resetsView(
   now: number,
   locale: Language,
 ): ResetsView {
+  const rows = account.resets.offers.map((offer) =>
+    row(offer, account, now, locale),
+  );
+  const usable = rows.filter((r) => r.canUse);
+  const reasons = new Set(rows.map((r) => r.reason));
   return {
-    rows: account.resets.offers.map((offer) =>
-      row(offer, account, now, locale),
-    ),
+    rows,
     total: account.resets.available,
     pending: account.resets.pending,
     cooldownUntil: account.resets.cooldownUntil,
     lastOutcome: account.resets.lastOutcome,
+    usable,
+    retry: usable.length === 1 && usable[0].retry,
+    sharedReason:
+      usable.length === 0 && rows.length > 0 && reasons.size === 1
+        ? rows[0].reason
+        : null,
   };
 }

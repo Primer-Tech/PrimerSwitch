@@ -29,27 +29,29 @@ demo.accounts[0].planTier = 'default_claude_max_5x';
 demo.accounts[0].organizationType = 'claude_team';
 demo.accounts[1].planTier = 'default_claude_max_5x';
 demo.accounts[1].organizationType = 'claude_max';
-// Banked resets by kind, for the Claude preview: usable, early and blocked ones.
+// Banked resets by kind, for the Claude preview. The three accounts show the three
+// states of the one Use reset button: a choice between two usable kinds (Fable at a
+// limit, Full as an early use), exactly one usable kind, and none.
 const dayFromNow = (days: number) =>
   Math.floor(Date.now() / 1000) + days * 86400;
 demo.accounts[0].resets.offers = [
   {
-    kind: 'weekly',
+    kind: 'fable',
+    resetsLeft: 2,
+    resetsTotal: 3,
+    endsAt: dayFromNow(4),
+    usableNow: true,
+    unavailableReason: null,
+    earlyUse: null,
+  },
+  {
+    kind: 'full',
     resetsLeft: 1,
     resetsTotal: 1,
     endsAt: dayFromNow(6),
     usableNow: true,
     unavailableReason: null,
     earlyUse: { percentLeft: 42 },
-  },
-  {
-    kind: 'fable',
-    resetsLeft: 2,
-    resetsTotal: 3,
-    endsAt: dayFromNow(4),
-    usableNow: false,
-    unavailableReason: 'needsLimit',
-    earlyUse: null,
   },
 ];
 demo.accounts[1].resets.offers = [
@@ -72,7 +74,23 @@ demo.accounts[1].resets.offers = [
     earlyUse: null,
   },
 ];
+demo.accounts[2].resets.offers = [
+  {
+    kind: 'weekly',
+    resetsLeft: 1,
+    resetsTotal: 1,
+    endsAt: dayFromNow(5),
+    usableNow: false,
+    unavailableReason: 'needsLimit',
+    earlyUse: null,
+  },
+];
 demo.consumptionPlan = ['b', 'research', 'a'];
+// A demo disables every action. ?dialogs=1 lets the Use reset button open its
+// dialogs for a visual check; the preview bridge below still answers every command
+// except get_snapshot with an error, so nothing is ever sent or changed.
+if (new URLSearchParams(location.search).get('dialogs') === '1')
+  demo.demo = false;
 
 demo.settings.language =
   new URLSearchParams(location.search).get('lang') === 'ro' ? 'ro' : 'en';

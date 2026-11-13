@@ -7,7 +7,7 @@
     account,
     now,
     locked,
-    working = null,
+    working = false,
     heading = null,
     onuse,
   }: {
@@ -15,15 +15,28 @@
     now: number;
     /** A command is running, or the view is a demo: nothing can be started. */
     locked: boolean;
-    /** The kind whose request is running for this account. */
-    working?: ResetKind | null;
+    /** A request to use a reset on this account is running. */
+    working?: boolean;
     /** A section title for the details; the side card brings its own. */
     heading?: string | null;
-    /** Asks to use a kind; the page confirms it with the user first. */
-    onuse: (kind: ResetKind, trigger: HTMLElement) => void;
+    /**
+     * Asks to use a reset. It passes the kinds that can be used now; the page asks which
+     * one when there are several, and confirms it with the user first.
+     */
+    onuse: (kinds: ResetKind[], trigger: HTMLElement) => void;
   } = $props();
   const uid = $props.id();
   let resets = $derived(resetsView(account, now, $language));
+  // While nothing can be used the button points at the reason it is disabled.
+  let describedBy = $derived(
+    resets.usable.length
+      ? undefined
+      : resets.rows.length === 0
+        ? `${uid}-none`
+        : resets.sharedReason
+          ? `${uid}-${resets.rows[0].kind}`
+          : `${uid}-generic`,
+  );
 </script>
 
 <section
@@ -37,38 +50,40 @@
     <ul class="reset-rows" aria-label={t($language, 'availableResets')}>
       {#each resets.rows as row (row.kind)}
         <li>
-          <div class="reset-text">
-            <p class="reset-name">
-              <span>{row.label}</span><span class="reset-left">{row.left}</span>
-            </p>
-            <p class="help reset-meta">{row.effect} · {row.useBy}</p>
-            {#if row.reason}<p
-                class="help reset-reason"
-                id={`${uid}-${row.kind}`}
-              >
-                {row.reason}
-              </p>{/if}
-          </div>
-          <button
-            class="primary"
-            disabled={locked || !row.canUse}
-            aria-label={t(
-              $language,
-              row.retry ? 'resetRetryLabel' : 'resetUseLabel',
-              { kind: row.label, name: account.name },
-            )}
-            aria-describedby={row.reason ? `${uid}-${row.kind}` : undefined}
-            onclick={(event) => onuse(row.kind, event.currentTarget)}
-            >{working === row.kind
-              ? t($language, 'resetUsing')
-              : t($language, row.retry ? 'resetRetry' : 'resetUse')}</button
-          >
+          <p class="reset-name">
+            <span>{row.label}</span><span class="reset-left">{row.left}</span>
+          </p>
+          <p class="help reset-meta">{row.effect} · {row.useBy}</p>
+          {#if row.reason}<p
+              class="help reset-reason"
+              id={`${uid}-${row.kind}`}
+            >
+              {row.reason}
+            </p>{/if}
         </li>
       {/each}
     </ul>
   {:else}
-    <p class="help">{t($language, 'resetsNone')}</p>
+    <p class="help" id={`${uid}-none`}>{t($language, 'resetsNone')}</p>
   {/if}
+  {#if describedBy === `${uid}-generic`}<p class="help" id={describedBy}>
+      {t($language, 'resetNoneUsable')}
+    </p>{/if}
+  <button
+    class="primary reset-use"
+    disabled={locked || working || !resets.usable.length}
+    aria-describedby={describedBy}
+    onclick={(event) => {
+      if (locked || working || !resets.usable.length) return;
+      onuse(
+        resets.usable.map((row) => row.kind),
+        event.currentTarget,
+      );
+    }}
+    >{working
+      ? t($language, 'resetUsing')
+      : t($language, resets.retry ? 'resetRetry' : 'resetUse')}</button
+  >
   {#if account.decisionFresh === false && resets.rows.length}<p class="help">
       {t($language, 'resetsCached')}
     </p>{/if}
@@ -95,15 +110,6 @@
     margin: 10px 0 0;
     padding: 0;
   }
-  .reset-rows li {
-    display: flex;
-    justify-content: space-between;
-    align-items: flex-start;
-    gap: 12px;
-  }
-  .reset-text {
-    min-width: 0;
-  }
   .reset-name {
     display: flex;
     flex-wrap: wrap;
@@ -121,8 +127,8 @@
     margin: 2px 0 0;
     overflow-wrap: anywhere;
   }
-  .reset-rows button {
-    flex: none;
-    font-size: 0.75rem;
+  .reset-use {
+    margin-top: 14px;
+    font-size: 0.78rem;
   }
 </style>

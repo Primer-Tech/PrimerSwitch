@@ -25,6 +25,7 @@
   import ClaudeLaunch from './ClaudeLaunch.svelte';
   import ClaudeResets from './ClaudeResets.svelte';
   import ClaudeResetConfirm from './ClaudeResetConfirm.svelte';
+  import ClaudeResetChoice from './ClaudeResetChoice.svelte';
   import { launchNoticeView } from '../lib/claude-launch';
   let {
     controller,
@@ -61,8 +62,13 @@
     t($language, snapshot?.demo ? 'demoOnly' : 'switchBusy'),
   );
   let loginCode = $state('');
-  /** The reset the user asked to use and has not confirmed yet. */
-  let resetRequest = $state<{ id: string; kind: ResetKind } | null>(null);
+  /**
+   * The reset the user asked to use and has not confirmed yet. With one usable kind the
+   * kind is known; with several it stays null until the chooser has an answer.
+   */
+  let resetRequest = $state<{ id: string; kind: ResetKind | null } | null>(
+    null,
+  );
   /** The reset whose request is running. */
   let resetting = $state<{ id: string; kind: ResetKind } | null>(null);
   let resetFocus = $state<HTMLElement | null>(null);
@@ -77,19 +83,28 @@
   );
   const raw = (id: string | undefined): AccountView | null =>
     snapshot?.accounts.find((account) => account.id === id) ?? null;
+  let resetRows = $derived(
+    view.rows.find((r) => r.id === resetRequest?.id)?.resets?.rows ?? [],
+  );
   let confirmRow = $derived(
-    resetRequest
-      ? (view.rows
-          .find((r) => r.id === resetRequest!.id)
-          ?.resets?.rows.find((r) => r.kind === resetRequest!.kind) ?? null)
+    resetRequest?.kind
+      ? (resetRows.find((r) => r.kind === resetRequest!.kind) ?? null)
       : null,
+  );
+  let choiceRows = $derived(
+    resetRequest && !resetRequest.kind ? resetRows.filter((r) => r.canUse) : [],
   );
   let confirmName = $derived(
     view.rows.find((r) => r.id === resetRequest?.id)?.name ?? '',
   );
   // A reset that is no longer offered closes its own question.
   $effect(() => {
-    if (resetRequest && !confirmRow && !resetting) resetRequest = null;
+    if (
+      resetRequest &&
+      !(resetRequest.kind ? confirmRow : choiceRows.length) &&
+      !resetting
+    )
+      resetRequest = null;
   });
   // A background error repeats on every tick while it lasts: once dismissed it stays
   // hidden until it clears or a different one appears. Notices are per occurrence.
@@ -155,21 +170,21 @@
     returnFocus = trigger;
     controller.openLaunch(row.id);
   }
-  // Using a reset spends a scarce, one-off credit: it is always confirmed first.
-  function askReset(id: string, kind: ResetKind, trigger: HTMLElement) {
+  // Using a reset spends a scarce, one-off credit: it is always confirmed first. One
+  // usable kind goes straight to its question; several are chosen from, with no default.
+  function askReset(id: string, kinds: ResetKind[], trigger: HTMLElement) {
+    if (!kinds.length) return;
     resetFocus = trigger;
-    resetRequest = { id, kind };
+    resetRequest = { id, kind: kinds.length === 1 ? kinds[0] : null };
   }
-  async function confirmReset() {
+  async function confirmReset(kind: ResetKind) {
     const request = resetRequest;
-    const row = confirmRow;
+    // The early-use confirmation comes from the offer as it is now, never from an
+    // earlier view of it.
+    const row = resetRows.find((r) => r.kind === kind);
     if (!request || !row || resetting) return;
-    resetting = request;
-    const done = await controller.useReset(
-      request.id,
-      request.kind,
-      !!row.early,
-    );
+    resetting = { id: request.id, kind };
+    const done = await controller.useReset(request.id, kind, !!row.early);
     resetting = null;
     if (done) resetRequest = null;
   }
@@ -401,8 +416,8 @@
           account={activeRaw}
           {now}
           {locked}
-          working={resetting?.id === activeRaw.id ? resetting.kind : null}
-          onuse={(kind, trigger) => askReset(activeRaw.id, kind, trigger)}
+          working={resetting?.id === activeRaw.id}
+          onuse={(kinds, trigger) => askReset(activeRaw.id, kinds, trigger)}
         />{/if}
       <div class="renewal-summary">
         <Icon name="calendar" />
@@ -512,8 +527,8 @@
             {now}
             {locked}
             heading={`${t($language, 'availableResets')}${account.resets.available === null ? '' : ` · ${account.resets.available}`}`}
-            working={resetting?.id === account.id ? resetting.kind : null}
-            onuse={(kind, trigger) => askReset(account.id, kind, trigger)}
+            working={resetting?.id === account.id}
+            onuse={(kinds, trigger) => askReset(account.id, kinds, trigger)}
           />
         {/if}
       {/snippet}
@@ -527,7 +542,16 @@
     disabled={locked}
     error={$controller.error ? safeError($controller.error, $language) : null}
     returnFocus={resetFocus}
-    onconfirm={() => void confirmReset()}
+    onconfirm={() => void confirmReset(confirmRow.kind)}
+    oncancel={() => (resetRequest = null)}
+  />{:else if resetRequest && choiceRows.length}<ClaudeResetChoice
+    name={confirmName}
+    rows={choiceRows}
+    working={!!resetting}
+    disabled={locked}
+    error={$controller.error ? safeError($controller.error, $language) : null}
+    returnFocus={resetFocus}
+    onconfirm={(kind) => void confirmReset(kind)}
     oncancel={() => (resetRequest = null)}
   />{/if}
 

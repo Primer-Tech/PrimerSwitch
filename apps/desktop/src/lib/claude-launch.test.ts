@@ -292,6 +292,29 @@ describe('launch and Fable schemas', () => {
     expect(old.launchSupported).toBeUndefined();
     expect(old.accounts[0].usage?.fable).toBeUndefined();
   });
+  it('accepts the plan type fields, older snapshots without them, and nothing odd', () => {
+    const fresh = snapshot();
+    fresh.accounts[0].organizationType = 'claude_team';
+    fresh.accounts[0].seatTier = 'team_tier_1';
+    const parsed = snapshotSchema.parse(fresh);
+    expect(parsed.accounts[0].organizationType).toBe('claude_team');
+    expect(parsed.accounts[0].seatTier).toBe('team_tier_1');
+    expect(parsed.accounts[1].organizationType).toBeNull();
+    const old = snapshot();
+    delete old.accounts[0].organizationType;
+    delete old.accounts[0].seatTier;
+    expect(
+      snapshotSchema.parse(old).accounts[0].organizationType,
+    ).toBeUndefined();
+    for (const field of ['organizationType', 'seatTier']) {
+      const odd = snapshot();
+      Object.assign(odd.accounts[0], { [field]: 5 });
+      expect(snapshotSchema.safeParse(odd).success).toBe(false);
+    }
+    const extra = snapshot();
+    Object.assign(extra.accounts[0], { organizationName: 'never-display' });
+    expect(snapshotSchema.safeParse(extra).success).toBe(false);
+  });
   it('rejects malformed or credential-bearing launch data', () => {
     const odd = snapshot();
     odd.accounts[0].usage!.fable = {

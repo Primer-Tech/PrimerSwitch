@@ -507,6 +507,11 @@ pub struct Profile {
     pub subscription_status: Option<String>,
     pub subscription_started_at: Option<i64>,
     pub plan_tier: Option<String>,
+    /// `organization.organization_type` and `organization.seat_tier`, cleaned by
+    /// `switcher_core::plan_code`. Deliberately not part of `identity`, which becomes
+    /// the saved `oauth_account` and is written to the live CLI login file.
+    pub organization_type: Option<String>,
+    pub seat_tier: Option<String>,
 }
 impl Profile {
     fn parse(value: &Value) -> Result<Self, ClientError> {
@@ -540,6 +545,8 @@ impl Profile {
                 &org["subscription_created_at"],
             ),
             plan_tier: org["rate_limit_tier"].as_str().map(str::to_owned),
+            organization_type: switcher_core::plan_code(&org["organization_type"]),
+            seat_tier: switcher_core::plan_code(&org["seat_tier"]),
         })
     }
     pub fn owner(&self) -> Option<&str> {
@@ -549,6 +556,13 @@ impl Profile {
         account.subscription_status = self.subscription_status.clone();
         account.subscription_started_at = self.subscription_started_at;
         account.plan_tier = self.plan_tier.clone();
+        // An answer that names a type is authoritative for the type and its seat tier
+        // (the tier may legitimately be null). An answer without one keeps what an
+        // earlier answer saved instead of erasing it.
+        if self.organization_type.is_some() {
+            account.organization_type = self.organization_type.clone();
+            account.seat_tier = self.seat_tier.clone();
+        }
         account.profile_checked_at = Some(now);
         account.identity_verified = true;
     }
@@ -1100,6 +1114,103 @@ mod tests {
                 .await;
             assert_eq!(outcome.is_final(), is_final, "{body}");
         }
+    }
+    fn profile_body(org: Value) -> Value {
+        let mut organization =
+            json!({"uuid":"fixture-org","rate_limit_tier":"default_claude_max_5x"});
+        organization
+            .as_object_mut()
+            .unwrap()
+            .extend(org.as_object().unwrap().clone());
+        json!({"account":{"uuid":"fixture-owner","email":"demo@example.invalid"},"organization":organization})
+    }
+    #[tokio::test]
+    async fn profile_answer_names_the_plan_type_for_every_organization_type() {
+        for (kind, seat) in [
+            ("claude_max", None),
+            ("claude_pro", None),
+            ("claude_team", Some("team_tier_1")),
+            ("claude_enterprise", Some("enterprise_seat")),
+        ] {
+            let mut org = json!({"organization_type":kind});
+            if let Some(seat) = seat {
+                org["seat_tier"] = json!(seat);
+            }
+            let (client, transport) = fake(vec![reply(200, profile_body(org))]);
+            let profile = client.profile("fixture-access").await.unwrap();
+            assert_eq!(profile.organization_type.as_deref(), Some(kind));
+            assert_eq!(profile.seat_tier.as_deref(), seat);
+            // The tier string is still read as before: it is the same for a Team seat.
+            assert_eq!(profile.plan_tier.as_deref(), Some("default_claude_max_5x"));
+            assert_eq!(transport.requests.lock().unwrap()[0].url, PROFILE_URL);
+        }
+    }
+    #[test]
+    fn plan_type_is_not_part_of_the_identity_written_to_the_cli_login() {
+        let profile = Profile::parse(&profile_body(
+            json!({"organization_type":"claude_team","seat_tier":"team_tier_1"}),
+        ))
+        .unwrap();
+        let keys: Vec<_> = profile.identity.as_object().unwrap().keys().collect();
+        assert!(!keys.iter().any(|k| k.to_lowercase().contains("type")));
+        assert!(!keys.iter().any(|k| k.to_lowercase().contains("seat")));
+        assert_eq!(profile.owner(), Some("fixture-owner"));
+    }
+    #[test]
+    fn missing_or_odd_plan_fields_are_unknown_never_an_error() {
+        for org in [
+            json!({}),
+            json!({"organization_type":null,"seat_tier":null}),
+            json!({"organization_type":5,"seat_tier":true}),
+            json!({"organization_type":["claude_team"],"seat_tier":{"a":1}}),
+            json!({"organization_type":"","seat_tier":""}),
+            json!({"organization_type":"Claude Team\n","seat_tier":"<b>x</b>"}),
+            json!({"organization_type":"x".repeat(65),"seat_tier":"y".repeat(65)}),
+        ] {
+            let profile = Profile::parse(&profile_body(org.clone())).unwrap();
+            assert_eq!(profile.organization_type, None, "{org}");
+            assert_eq!(profile.seat_tier, None, "{org}");
+            assert_eq!(profile.owner(), Some("fixture-owner"));
+        }
+        // An odd seat tier does not discard a good type, and case is normalized.
+        let profile = Profile::parse(&profile_body(
+            json!({"organization_type":"Claude_Team","seat_tier":7}),
+        ))
+        .unwrap();
+        assert_eq!(profile.organization_type.as_deref(), Some("claude_team"));
+        assert_eq!(profile.seat_tier, None);
+        // No organization object at all still parses (owner only), as before.
+        let bare = Profile::parse(&json!({"account":{"uuid":"fixture-owner"}})).unwrap();
+        assert_eq!(bare.organization_type, None);
+    }
+    #[test]
+    fn applying_a_profile_keeps_the_last_known_plan_when_an_answer_omits_it() {
+        let mut account = StoredAccount::new(
+            "Fixture",
+            json!({"accountUuid":"fixture-owner"}),
+            json!({}),
+            1,
+        );
+        let named = Profile::parse(&profile_body(
+            json!({"organization_type":"claude_team","seat_tier":"team_tier_1"}),
+        ))
+        .unwrap();
+        named.apply(&mut account, 100);
+        assert_eq!(account.organization_type.as_deref(), Some("claude_team"));
+        assert_eq!(account.seat_tier.as_deref(), Some("team_tier_1"));
+        assert_eq!(account.profile_checked_at, Some(100));
+        // An answer without a type neither erases nor replaces what is saved.
+        let silent = Profile::parse(&profile_body(json!({}))).unwrap();
+        silent.apply(&mut account, 200);
+        assert_eq!(account.organization_type.as_deref(), Some("claude_team"));
+        assert_eq!(account.seat_tier.as_deref(), Some("team_tier_1"));
+        assert_eq!(account.profile_checked_at, Some(200));
+        // An answer that names a type is authoritative for the pair, null seat included.
+        let moved =
+            Profile::parse(&profile_body(json!({"organization_type":"claude_max"}))).unwrap();
+        moved.apply(&mut account, 300);
+        assert_eq!(account.organization_type.as_deref(), Some("claude_max"));
+        assert_eq!(account.seat_tier, None);
     }
     #[test]
     fn version_and_auth_identifier_validation() {

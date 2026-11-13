@@ -149,6 +149,10 @@ export const accountSchema = z
     freesAt: timestamp.optional(),
     subscriptionStatus: z.string().nullable(),
     planTier: z.string().nullable(),
+    // The real plan (claude_max, claude_pro, claude_team, claude_enterprise) and the
+    // seat tier; null or absent while unknown.
+    organizationType: z.string().nullable().optional(),
+    seatTier: z.string().nullable().optional(),
     renewalDay: z.number().int().min(1).max(31).nullable(),
     nextRenewalAt: timestamp,
     resets: z

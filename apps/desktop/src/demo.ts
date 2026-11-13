@@ -23,6 +23,12 @@ research.usage!.weeklyOverall = 84;
 research.usage!.weeklyModel = 88;
 research.usage!.scopedLimits[0].percent = 88;
 demo.accounts.push(research);
+// A Team seat and a personal Max carry the same rate-limit tier; the organization
+// type tells them apart.
+demo.accounts[0].planTier = 'default_claude_max_5x';
+demo.accounts[0].organizationType = 'claude_team';
+demo.accounts[1].planTier = 'default_claude_max_5x';
+demo.accounts[1].organizationType = 'claude_max';
 // Banked resets by kind, for the Claude preview: usable, early and blocked ones.
 const dayFromNow = (days: number) =>
   Math.floor(Date.now() / 1000) + days * 86400;

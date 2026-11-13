@@ -53,6 +53,29 @@ describe('Claude adapter: meters', () => {
     ]);
     expect(row(snapshot(), 'a').plan).toBe('Max 5×');
   });
+  it('shows the real plan on every row: Team seat vs personal Max with one tier', () => {
+    const raw = withAccounts(
+      account('a', {
+        planTier: 'default_claude_max_5x',
+        organizationType: 'claude_team',
+        seatTier: 'team_tier_1',
+      }),
+      account('b', {
+        planTier: 'default_claude_max_5x',
+        organizationType: 'claude_max',
+        seatTier: null,
+      }),
+      account('c', { planTier: 'default_claude_max_5x' }),
+      account('d', { planTier: null, organizationType: 'claude_enterprise' }),
+    );
+    expect(row(raw, 'a').plan).toBe('Team 5×');
+    expect(row(raw, 'b').plan).toBe('Max 5×');
+    // Not refreshed yet: the tier alone, as before, and never "Team".
+    expect(row(raw, 'c').plan).toBe('Max 5×');
+    expect(row(raw, 'd').plan).toBe('Enterprise');
+    // The active card shows the same label as the row.
+    expect(view(raw).active?.plan).toBe('Team 5×');
+  });
   it('never borrows a reset time and shows unknown usage as no value', () => {
     const raw = snapshot();
     delete raw.accounts[0].usage!.weeklyOverallResetsAt;

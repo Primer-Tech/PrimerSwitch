@@ -152,7 +152,7 @@ function row(
       [account.email, account.workspaceLabel].filter(Boolean).join(' · ') ||
       null,
     workspaceLabel: account.workspaceLabel ?? null,
-    plan: planLabel(account.planTier),
+    plan: planLabel(account.planTier, account.organizationType),
     active: account.active,
     next: account.isNext,
     automation: account.automation ?? { ...defaultAutomation },

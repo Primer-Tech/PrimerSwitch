@@ -997,6 +997,68 @@ describe('desktop workflows', () => {
     expect(remove).toHaveTextContent('Delete account');
     expect(within(dialog).getByText('Max 5×')).toBeVisible();
   });
+  it('shows the real plan in rows, the active card and a plan type line in details', async () => {
+    const raw = snapshot({
+      accounts: [
+        account('a', {
+          planTier: 'default_claude_max_5x',
+          organizationType: 'claude_team',
+          seatTier: 'team_tier_1',
+        }),
+        account('b', {
+          planTier: 'default_claude_max_5x',
+          organizationType: 'claude_max',
+        }),
+      ],
+    });
+    setup(raw);
+    expect((await screen.findAllByText('Team 5×'))[0]).toBeVisible();
+    expect(activeCard().getByText('Team 5×')).toBeVisible();
+    expect(row('Personal').getByText('Max 5×')).toBeVisible();
+    let dialog = await details('Studio');
+    expect(
+      within(dialog).getByText('Plan type').closest('div'),
+    ).toHaveTextContent('Plan type Team');
+    cleanup();
+    setup(raw);
+    dialog = await details('Personal');
+    expect(
+      within(dialog).getByText('Plan type').closest('div'),
+    ).toHaveTextContent('Plan type Personal');
+  });
+  it('hides the plan type line while the type is unknown and shows it in Romanian', async () => {
+    setup(snapshot());
+    await screen.findAllByText('a@example.invalid');
+    const dialog = await details();
+    expect(within(dialog).queryByText('Plan type')).toBeNull();
+    // An unknown type keeps the old tier-only label.
+    expect(within(dialog).getByText('Pro')).toBeVisible();
+    cleanup();
+    language.set('ro');
+    const raw = snapshot({
+      accounts: [
+        account('a', { organizationType: 'claude_team' }),
+        account('b', { organizationType: 'claude_enterprise' }),
+      ],
+    });
+    raw.settings = { ...raw.settings, language: 'ro' };
+    setup(raw);
+    await screen.findAllByText('a@example.invalid');
+    const trigger = await screen.findByRole('button', {
+      name: t('ro', 'moreLabel', { name: 'Personal' }),
+    });
+    await fireEvent.click(trigger);
+    await fireEvent.click(
+      within(
+        document.getElementById(trigger.getAttribute('aria-controls')!)!,
+      ).getByRole('button', { name: t('ro', 'viewDetails') }),
+    );
+    expect(
+      within(screen.getByRole('dialog'))
+        .getByText('Tip de plan')
+        .closest('div'),
+    ).toHaveTextContent('Tip de plan Enterprise');
+  });
   it('updates local countdowns without provider commands', async () => {
     vi.useFakeTimers();
     const { call } = setup();

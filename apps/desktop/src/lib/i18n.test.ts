@@ -1,6 +1,13 @@
 import { describe, it, expect } from 'vitest';
 import { t, plural, subscriptionLabel } from './i18n';
-import { percentage, date, age, duration, planLabel } from './format';
+import {
+  percentage,
+  date,
+  age,
+  duration,
+  planLabel,
+  planTypeLabel,
+} from './format';
 import { defaults, settingsSchema } from './types';
 import { safeError } from './controller';
 import { en } from './locales/en';
@@ -63,6 +70,50 @@ describe('localized presentation', () => {
       t('ro', 'externalChange'),
     );
     expect(subscriptionLabel('active', 'ro')).toBe('Activ');
+  });
+  it('labels the real Claude plan from the organization type and the tier', () => {
+    const max5 = 'default_claude_max_5x';
+    const max20 = 'default_claude_max_20x';
+    // The two real cases: a Team seat and a personal Max share one tier string.
+    expect(planLabel(max5, 'claude_team')).toBe('Team 5×');
+    expect(planLabel(max5, 'claude_max')).toBe('Max 5×');
+    expect(planLabel(max20, 'claude_team')).toBe('Team 20×');
+    expect(planLabel(max20, 'claude_max')).toBe('Max 20×');
+    // The type decides the plan; the tier only adds an allowance it recognises.
+    expect(planLabel(null, 'claude_max')).toBe('Max');
+    expect(planLabel('default_raven', 'claude_max')).toBe('Max');
+    expect(planLabel(null, 'claude_team')).toBe('Team');
+    expect(planLabel('default_raven', 'claude_team')).toBe('Team');
+    expect(planLabel(max5, 'claude_pro')).toBe('Pro');
+    expect(planLabel(null, 'claude_pro')).toBe('Pro');
+    expect(planLabel(max5, 'claude_enterprise')).toBe('Enterprise');
+    expect(planLabel(null, 'claude_enterprise')).toBe('Enterprise');
+    expect(planLabel(max5, ' Claude_Team ')).toBe('Team 5×');
+    // No known type: today's tier-only behaviour, and Team is never invented.
+    for (const unknown of [undefined, null, '', 'claude_edu', 'team', 'max']) {
+      expect(planLabel(max5, unknown)).toBe('Max 5×');
+      expect(planLabel(max20, unknown)).toBe('Max 20×');
+      expect(planLabel('default_claude_pro', unknown)).toBe('Pro');
+      expect(planLabel('default_raven', unknown)).toBeNull();
+      expect(planLabel(null, unknown)).toBeNull();
+    }
+  });
+  it('names the plan type in both languages and hides it while unknown', () => {
+    expect(planTypeLabel('claude_max', 'en')).toBe('Personal');
+    expect(planTypeLabel('claude_pro', 'en')).toBe('Personal');
+    expect(planTypeLabel('claude_team', 'en')).toBe('Team');
+    expect(planTypeLabel('claude_enterprise', 'en')).toBe('Enterprise');
+    expect(planTypeLabel('claude_max', 'ro')).toBe(t('ro', 'planTypePersonal'));
+    expect(planTypeLabel('claude_team', 'ro')).toBe(t('ro', 'planTypeTeam'));
+    expect(planTypeLabel('claude_enterprise', 'ro')).toBe(
+      t('ro', 'planTypeEnterprise'),
+    );
+    expect(t('en', 'detailsPlanType')).toBe('Plan type');
+    expect(t('ro', 'detailsPlanType')).toBe('Tip de plan');
+    for (const unknown of [undefined, null, '', 'claude_edu', 'personal']) {
+      expect(planTypeLabel(unknown, 'en')).toBeNull();
+      expect(planTypeLabel(unknown, 'ro')).toBeNull();
+    }
   });
   it('uses one vocabulary for both providers in both languages', () => {
     expect(Object.keys(ro).sort()).toEqual(Object.keys(en).sort());

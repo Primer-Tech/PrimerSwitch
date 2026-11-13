@@ -83,6 +83,21 @@ fn timestamp<'de, D: Deserializer<'de>>(d: D) -> Result<Option<i64>, D::Error> {
     Ok(parse_timestamp(&Value::deserialize(d)?))
 }
 
+/// A provider plan code such as `claude_team` or `team_tier_1`: a short lowercase
+/// ASCII identifier. Missing, non-string, empty, long or odd values are `None`, so a
+/// plan field can never carry free text towards the view.
+pub fn plan_code(value: &Value) -> Option<String> {
+    value.as_str().and_then(plan_code_str)
+}
+fn plan_code_str(value: &str) -> Option<String> {
+    (!value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'))
+    .then(|| value.to_ascii_lowercase())
+}
+
 #[derive(Clone, Deserialize, Serialize, Default)]
 #[serde(default)]
 pub struct StoredAccount {
@@ -118,6 +133,13 @@ pub struct StoredAccount {
     pub subscription_status: Option<String>,
     pub subscription_started_at: Option<i64>,
     pub plan_tier: Option<String>,
+    /// Claude `organization.organization_type` from the last profile answer, already
+    /// cleaned by `plan_code`. Absent on records saved by older builds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub organization_type: Option<String>,
+    /// Claude `organization.seat_tier` (for example `team_tier_1`), same rules.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seat_tier: Option<String>,
     pub profile_checked_at: Option<i64>,
     pub renewal_day: Option<u8>,
     pub reset_status: Option<ResetStatus>,
@@ -157,6 +179,33 @@ impl StoredAccount {
     }
     pub fn email(&self) -> Option<&str> {
         self.oauth_account.get("emailAddress")?.as_str()
+    }
+    /// Claude plan kind and seat tier for display, as `(organization_type, seat_tier)`.
+    /// Resolved at read time and never written back: the fields saved from the last
+    /// profile answer win; only when no type is saved do the `organizationType` and
+    /// `seatTier` keys that Claude Code itself keeps in `oauth_account` (accounts
+    /// imported from the CLI have them) stand in, and the pair always comes from one
+    /// source. Nothing is copied into `oauth_account`, so the live `~/.claude.json`
+    /// is untouched, and the next profile answer that names a type replaces any
+    /// stand-in.
+    pub fn plan_codes(&self) -> (Option<String>, Option<String>) {
+        if let Some(kind) = self.organization_type.as_deref().and_then(plan_code_str) {
+            return (
+                Some(kind),
+                self.seat_tier.as_deref().and_then(plan_code_str),
+            );
+        }
+        match self
+            .oauth_account
+            .get("organizationType")
+            .and_then(plan_code)
+        {
+            Some(kind) => (
+                Some(kind),
+                self.oauth_account.get("seatTier").and_then(plan_code),
+            ),
+            None => (None, None),
+        }
     }
     pub fn access_token(&self) -> Option<&str> {
         self.credentials

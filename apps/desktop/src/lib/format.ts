@@ -35,12 +35,65 @@ export function duration(
   parts.push(ro ? `${n(minutes % 60)} min` : `${n(minutes % 60)}m`);
   return parts.join(' ');
 }
-/** Readable plan from Claude's raw rate-limit tier; unknown tiers stay hidden. */
-export function planLabel(tier: string | null | undefined): string | null {
+type ClaudePlanKind = 'max' | 'pro' | 'team' | 'enterprise';
+/** The plan Claude reports as `organization_type`; any other value is unknown. */
+function planKind(
+  organizationType: string | null | undefined,
+): ClaudePlanKind | null {
+  switch ((organizationType ?? '').trim().toLowerCase()) {
+    case 'claude_max':
+      return 'max';
+    case 'claude_pro':
+      return 'pro';
+    case 'claude_team':
+      return 'team';
+    case 'claude_enterprise':
+      return 'enterprise';
+    default:
+      return null;
+  }
+}
+/**
+ * Readable Claude plan. The organization type says what the plan is; the raw
+ * rate-limit tier only adds the allowance, because a Team seat and a personal Max
+ * can carry the same tier. Without a known type the tier alone decides, as before,
+ * and "Team" is never guessed. Unknown tiers stay hidden.
+ */
+export function planLabel(
+  tier: string | null | undefined,
+  organizationType?: string | null,
+): string | null {
   const value = (tier ?? '').toLowerCase();
   const max = /max[_\s-]*(5|20)\s*[x×]/.exec(value);
+  switch (planKind(organizationType)) {
+    case 'max':
+      return max ? `Max ${max[1]}×` : 'Max';
+    case 'pro':
+      return 'Pro';
+    case 'team':
+      return max ? `Team ${max[1]}×` : 'Team';
+    case 'enterprise':
+      return 'Enterprise';
+  }
   if (max) return `Max ${max[1]}×`;
   return /(^|[_\s-])pro($|[_\s-])/.test(value) ? 'Pro' : null;
+}
+/** Personal (Max, Pro), Team or Enterprise from the organization type; else unknown. */
+export function planTypeLabel(
+  organizationType: string | null | undefined,
+  locale: Language,
+): string | null {
+  switch (planKind(organizationType)) {
+    case 'max':
+    case 'pro':
+      return t(locale, 'planTypePersonal');
+    case 'team':
+      return t(locale, 'planTypeTeam');
+    case 'enterprise':
+      return t(locale, 'planTypeEnterprise');
+    default:
+      return null;
+  }
 }
 export function age(
   timestamp: number | null,

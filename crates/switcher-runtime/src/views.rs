@@ -334,6 +334,10 @@ pub struct AccountView {
     pub frees_at: Option<i64>,
     pub subscription_status: Option<String>,
     pub plan_tier: Option<String>,
+    /// Plan kind (`claude_max`, `claude_pro`, `claude_team`, `claude_enterprise`) and
+    /// seat tier; short lowercase codes (see `StoredAccount::plan_codes`), or null.
+    pub organization_type: Option<String>,
+    pub seat_tier: Option<String>,
     pub renewal_day: Option<u8>,
     pub next_renewal_at: Option<i64>,
     pub resets: ResetView,

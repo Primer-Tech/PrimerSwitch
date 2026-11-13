@@ -40,6 +40,8 @@ export function account(
     freesAt: null,
     subscriptionStatus: 'Activ',
     planTier: id === 'a' ? 'Max 5×' : 'Pro',
+    organizationType: null,
+    seatTier: null,
     renewalDay: 15,
     nextRenewalAt: now + 13 * 86400,
     resets: {

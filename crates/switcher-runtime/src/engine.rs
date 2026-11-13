@@ -35,6 +35,10 @@ const SCOPED_MAX_AGE: i64 = 1800;
 /// Once Claude rejects a saved refresh token, background polling retries it at most
 /// daily; an explicit refresh, a switch attempt or a new sign-in retries at once.
 const SIGN_IN_RETRY: i64 = 86_400;
+/// The profile is read daily. A verified account whose plan type is still unknown
+/// (saved by an older build, or an answer without the field) reads it again, but at
+/// most this often per account, so an API that never names the type cannot loop.
+const PLAN_TYPE_RETRY: i64 = 3_600;
 /// A repeated automatic-switch failure for the same target and cause notifies at most
 /// this often; every failure still updates the in-app status.
 const SWITCH_FAILURE_NOTICE: i64 = 1800;
@@ -365,6 +369,9 @@ struct Reading {
     active_reauth_pending: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     profile_retry_at: Option<i64>,
+    /// Last profile read made only to learn the plan type, whatever its outcome.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plan_attempt_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     return_attempt_at: Option<i64>,
 }
@@ -1504,6 +1511,7 @@ impl Engine {
                         || u.weekly_utilization_for_model(self.active_model.as_deref()) >= threshold
                 });
                 let reading = self.saved.readings.get(&a.id);
+                let (organization_type, seat_tier) = a.plan_codes();
                 AccountView {
                     id: a.id.clone(),
                     name: safe_label(&a.name),
@@ -1529,6 +1537,8 @@ impl Engine {
                         .and_then(|u| frees_at(u, threshold, self.active_model.as_deref())),
                     subscription_status: a.subscription_status.as_deref().map(safe_label),
                     plan_tier: a.plan_tier.as_deref().map(safe_label),
+                    organization_type,
+                    seat_tier,
                     renewal_day: a.renewal_day,
                     next_renewal_at: next_renewal(a, now),
                     resets: ResetView {
@@ -1859,6 +1869,20 @@ impl Engine {
 fn recent(at: Option<i64>, now: i64, age: i64) -> bool {
     at.is_some_and(|at| at <= now + 30 && now.saturating_sub(at) <= age)
 }
+/// A verified, signed-in account with no saved plan type whose last profile read and
+/// last plan-only attempt are both older than `PLAN_TYPE_RETRY`. The daily profile
+/// and sign-in rules are separate and unchanged; this only adds an earlier read.
+fn plan_type_due(account: &StoredAccount, reading: Option<&Reading>, now: i64) -> bool {
+    account.organization_type.is_none()
+        && account.identity_verified
+        && !reading.is_some_and(|r| r.sign_in_required)
+        && !recent(account.profile_checked_at, now, PLAN_TYPE_RETRY)
+        && !recent(
+            reading.and_then(|r| r.plan_attempt_at),
+            now,
+            PLAN_TYPE_RETRY,
+        )
+}
 fn notice_view(code: &str, account: Option<String>, at: i64) -> ErrorView {
     ErrorView {
         code: code.into(),
@@ -2002,6 +2026,33 @@ impl Engine {
         self.clear_auth_failure(id);
         Ok(())
     }
+    /// Reads the profile again only to learn the plan type of an account that is
+    /// otherwise up to date. It uses `verify_profile` and so keeps its owner proof,
+    /// context guard and rate-limit backoff. The label is cosmetic: a failed or
+    /// refused read must not fail the cycle, and the attempt time holds the floor.
+    async fn refresh_plan_type(
+        &mut self,
+        id: &str,
+        token: &str,
+        expected: &str,
+    ) -> Result<(), RuntimeError> {
+        if !plan_type_due(
+            &self.saved.accounts[self.index(id)?],
+            self.saved.readings.get(id),
+            self.clock.now(),
+        ) {
+            return Ok(());
+        }
+        self.saved
+            .readings
+            .entry(id.into())
+            .or_default()
+            .plan_attempt_at = Some(self.clock.now());
+        match self.verify_profile(id, token, expected).await {
+            Ok(()) | Err(RuntimeError::Provider | RuntimeError::SignInRequired) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
     fn clear_auth_failure(&mut self, id: &str) {
         if let Some(r) = self.saved.readings.get_mut(id) {
             r.sign_in_required = false;
@@ -2065,6 +2116,8 @@ impl Engine {
                     RuntimeError::SignInRequired => RuntimeError::ActiveSessionExpired,
                     other => other,
                 })?;
+        } else {
+            self.refresh_plan_type(id, &token, expected).await?;
         }
         self.ensure_context(expected)?;
         self.clear_auth_failure(id);
@@ -2465,6 +2518,8 @@ impl Engine {
                         Err(RuntimeError::SignInRequired) => return Err(RuntimeError::Provider),
                         Err(error) => return Err(error),
                     }
+                } else {
+                    self.refresh_plan_type(id, &token, &expected).await?;
                 }
                 token
             };
@@ -3782,6 +3837,10 @@ impl Engine {
             existing.subscription_status = incoming.subscription_status;
             existing.subscription_started_at = incoming.subscription_started_at;
             existing.plan_tier = incoming.plan_tier;
+            if incoming.organization_type.is_some() {
+                existing.organization_type = incoming.organization_type;
+                existing.seat_tier = incoming.seat_tier;
+            }
             existing.profile_checked_at = incoming.profile_checked_at;
             existing.refresh_fail_at = None;
             // A new proven sign-in supersedes a captured blob and a sign-in prompt.
@@ -8607,5 +8666,325 @@ mod tests {
         let snapshot = reopened.get_snapshot();
         assert_eq!(snapshot.active_id.as_deref(), Some("a"));
         assert!(snapshot.error.is_none());
+    }
+    fn plan_reply(
+        owner: &str,
+        kind: &str,
+        seat: Option<&str>,
+    ) -> (&'static str, Result<HttpResponse, ClientError>) {
+        let mut org = json!({"uuid":format!("org-{owner}"),"subscription_status":"active","rate_limit_tier":"default_claude_max_5x","organization_type":kind});
+        if let Some(seat) = seat {
+            org["seat_tier"] = json!(seat);
+        }
+        (
+            PROFILE_URL,
+            Ok(response(
+                200,
+                json!({"account":{"uuid":owner},"organization":org}),
+            )),
+        )
+    }
+    /// A saved account whose token stays valid, so only profile reads show up.
+    fn long_lived(id: &str) -> StoredAccount {
+        let mut a = account(id, 1000);
+        a.credentials["claudeAiOauth"]["expiresAt"] = json!(4_000_000_000_000_i64);
+        a
+    }
+    #[test]
+    fn plan_type_is_due_after_an_hour_only_for_verified_signed_in_accounts_without_one() {
+        let none: Option<&Reading> = None;
+        let mut a = account("a", 1000);
+        assert!(!plan_type_due(&a, none, 1000));
+        assert!(!plan_type_due(&a, none, 1000 + PLAN_TYPE_RETRY));
+        assert!(plan_type_due(&a, none, 1000 + PLAN_TYPE_RETRY + 1));
+        // A failed attempt holds its own floor, whatever the last profile time was.
+        let attempted = Reading {
+            plan_attempt_at: Some(50_000),
+            ..Reading::default()
+        };
+        assert!(!plan_type_due(
+            &a,
+            Some(&attempted),
+            50_000 + PLAN_TYPE_RETRY
+        ));
+        assert!(plan_type_due(
+            &a,
+            Some(&attempted),
+            50_000 + PLAN_TYPE_RETRY + 1
+        ));
+        // Never read at all: due.
+        a.profile_checked_at = None;
+        assert!(plan_type_due(&a, none, 1000));
+        // A saved type leaves only the daily rule.
+        a.profile_checked_at = Some(1000);
+        a.organization_type = Some("claude_team".into());
+        assert!(!plan_type_due(&a, none, 1000 + 86_000));
+        // Unverified and signed-out accounts are never read for their label.
+        let mut unverified = account("b", 1000);
+        unverified.identity_verified = false;
+        assert!(!plan_type_due(&unverified, none, 100_000));
+        let signed_out = Reading {
+            sign_in_required: true,
+            ..Reading::default()
+        };
+        assert!(!plan_type_due(
+            &account("c", 1000),
+            Some(&signed_out),
+            100_000
+        ));
+        assert!(plan_type_due(
+            &account("c", 1000),
+            Some(&Reading::default()),
+            100_000
+        ));
+    }
+    #[tokio::test]
+    async fn an_inactive_account_without_a_plan_type_is_read_after_an_hour_then_daily() {
+        let fake = Arc::new(Fake::default());
+        let (temp, handle, clock, _paths) = fixture(
+            vec![account("a", 1000), long_lived("b")],
+            Some("a"),
+            1000,
+            fake.clone(),
+        );
+        let encoded = serde_json::to_value(&saved_record(&temp).accounts[1]).unwrap();
+        assert!(encoded.get("organization_type").is_none() && encoded.get("seat_tier").is_none());
+        let mut engine = handle.inner.owner.lock().await;
+        for a in &mut engine.saved.accounts {
+            a.identity_verified = true;
+        }
+        // Inside the hour only the daily rule applies: no profile request.
+        clock.0.store(1000 + 3599, Ordering::SeqCst);
+        engine.poll_account("b", true, false).await.unwrap();
+        assert_eq!(count(&fake, PROFILE_URL), 0);
+        // After the hour one read names the plan.
+        let read_at = 1000 + 3601;
+        clock.0.store(read_at, Ordering::SeqCst);
+        fake.replies
+            .lock()
+            .unwrap()
+            .push_back(plan_reply("b", "claude_team", Some("team_tier_1")));
+        engine.poll_account("b", true, false).await.unwrap();
+        assert_eq!(count(&fake, PROFILE_URL), 1);
+        let b = &engine.saved.accounts[engine.index("b").unwrap()];
+        assert_eq!(b.organization_type.as_deref(), Some("claude_team"));
+        assert_eq!(b.seat_tier.as_deref(), Some("team_tier_1"));
+        assert_eq!(b.profile_checked_at, Some(read_at));
+        let saved = saved_record(&temp).accounts[1].clone();
+        assert_eq!(saved.organization_type.as_deref(), Some("claude_team"));
+        // With the type known, hours later is still inside the daily window.
+        clock.0.store(read_at + 7200, Ordering::SeqCst);
+        engine.poll_account("b", true, false).await.unwrap();
+        assert_eq!(count(&fake, PROFILE_URL), 1);
+        // A day after the last read the daily refresh runs as before; its answer
+        // (the fake names no type) does not erase the saved one.
+        clock.0.store(read_at + 86_401, Ordering::SeqCst);
+        engine.poll_account("b", true, false).await.unwrap();
+        assert_eq!(count(&fake, PROFILE_URL), 2);
+        let b = &engine.saved.accounts[engine.index("b").unwrap()];
+        assert_eq!(b.organization_type.as_deref(), Some("claude_team"));
+        assert_eq!(b.seat_tier.as_deref(), Some("team_tier_1"));
+    }
+    #[tokio::test]
+    async fn an_api_that_never_names_the_plan_is_asked_once_an_hour_at_most() {
+        let fake = Arc::new(Fake::default());
+        let (_temp, handle, clock, _paths) = fixture(
+            vec![account("a", 1000), long_lived("b")],
+            Some("a"),
+            1000,
+            fake.clone(),
+        );
+        let mut engine = handle.inner.owner.lock().await;
+        for a in &mut engine.saved.accounts {
+            a.identity_verified = true;
+        }
+        // Polls every five minutes for six hours: the fake never names a type.
+        for step in 1..=72_i64 {
+            clock.0.store(1000 + step * 300, Ordering::SeqCst);
+            engine.poll_account("b", true, false).await.unwrap();
+        }
+        // Reads at 1h05, 2h10, 3h15, 4h20 and 5h25 after the start, and no others.
+        assert_eq!(count(&fake, PROFILE_URL), 5);
+        assert_eq!(
+            engine.saved.accounts[engine.index("b").unwrap()].organization_type,
+            None
+        );
+        assert!(engine.saved.readings["b"].error.is_none());
+    }
+    #[tokio::test]
+    async fn a_failed_plan_type_read_does_not_fail_the_cycle_and_still_holds_the_floor() {
+        let refusals: [fn() -> Result<HttpResponse, ClientError>; 4] = [
+            || Ok(response(500, Value::Null)),
+            || Ok(response(401, Value::Null)),
+            || Ok(response(429, Value::Null)),
+            || Err(ClientError::Transport),
+        ];
+        for (case, refused) in refusals.into_iter().enumerate() {
+            let fake = Arc::new(Fake::default());
+            let (_temp, handle, clock, _paths) = fixture(
+                vec![account("a", 1000), long_lived("b")],
+                Some("a"),
+                1000,
+                fake.clone(),
+            );
+            let mut engine = handle.inner.owner.lock().await;
+            for a in &mut engine.saved.accounts {
+                a.identity_verified = true;
+            }
+            let at = 1000 + 3601;
+            clock.0.store(at, Ordering::SeqCst);
+            fake.replies
+                .lock()
+                .unwrap()
+                .push_back((PROFILE_URL, refused()));
+            // The cycle still succeeds: the usage reading is not lost over a label.
+            engine.poll_account("b", true, false).await.unwrap();
+            assert_eq!(count(&fake, PROFILE_URL), 1, "case {case}");
+            assert!(engine.saved.accounts[engine.index("b").unwrap()].identity_verified);
+            assert!(
+                engine.saved.accounts[engine.index("b").unwrap()]
+                    .last_usage
+                    .is_some()
+            );
+            // No second try inside the floor, however often it polls.
+            for dt in [60, 1800, 3600] {
+                clock.0.store(at + dt, Ordering::SeqCst);
+                engine.poll_account("b", true, false).await.unwrap();
+                assert_eq!(count(&fake, PROFILE_URL), 1, "case {case} {dt}");
+            }
+            // After the floor it tries again, and a good answer names the plan.
+            clock.0.store(at + 3601 + 120, Ordering::SeqCst);
+            fake.replies
+                .lock()
+                .unwrap()
+                .push_back(plan_reply("b", "claude_max", None));
+            engine.poll_account("b", true, false).await.unwrap();
+            assert_eq!(count(&fake, PROFILE_URL), 2, "case {case}");
+            assert_eq!(
+                engine.saved.accounts[engine.index("b").unwrap()]
+                    .organization_type
+                    .as_deref(),
+                Some("claude_max"),
+                "case {case}"
+            );
+        }
+    }
+    #[tokio::test]
+    async fn the_active_account_reads_a_missing_plan_type_after_an_hour() {
+        let fake = Arc::new(Fake::default());
+        let (_temp, handle, clock, _paths) =
+            fixture(vec![account("a", 1000)], Some("a"), 1000, fake.clone());
+        let mut engine = handle.inner.owner.lock().await;
+        engine.saved.accounts[0].identity_verified = true;
+        clock.0.store(1000 + 3000, Ordering::SeqCst);
+        engine.poll_account("a", true, false).await.unwrap();
+        assert_eq!(count(&fake, PROFILE_URL), 0);
+        clock.0.store(1000 + 3601, Ordering::SeqCst);
+        fake.replies
+            .lock()
+            .unwrap()
+            .push_back(plan_reply("a", "claude_team", Some("team_tier_1")));
+        engine.poll_account("a", true, false).await.unwrap();
+        assert_eq!(count(&fake, PROFILE_URL), 1);
+        assert_eq!(
+            engine.saved.accounts[0].organization_type.as_deref(),
+            Some("claude_team")
+        );
+        let shown = &engine.snapshot(false).accounts[0];
+        assert_eq!(shown.organization_type.as_deref(), Some("claude_team"));
+        assert_eq!(shown.seat_tier.as_deref(), Some("team_tier_1"));
+    }
+    #[tokio::test]
+    async fn an_unverified_or_signed_out_account_is_not_read_for_its_plan() {
+        let fake = Arc::new(Fake::default());
+        let (_temp, handle, clock, _paths) = fixture(
+            vec![account("a", 1000), long_lived("b"), long_lived("c")],
+            Some("a"),
+            1000,
+            fake.clone(),
+        );
+        let mut engine = handle.inner.owner.lock().await;
+        for id in ["a", "b", "c"] {
+            let i = engine.index(id).unwrap();
+            engine.saved.accounts[i].identity_verified = true;
+        }
+        // Signed out and still verified from an earlier read: not asked again.
+        let signed_out = engine.saved.readings.get_mut("c").unwrap();
+        signed_out.sign_in_required = true;
+        signed_out.auth_failure_confirmed = true;
+        engine.saved.accounts[2].refresh_fail_at = Some(1000 + 3600);
+        clock.0.store(1000 + 3601, Ordering::SeqCst);
+        assert!(engine.poll_account("c", false, false).await.is_err());
+        assert_eq!(count(&fake, PROFILE_URL), 0);
+        assert!(engine.saved.readings["c"].plan_attempt_at.is_none());
+        // Unverified is the existing hard path (not the label path): no attempt marker.
+        engine.saved.accounts[1].identity_verified = false;
+        engine.poll_account("b", true, false).await.unwrap();
+        assert_eq!(count(&fake, PROFILE_URL), 1);
+        assert!(engine.saved.readings["b"].plan_attempt_at.is_none());
+    }
+    #[tokio::test]
+    async fn account_view_shows_the_saved_plan_with_the_cli_copy_as_fallback() {
+        let mut a = account("a", 1000);
+        a.organization_type = Some("claude_team".into());
+        a.seat_tier = Some("team_tier_1".into());
+        // Saved by the CLI import: only Claude Code's own keys.
+        let mut b = account("b", 1000);
+        b.oauth_account["organizationType"] = json!("claude_max");
+        b.oauth_account["seatTier"] = json!("seat_x");
+        // Odd text never reaches the view.
+        let mut c = account("c", 1000);
+        c.organization_type = Some("Evil <script>".into());
+        c.oauth_account["organizationType"] = json!("x".repeat(200));
+        let d = account("d", 1000);
+        let fake = Arc::new(Fake::default());
+        let (_temp, handle, _clock, _paths) =
+            fixture(vec![a, b, c, d], Some("a"), 1000, fake.clone());
+        let a = view(&handle, "a");
+        assert_eq!(a.organization_type.as_deref(), Some("claude_team"));
+        assert_eq!(a.seat_tier.as_deref(), Some("team_tier_1"));
+        let b = view(&handle, "b");
+        assert_eq!(b.organization_type.as_deref(), Some("claude_max"));
+        assert_eq!(b.seat_tier.as_deref(), Some("seat_x"));
+        for id in ["c", "d"] {
+            let shown = view(&handle, id);
+            assert_eq!(shown.organization_type, None, "{id}");
+            assert_eq!(shown.seat_tier, None, "{id}");
+        }
+        let json = serde_json::to_value(handle.get_snapshot()).unwrap();
+        assert_eq!(json["accounts"][0]["organizationType"], "claude_team");
+        assert_eq!(json["accounts"][0]["seatTier"], "team_tier_1");
+        assert!(json["accounts"][3]["organizationType"].is_null());
+        assert!(fake.calls.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn signing_in_again_keeps_or_replaces_the_saved_plan_but_never_erases_it() {
+        let fake = Arc::new(Fake::default());
+        let mut a = account("a", 1000);
+        a.organization_type = Some("claude_team".into());
+        a.seat_tier = Some("team_tier_1".into());
+        let (_temp, handle, _clock, _paths) = fixture(vec![a], None, 1000, fake);
+        let mut engine = handle.inner.owner.lock().await;
+        // The new sign-in's profile named no type: what was saved stays.
+        let mut silent = account("a", 2000);
+        silent.profile_checked_at = Some(2000);
+        engine.merge_account_at(0, silent, true);
+        assert_eq!(
+            engine.saved.accounts[0].organization_type.as_deref(),
+            Some("claude_team")
+        );
+        assert_eq!(
+            engine.saved.accounts[0].seat_tier.as_deref(),
+            Some("team_tier_1")
+        );
+        // One that names a type is authoritative for the type and its seat tier.
+        let mut moved = account("a", 3000);
+        moved.organization_type = Some("claude_max".into());
+        engine.merge_account_at(0, moved, true);
+        assert_eq!(
+            engine.saved.accounts[0].organization_type.as_deref(),
+            Some("claude_max")
+        );
+        assert_eq!(engine.saved.accounts[0].seat_tier, None);
     }
 }

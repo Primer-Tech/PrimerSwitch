@@ -1,6 +1,6 @@
 <script lang="ts">
   import { language, t, plural, subscriptionLabel } from '../lib/i18n';
-  import { date } from '../lib/format';
+  import { date, planTypeLabel } from '../lib/format';
   import {
     codeMessage,
     errorText,
@@ -445,6 +445,11 @@
     >
       {#snippet facts()}
         {#if account}
+          {@const planType = planTypeLabel(account.organizationType, $language)}
+          {#if planType}<div>
+              <dt>{t($language, 'detailsPlanType')}</dt>
+              <dd>{planType}</dd>
+            </div>{/if}
           <div>
             <dt>{t($language, 'subscription')}</dt>
             <dd>

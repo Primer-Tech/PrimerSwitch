@@ -6022,8 +6022,14 @@ mod tests {
             "accounts":[stored],"settings":{},"readings":{},"last_refresh_at":null
         }))
         .unwrap();
-        // Saving through the vault and loading again keeps the old shape exactly.
-        let temp = tempfile::tempdir().unwrap();
+        // Saving through the vault and loading again keeps the old shape exactly. The
+        // vault refuses a path that goes through a link, and the macOS temp directory
+        // does (`/var` is a link), so use the canonical parent like the other tests.
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let temp = tempfile::Builder::new()
+            .prefix("primerswitch-runtime-")
+            .tempdir_in(parent)
+            .unwrap();
         let vault = Vault::with_key(temp.path().join("vault"), [7; 32]).unwrap();
         vault.save(RECORD, &old).unwrap();
         let back = vault.load::<Persisted>(RECORD).unwrap().unwrap();

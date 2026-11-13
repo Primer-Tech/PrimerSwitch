@@ -610,6 +610,40 @@ describe('desktop workflows', () => {
     // A first-launch check is not reported as an identity problem.
     expect(screen.queryByText('Identity unverified')).not.toBeInTheDocument();
   });
+  it('offers recovery guidance after an identity verification failure', async () => {
+    const { call } = setup();
+    await screen.findAllByText('a@example.invalid');
+    call.mockRejectedValueOnce('identityError');
+    await fireEvent.click(
+      row('Personal').getByRole('button', { name: 'Switch' }),
+    );
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      t('en', 'claudeIdentityRecoveryHint'),
+    );
+  });
+  it.each(['Studio', 'Personal'] as const)(
+    'offers targeted Claude repair from %s details even without an expiry flag',
+    async (name) => {
+      const { call } = setup();
+      await screen.findAllByText('a@example.invalid');
+      const dialog = await details(name);
+      call.mockResolvedValueOnce({
+        id: 'manual-repair-session',
+        url: 'https://example.invalid/authorize',
+      });
+      await fireEvent.click(
+        within(dialog).getByRole('button', { name: 'Sign in again' }),
+      );
+      await waitFor(() =>
+        expect(call).toHaveBeenCalledWith('begin_login', {
+          accountId: name === 'Studio' ? 'a' : 'b',
+        }),
+      );
+      expect(
+        screen.getByRole('heading', { name: t('en', 'claudeLoginAgainTitle') }),
+      ).toBeVisible();
+    },
+  );
   it('offers a browser sign-in for an account Claude no longer accepts', async () => {
     const { call } = setup(
       snapshot({

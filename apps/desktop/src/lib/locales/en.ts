@@ -370,6 +370,8 @@ export const en = {
   missingAccount: 'The account is no longer available.',
   externalChange: 'The Claude login changed. Refresh before continuing.',
   identityError: 'The account identity could not be verified.',
+  claudeIdentityRecoveryHint:
+    'Refresh and try again. If the problem continues, open the affected account’s details and choose Sign in again with its original workspace.',
   providerError: 'Claude did not provide a fresh reading. Try again later.',
   signInRequired:
     "Claude no longer accepts this account's saved sign-in. Sign in again to keep using it.",

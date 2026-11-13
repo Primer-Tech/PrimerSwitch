@@ -167,9 +167,20 @@
         key: 'error',
         tone: 'error',
         role: 'alert',
-        text: error
-          ? safeError(error, $language)
-          : errorText(statusError!, snapshot?.accounts ?? [], $language),
+        text: [
+          error
+            ? safeError(error, $language)
+            : errorText(statusError!, snapshot?.accounts ?? [], $language),
+          ...((
+            error
+              ? [t('en', 'identityError'), t('ro', 'identityError')].includes(
+                  error,
+                )
+              : statusError?.code === 'identityError'
+          )
+            ? [t($language, 'claudeIdentityRecoveryHint')]
+            : []),
+        ].join(' '),
         dismiss: dismissError,
       });
     if (notice)
@@ -383,6 +394,7 @@
       threshold={view.threshold}
       {locked}
       {lockReason}
+      manualSignIn={true}
       onrefresh={() => void run('refresh', details!)}
       onswitch={() => {
         const row = details!;

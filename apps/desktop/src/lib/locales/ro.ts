@@ -379,6 +379,8 @@ export const ro: Record<keyof typeof en, string> = {
   externalChange:
     'Autentificarea Claude s-a schimbat. Actualizează înainte de a continua.',
   identityError: 'Identitatea contului nu a putut fi verificată.',
+  claudeIdentityRecoveryHint:
+    'Actualizează și încearcă din nou. Dacă problema persistă, deschide detaliile contului afectat și alege Autentifică-te din nou, folosind spațiul de lucru inițial.',
   providerError:
     'Claude nu a furnizat o citire proaspătă. Reîncearcă mai târziu.',
   signInRequired:

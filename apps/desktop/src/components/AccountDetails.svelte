@@ -23,6 +23,7 @@
     ondelete,
     onautomation,
     onlaunch,
+    manualSignIn = false,
     automationSupported = true,
     automationError = null,
   }: {
@@ -43,6 +44,8 @@
     ) => Promise<AccountAutomation | null>;
     /** Claude only: start the account in its own window. Absent: no such action. */
     onlaunch?: (trigger: HTMLElement) => void;
+    /** Claude can repair a saved login even when expiry has not been detected. */
+    manualSignIn?: boolean;
     automationSupported?: boolean;
     automationError?: string | null;
   } = $props();
@@ -145,6 +148,12 @@
           aria-label={t($language, 'refreshLabel', { name: row.name })}
           onclick={(event) => onrefresh(event.currentTarget)}
           ><Icon name="refresh" size={15} />{t($language, 'refresh')}</button
+        >{/if}
+      {#if manualSignIn && row.primary !== 'signIn'}<button
+          disabled={locked}
+          title={locked ? (lockReason ?? undefined) : undefined}
+          onclick={(event) => onsignin(event.currentTarget)}
+          >{t($language, 'signInAgain')}</button
         >{/if}
       {#if row.primary === 'signIn'}<button
           class="primary"

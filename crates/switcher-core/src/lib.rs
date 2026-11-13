@@ -1,7 +1,9 @@
 //! Pure account models and Claude quota/reset policy. No I/O or provider requests.
+mod manual_reset;
 mod models;
 mod policy;
 mod protocol;
+pub use manual_reset::*;
 pub use models::*;
 pub use policy::*;
 pub use protocol::*;

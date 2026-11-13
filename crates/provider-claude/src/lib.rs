@@ -1013,6 +1013,94 @@ mod tests {
             "same-key-1"
         );
     }
+    #[tokio::test]
+    async fn the_usage_read_keeps_every_grant_field_a_manual_use_needs() {
+        let (client, _) = fake(vec![reply(
+            200,
+            json!({"five_hour":{"utilization":29,"resets_at":null},
+            "seven_day":{"utilization":57,"resets_at":null},
+            "cedar_ember":{"eligible":true,"at_limit":true,"exhausted":["seven_day"],
+                "next_grant_id":"fable-1","cooldown_until":null,
+                "grants":[
+                    {"id":"fable-1","label":"Fable","resets_total":2,"resets_left":2,
+                     "usable_now":true,"use_requires_limit":true,"gives_back_weekly":true,
+                     "clears":["seven_day_overage_included"],
+                     "percent_used":{"seven_day_overage_included":80},
+                     "blocking":[],"unavailable_reason":null},
+                    {"id":"s-1","resets_left":1,"type":"session","clears":["five_hour"],
+                     "unavailable_reason":"needs_limit","future_field":{"x":1}},
+                    {"id":"BROKEN ID","resets_left":1}
+                ]}}),
+        )]);
+        let usage = client.metadata("sentinel-access").await.unwrap();
+        let status = usage.cedar_ember.expect("the reset block is kept");
+        assert_eq!(status.exhausted, vec!["seven_day".to_owned()]);
+        assert_eq!(
+            status.grants.len(),
+            2,
+            "one bad grant never hides the others"
+        );
+        assert_eq!(status.grants[0].kind(), switcher_core::ResetKind::Fable);
+        assert_eq!(status.grants[1].kind(), switcher_core::ResetKind::Session);
+        assert_eq!(
+            status.grants[1].unavailable_reason,
+            Some(switcher_core::ResetUnavailable::NeedsLimit)
+        );
+        let plan = switcher_core::plan_manual_claim(
+            &status,
+            switcher_core::ResetKind::Fable,
+            1_000,
+            false,
+        )
+        .unwrap();
+        assert_eq!(plan.grant_id, "fable-1");
+    }
+    #[tokio::test]
+    async fn every_documented_claim_answer_keeps_or_clears_the_key_as_it_should() {
+        let answers = [
+            (json!({"result":"reset","resets_left":1}), true),
+            (
+                json!({"result":"already_used","reason":"already_used"}),
+                true,
+            ),
+            (json!({"result":"not_limited","reason":"not_limited"}), true),
+            (
+                json!({"result":"cooldown","cooldown_until":"2026-11-13T12:00:00Z"}),
+                true,
+            ),
+            (json!({"result":"ineligible","reason":"not_eligible"}), true),
+            (
+                json!({"result":"unavailable","reason":"not_next_grant"}),
+                true,
+            ),
+            (
+                json!({"result":"unavailable","reason":"unknown_grant"}),
+                true,
+            ),
+            (json!({"result":"unavailable","reason":"paused"}), true),
+            (json!({"result":"unavailable","reason":"expired"}), true),
+            (
+                json!({"result":"unavailable","reason":"stamp_indeterminate"}),
+                false,
+            ),
+            (
+                json!({"result":"unavailable","reason":"reset_unconfirmed"}),
+                false,
+            ),
+        ];
+        let (client, _) = fake(
+            answers
+                .iter()
+                .map(|(body, _)| reply(200, body.clone()))
+                .collect(),
+        );
+        for (body, is_final) in answers {
+            let outcome = client
+                .claim_reset("org-a", "grant_a", "same-key-1", "sentinel-access")
+                .await;
+            assert_eq!(outcome.is_final(), is_final, "{body}");
+        }
+    }
     #[test]
     fn version_and_auth_identifier_validation() {
         assert!(valid_version("2.1.287"));

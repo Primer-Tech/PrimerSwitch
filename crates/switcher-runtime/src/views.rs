@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
 use switcher_core::{AccountAutomation, ProviderId, Settings, UsageResponse};
+use switcher_core::{
+    CLAIM_REPLAY_FLOOR, ResetKind, ResetOffer, ResetUnavailable, StoredAccount, grant_kind,
+    reset_offers,
+};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -199,6 +203,109 @@ pub struct ResetView {
     pub cooldown_until: Option<i64>,
     pub pending: bool,
     pub last_outcome: Option<String>,
+    /// One entry per kind of reset the account holds, in display order. Neither grant
+    /// ids nor request ids are part of it.
+    #[serde(default)]
+    pub offers: Vec<ResetOfferView>,
+}
+/// Why a kind of reset cannot be used now. The first nine are the provider's own
+/// reasons; `PendingClaim` is this app's: a request is still waiting for its answer.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ResetOfferReason {
+    Cooldown,
+    BlockedFiveHour,
+    BlockedSevenDay,
+    BlockedOpus,
+    BlockedSonnet,
+    BlockedOther,
+    CannotClear,
+    NeedsLimit,
+    Unavailable,
+    PendingClaim,
+}
+impl From<ResetUnavailable> for ResetOfferReason {
+    fn from(reason: ResetUnavailable) -> Self {
+        match reason {
+            ResetUnavailable::Cooldown => Self::Cooldown,
+            ResetUnavailable::BlockedFiveHour => Self::BlockedFiveHour,
+            ResetUnavailable::BlockedSevenDay => Self::BlockedSevenDay,
+            ResetUnavailable::BlockedOpus => Self::BlockedOpus,
+            ResetUnavailable::BlockedSonnet => Self::BlockedSonnet,
+            ResetUnavailable::BlockedOther => Self::BlockedOther,
+            ResetUnavailable::CannotClear => Self::CannotClear,
+            ResetUnavailable::NeedsLimit => Self::NeedsLimit,
+            ResetUnavailable::Unavailable => Self::Unavailable,
+        }
+    }
+}
+/// Using this reset now would waste part of a limit that has not been reached.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EarlyUseView {
+    /// Share of the limit still left, when the provider says so.
+    pub percent_left: Option<u8>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ResetOfferView {
+    pub kind: ResetKind,
+    pub resets_left: u32,
+    pub resets_total: u32,
+    /// The earliest end among the grants of this kind.
+    pub ends_at: Option<i64>,
+    /// A claim of this kind can be sent now (an early use still needs confirming).
+    pub usable_now: bool,
+    pub unavailable_reason: Option<ResetOfferReason>,
+    pub early_use: Option<EarlyUseView>,
+}
+impl From<&ResetOffer> for ResetOfferView {
+    fn from(offer: &ResetOffer) -> Self {
+        Self {
+            kind: offer.kind,
+            resets_left: offer.resets_left,
+            resets_total: offer.resets_total,
+            ends_at: offer.ends_at,
+            usable_now: offer.usable_now,
+            unavailable_reason: offer.unavailable.map(Into::into),
+            early_use: offer.early_use.map(|e| EarlyUseView {
+                percent_left: e.percent_left,
+            }),
+        }
+    }
+}
+/// The kinds of reset an account holds and whether each can be used now. A pending
+/// claim limits the account to repeating that one request, after the replay floor.
+pub(crate) fn offers_for(account: &StoredAccount, now: i64) -> Vec<ResetOfferView> {
+    let Some(status) = account.reset_status.as_ref() else {
+        return vec![];
+    };
+    let pending_kind = account
+        .pending_reset_claim
+        .as_ref()
+        .map(|p| grant_kind(status, &p.grant_id));
+    let waiting = account
+        .last_reset_attempt_at
+        .is_some_and(|last| now.saturating_sub(last) < CLAIM_REPLAY_FLOOR);
+    reset_offers(status, now)
+        .iter()
+        .map(|offer| {
+            let mut view = ResetOfferView::from(offer);
+            if let Some(kind) = pending_kind {
+                // The request for this kind was sent but not confirmed; any other kind
+                // (or a request whose grant has since vanished) must wait for it.
+                view.early_use = None;
+                if kind != Some(offer.kind) || waiting {
+                    view.usable_now = false;
+                    view.unavailable_reason = Some(ResetOfferReason::PendingClaim);
+                } else {
+                    view.usable_now = true;
+                    view.unavailable_reason = None;
+                }
+            }
+            view
+        })
+        .collect()
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

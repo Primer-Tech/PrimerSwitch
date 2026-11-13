@@ -1,6 +1,11 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import type { AccountAutomation, LaunchModel, Settings } from './types';
+import type {
+  AccountAutomation,
+  LaunchModel,
+  ResetKind,
+  Settings,
+} from './types';
 import { t } from './i18n';
 
 export interface CommandArgs {
@@ -13,6 +18,8 @@ export interface CommandArgs {
   update_settings: { settings: Settings };
   update_account_automation: { id: string; automation: AccountAutomation };
   resume_automatic_returns: undefined;
+  /** Uses one banked reset of a kind; the native side re-checks everything. */
+  claude_use_reset: { id: string; kind: ResetKind; allowEarly: boolean };
   import_current: undefined;
   begin_login: { accountId?: string | null } | undefined;
   finish_login: { id: string; code: string };
@@ -41,6 +48,7 @@ const commands: readonly Command[] = [
   'update_settings',
   'update_account_automation',
   'resume_automatic_returns',
+  'claude_use_reset',
   'import_current',
   'begin_login',
   'finish_login',

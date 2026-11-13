@@ -23,6 +23,49 @@ research.usage!.weeklyOverall = 84;
 research.usage!.weeklyModel = 88;
 research.usage!.scopedLimits[0].percent = 88;
 demo.accounts.push(research);
+// Banked resets by kind, for the Claude preview: usable, early and blocked ones.
+const dayFromNow = (days: number) =>
+  Math.floor(Date.now() / 1000) + days * 86400;
+demo.accounts[0].resets.offers = [
+  {
+    kind: 'weekly',
+    resetsLeft: 1,
+    resetsTotal: 1,
+    endsAt: dayFromNow(6),
+    usableNow: true,
+    unavailableReason: null,
+    earlyUse: { percentLeft: 42 },
+  },
+  {
+    kind: 'fable',
+    resetsLeft: 2,
+    resetsTotal: 3,
+    endsAt: dayFromNow(4),
+    usableNow: false,
+    unavailableReason: 'needsLimit',
+    earlyUse: null,
+  },
+];
+demo.accounts[1].resets.offers = [
+  {
+    kind: 'session',
+    resetsLeft: 1,
+    resetsTotal: 2,
+    endsAt: null,
+    usableNow: false,
+    unavailableReason: 'blockedSevenDay',
+    earlyUse: null,
+  },
+  {
+    kind: 'full',
+    resetsLeft: 1,
+    resetsTotal: 1,
+    endsAt: dayFromNow(2),
+    usableNow: true,
+    unavailableReason: null,
+    earlyUse: null,
+  },
+];
 demo.consumptionPlan = ['b', 'research', 'a'];
 
 demo.settings.language =

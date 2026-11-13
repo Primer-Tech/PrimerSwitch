@@ -149,6 +149,50 @@ export const ro: Record<keyof typeof en, string> = {
   expiresIn: 'Expiră în {duration}',
   resetCooldown: 'Resetările pot fi folosite din nou în {duration}',
   checkingReset: 'Se verifică rezultatul resetării…',
+  // Folosirea manuală a resetărilor Claude din rezervă.
+  resetKind_session: 'Resetare de 5 ore',
+  resetKind_weekly: 'Resetare săptămânală',
+  resetKind_fable: 'Resetare Fable',
+  resetKind_full: 'Resetare completă',
+  resetEffect_session: 'Reface acum limita de 5 ore.',
+  resetEffect_weekly: 'Reface acum limita săptămânală.',
+  resetEffect_fable: 'Returnează în limita săptămânală ce a consumat Fable.',
+  resetEffect_full: 'Reface acum toate limitele.',
+  resetsLeft: 'Rămase: {count}',
+  resetUseBy: 'De folosit până la {date}',
+  resetNoExpiry: 'Fără dată de expirare',
+  resetUse: 'Folosește',
+  resetRetry: 'Reîncearcă',
+  resetUsing: 'Se resetează consumul…',
+  resetUseLabel: 'Folosește o resetare ({kind}) pe {name}',
+  resetRetryLabel: 'Reîncearcă resetarea ({kind}) pe {name}',
+  resetsNone: 'Nicio resetare disponibilă.',
+  resetsCached:
+    'Citire salvată. Reîmprospătează pentru a verifica disponibilitatea actuală.',
+  resetConfirmTitle: 'Folosești o resetare?',
+  resetConfirmAccount: 'Cont: {name}',
+  resetConfirmDetail: 'Rămase: {left} · de folosit până la {date}',
+  resetConfirmDetailNoDate: 'Rămase: {left}',
+  resetConfirmYes: 'Da, folosește',
+  resetConfirmNo: 'Nu, o păstrez',
+  resetConfirmRetry:
+    'Ultima încercare nu a fost confirmată. Trimiterea aceleiași cereri încă o dată nu poate consuma a doua resetare.',
+  resetEarlyWarning:
+    'Încă ai {percent}% din limită. Folosești resetarea oricum?',
+  resetEarlyWarningUnknown:
+    'Nu ai atins încă o limită. Folosești resetarea oricum?',
+  resetReason_cooldown: 'În pauză. Reîncearcă peste un minut.',
+  resetReason_blockedFiveHour: 'Nu poate fi folosită la limita de 5 ore.',
+  resetReason_blockedSevenDay: 'Nu poate fi folosită la limita săptămânală.',
+  resetReason_blockedOpus: 'Nu poate fi folosită la limita Opus.',
+  resetReason_blockedSonnet: 'Nu poate fi folosită la limita Sonnet.',
+  resetReason_blockedOther:
+    'Nu poate fi folosită la altă limită pe care nu o reface.',
+  resetReason_cannotClear: 'Nu reface limita pe care ai atins-o.',
+  resetReason_needsLimit:
+    'Poate fi folosită după ce atingi o limită pe care o reface.',
+  resetReason_unavailable: 'Nu poate fi folosită acum.',
+  resetReason_pendingClaim: 'Se așteaptă confirmarea ultimei încercări.',
   estimatedRenewal: 'Reînnoire estimată',
   manualRenewalDescription: 'Estimare introdusă manual, nu dată de facturare.',
   codexSetupTitle: 'Configurare Codex',
@@ -393,6 +437,12 @@ export const ro: Record<keyof typeof en, string> = {
   importExpired: 'Importul nu mai este valid. Selectează din nou dosarul.',
   pendingResetError:
     'Cererea anterioară de resetare trebuie confirmată înainte de o nouă încercare.',
+  resetNotUsable:
+    'Niciun reset de acest tip nu poate fi folosit acum. Reîmprospătează și reîncearcă.',
+  resetNeedsLimit:
+    'Acest reset poate fi folosit după ce atingi o limită pe care o reface.',
+  earlyUseNeedsConfirmation:
+    'Folosirea acestui reset acum necesită mai întâi confirmarea ta.',
   cliVersionError:
     'Versiunea Claude Code nu a putut fi detectată. Instalează o versiune recunoscută.',
   browserError: 'Browserul nu a putut fi deschis. Reîncearcă autentificarea.',

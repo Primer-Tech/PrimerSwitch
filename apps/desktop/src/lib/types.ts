@@ -67,6 +67,41 @@ export function providerThreshold(
     95
   );
 }
+/** The four kinds of banked Claude reset, in the order the runtime lists them. */
+export const resetKindSchema = z.enum(['session', 'weekly', 'fable', 'full']);
+export type ResetKind = z.infer<typeof resetKindSchema>;
+export const resetKinds: readonly ResetKind[] = resetKindSchema.options;
+/** Why a kind of reset cannot be used now; each one is a catalog key suffix. */
+export const resetReasonSchema = z.enum([
+  'cooldown',
+  'blockedFiveHour',
+  'blockedSevenDay',
+  'blockedOpus',
+  'blockedSonnet',
+  'blockedOther',
+  'cannotClear',
+  'needsLimit',
+  'unavailable',
+  'pendingClaim',
+]);
+export type ResetReason = z.infer<typeof resetReasonSchema>;
+/** One kind of banked reset an account holds. No grant or request id is ever sent. */
+export const resetOfferSchema = z
+  .object({
+    kind: resetKindSchema,
+    resetsLeft: z.number().int().nonnegative(),
+    resetsTotal: z.number().int().nonnegative(),
+    endsAt: timestamp,
+    usableNow: z.boolean(),
+    unavailableReason: resetReasonSchema.nullable(),
+    /** Using it now would waste part of a limit not yet reached; needs confirming. */
+    earlyUse: z
+      .object({ percentLeft: z.number().int().min(0).max(100).nullable() })
+      .strict()
+      .nullable(),
+  })
+  .strict();
+export type ResetOffer = z.infer<typeof resetOfferSchema>;
 export const accountSchema = z
   .object({
     id: z.string(),
@@ -123,6 +158,7 @@ export const accountSchema = z
         cooldownUntil: timestamp,
         pending: z.boolean(),
         lastOutcome: z.string().nullable(),
+        offers: z.array(resetOfferSchema),
       })
       .strict(),
     primedAt: timestamp,

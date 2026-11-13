@@ -18,6 +18,7 @@ import {
   launchModelSchema,
   launchOutcomeSchema,
   loginSchema,
+  resetKindSchema,
   previewSchema,
   snapshotSchema,
   accountAutomationSchema,
@@ -27,6 +28,7 @@ import {
   type LaunchModel,
   type LaunchOutcome,
   type ProfileAuthReason,
+  type ResetKind,
   type Snapshot,
   type LoginSession,
   type ImportPreview,
@@ -53,6 +55,9 @@ const errorCodes: ReadonlySet<string> = new Set<MessageKey>([
   'loginExpired',
   'importExpired',
   'pendingResetError',
+  'resetNotUsable',
+  'resetNeedsLimit',
+  'earlyUseNeedsConfirmation',
   'cliVersionError',
   'switchInterrupted',
   'switchRecoveryPending',
@@ -362,6 +367,31 @@ export function createController(bridge: Bridge = nativeBridge) {
       state.snapshot?.accounts.find((account) => account.id === id)
         ?.automation ?? null
     );
+  }
+  /**
+   * Uses one banked reset of `kind` on a saved account, the active one or not. The
+   * runtime decides everything; this only refuses what the latest snapshot already
+   * shows cannot work, and sends the early-use confirmation only for an offer that is
+   * an early use (a confirmation the user gave in the dialog for exactly that).
+   */
+  async function useReset(
+    id: string,
+    kind: ResetKind,
+    allowEarly = false,
+  ): Promise<boolean> {
+    const parsed = resetKindSchema.safeParse(kind);
+    const offer = state.snapshot?.accounts
+      .find((account) => account.id === id)
+      ?.resets.offers.find((candidate) => candidate.kind === kind);
+    if (!parsed.success || !offer || !offer.usableNow) {
+      set({ error: codeMessage('resetNotUsable', locale()) });
+      return false;
+    }
+    return action('claude_use_reset', {
+      id,
+      kind: parsed.data,
+      allowEarly: allowEarly && offer.earlyUse !== null,
+    });
   }
   async function cancelLogin() {
     const session = state.login.session;
@@ -716,6 +746,7 @@ export function createController(bridge: Bridge = nativeBridge) {
     read,
     action,
     updateAutomation,
+    useReset,
     resumeAutomaticReturns: () => action('resume_automatic_returns'),
     beginLogin,
     cancelLogin,

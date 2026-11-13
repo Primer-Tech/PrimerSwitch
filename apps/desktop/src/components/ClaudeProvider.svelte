@@ -1,13 +1,13 @@
 <script lang="ts">
   import { language, t, plural, subscriptionLabel } from '../lib/i18n';
-  import { date, duration } from '../lib/format';
+  import { date } from '../lib/format';
   import {
     codeMessage,
     errorText,
     safeError,
     type Controller,
   } from '../lib/controller';
-  import type { AccountView, ErrorView } from '../lib/types';
+  import type { AccountView, ErrorView, ResetKind } from '../lib/types';
   import { claudeView } from '../lib/claude-view';
   import type {
     AccountRowView,
@@ -23,6 +23,8 @@
   import Modal from './Modal.svelte';
   import Icon from './Icon.svelte';
   import ClaudeLaunch from './ClaudeLaunch.svelte';
+  import ClaudeResets from './ClaudeResets.svelte';
+  import ClaudeResetConfirm from './ClaudeResetConfirm.svelte';
   import { launchNoticeView } from '../lib/claude-launch';
   let {
     controller,
@@ -59,6 +61,11 @@
     t($language, snapshot?.demo ? 'demoOnly' : 'switchBusy'),
   );
   let loginCode = $state('');
+  /** The reset the user asked to use and has not confirmed yet. */
+  let resetRequest = $state<{ id: string; kind: ResetKind } | null>(null);
+  /** The reset whose request is running. */
+  let resetting = $state<{ id: string; kind: ResetKind } | null>(null);
+  let resetFocus = $state<HTMLElement | null>(null);
   let detailsId = $state<string | null>(null);
   let deleteTarget = $state<AccountRowView | null>(null);
   let returnFocus = $state<HTMLElement | null>(null);
@@ -70,6 +77,20 @@
   );
   const raw = (id: string | undefined): AccountView | null =>
     snapshot?.accounts.find((account) => account.id === id) ?? null;
+  let confirmRow = $derived(
+    resetRequest
+      ? (view.rows
+          .find((r) => r.id === resetRequest!.id)
+          ?.resets?.rows.find((r) => r.kind === resetRequest!.kind) ?? null)
+      : null,
+  );
+  let confirmName = $derived(
+    view.rows.find((r) => r.id === resetRequest?.id)?.name ?? '',
+  );
+  // A reset that is no longer offered closes its own question.
+  $effect(() => {
+    if (resetRequest && !confirmRow && !resetting) resetRequest = null;
+  });
   // A background error repeats on every tick while it lasts: once dismissed it stays
   // hidden until it clears or a different one appears. Notices are per occurrence.
   const errorKey = (error: ErrorView) =>
@@ -133,6 +154,24 @@
     detailsId = null;
     returnFocus = trigger;
     controller.openLaunch(row.id);
+  }
+  // Using a reset spends a scarce, one-off credit: it is always confirmed first.
+  function askReset(id: string, kind: ResetKind, trigger: HTMLElement) {
+    resetFocus = trigger;
+    resetRequest = { id, kind };
+  }
+  async function confirmReset() {
+    const request = resetRequest;
+    const row = confirmRow;
+    if (!request || !row || resetting) return;
+    resetting = request;
+    const done = await controller.useReset(
+      request.id,
+      request.kind,
+      !!row.early,
+    );
+    resetting = null;
+    if (done) resetRequest = null;
   }
   function askDelete(row: AccountRowView, trigger: HTMLElement | null) {
     returnFocus = trigger;
@@ -358,19 +397,13 @@
           >{t($language, 'availableResets')}</span
         >
       </div>
-      {#if activeRaw?.resets.expiresAt && activeRaw.resets.expiresAt > now}<small
-          >{t($language, 'expiresIn', {
-            duration: duration(activeRaw.resets.expiresAt, now, $language),
-          })}</small
-        >{/if}{#if activeRaw?.resets.pending}<p class="warning-text">
-          {t($language, 'checkingReset')}
-        </p>{/if}{#if activeRaw?.resets.cooldownUntil && activeRaw.resets.cooldownUntil > now}<p
-          class="warning-text"
-        >
-          {t($language, 'resetCooldown', {
-            duration: duration(activeRaw.resets.cooldownUntil, now, $language),
-          })}
-        </p>{/if}
+      {#if activeRaw}<ClaudeResets
+          account={activeRaw}
+          {now}
+          {locked}
+          working={resetting?.id === activeRaw.id ? resetting.kind : null}
+          onuse={(kind, trigger) => askReset(activeRaw.id, kind, trigger)}
+        />{/if}
       <div class="renewal-summary">
         <Icon name="calendar" />
         <div>
@@ -457,36 +490,6 @@
                 >{/if}
             </dd>
           </div>
-          <div>
-            <dt>{t($language, 'availableResets')}</dt>
-            <dd>
-              {account.resets.available ?? t($language, 'unknownCount')}
-              {#if account.resets.expiresAt !== null && account.resets.expiresAt > now}<small
-                  class="fact-note"
-                  >{t($language, 'expiresIn', {
-                    duration: duration(
-                      account.resets.expiresAt,
-                      now,
-                      $language,
-                    ),
-                  })}</small
-                >{/if}{#if account.resets.cooldownUntil !== null && account.resets.cooldownUntil > now}<small
-                  class="fact-note"
-                  >{t($language, 'resetCooldown', {
-                    duration: duration(
-                      account.resets.cooldownUntil,
-                      now,
-                      $language,
-                    ),
-                  })}</small
-                >{/if}{#if account.resets.pending}<small
-                  class="fact-note warning-text"
-                  >{t($language, 'checkingReset')}</small
-                >{/if}{#if account.resets.lastOutcome}<small class="fact-note"
-                  >{safeError(account.resets.lastOutcome, $language)}</small
-                >{/if}
-            </dd>
-          </div>
           {#if account.fiveHourPrimedAt !== null}<div>
               <dt>{t($language, 'fiveHourPrimedLabel')}</dt>
               <dd>{date(account.fiveHourPrimedAt, $language)}</dd>
@@ -497,8 +500,31 @@
             </div>{/if}
         {/if}
       {/snippet}
+      {#snippet extra()}
+        {#if account}
+          <ClaudeResets
+            {account}
+            {now}
+            {locked}
+            heading={`${t($language, 'availableResets')}${account.resets.available === null ? '' : ` · ${account.resets.available}`}`}
+            working={resetting?.id === account.id ? resetting.kind : null}
+            onuse={(kind, trigger) => askReset(account.id, kind, trigger)}
+          />
+        {/if}
+      {/snippet}
     </AccountDetails>
   </Modal>{/if}
+
+{#if resetRequest && confirmRow}<ClaudeResetConfirm
+    name={confirmName}
+    row={confirmRow}
+    working={!!resetting}
+    disabled={locked}
+    error={$controller.error ? safeError($controller.error, $language) : null}
+    returnFocus={resetFocus}
+    onconfirm={() => void confirmReset()}
+    oncancel={() => (resetRequest = null)}
+  />{/if}
 
 {#if deleteTarget}<DeleteDialog
     text={t($language, 'deleteClaude', { name: deleteTarget.name })}

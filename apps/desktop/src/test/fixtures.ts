@@ -48,6 +48,7 @@ export function account(
       cooldownUntil: null,
       pending: false,
       lastOutcome: null,
+      offers: [],
     },
     primedAt: now - 3 * 86400,
     fiveHourPrimedAt: now - 2 * 3600,

@@ -2,6 +2,7 @@
 import { t, type Language } from './i18n';
 import { planLabel } from './format';
 import { codeMessage } from './controller';
+import { resetsView } from './claude-resets';
 import { launchBlock, launchBlockText, needsSignIn } from './claude-launch';
 import {
   defaultAutomation,
@@ -245,6 +246,7 @@ function row(
         ? null
         : t(locale, account.error ? 'switchUnverified' : 'switchChecking'),
     canSignIn: signIn,
+    resets: resetsView(account, now, locale),
     // Unlike a switch, the account in use can be launched too.
     canLaunch: launch === null,
     launchReason: launch ? launchBlockText(launch, locale) : null,

@@ -10,5 +10,7 @@ pub use views::*;
 
 pub use codex_engine::CodexLoginLaunch;
 pub use codex_views::*;
+/// The four kinds of banked Claude reset a manual use names.
+pub use switcher_core::ResetKind;
 /// The fixed model choices of a launch; the renderer can name nothing else.
 pub use switcher_platform::LaunchModel;

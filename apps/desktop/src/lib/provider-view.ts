@@ -6,6 +6,7 @@ import { age, duration } from './format';
 import { exactPercent } from './automation';
 import type { AccountAutomation, Settings } from './types';
 import type { CodexKeyUsage } from './codex-types';
+import type { ResetsView } from './claude-resets';
 
 export type ProviderKey = 'claude' | 'codex';
 
@@ -266,6 +267,8 @@ export interface AccountRowView {
   deleteReason: string | null;
   /** Claude only: the weekly Fable window; its value is null while unknown. */
   fable?: MeterView;
+  /** Claude only: the banked resets by kind, each with its Use action. */
+  resets?: ResetsView;
   /** Claude only: the account can start in its own window (the active one too). */
   canLaunch?: boolean;
   /** Why launching is unavailable for as long as the account stays like this. */

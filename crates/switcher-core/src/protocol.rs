@@ -126,6 +126,12 @@ impl ResetOutcome {
             Self::NotLimited => "reset unused: account is not at a limit",
             Self::Cooldown { .. } => "reset on cooldown",
             Self::Ineligible { .. } => "reset refused: account is ineligible",
+            Self::Unavailable { reason } if reason.as_deref() == Some("not_next_grant") => {
+                "reset not accepted: another reset has to be used first"
+            }
+            Self::Unavailable { reason } if reason.as_deref() == Some("unknown_grant") => {
+                "reset no longer listed: refresh and try again"
+            }
             Self::Unavailable { .. } => "reset unavailable",
             Self::Transport => "reset response unconfirmed — retry pending",
             Self::AuthError => "reset token rejected",
@@ -142,6 +148,12 @@ impl ResetOutcome {
             Self::NotLimited => "reset nefolosit: contul nu e la limită",
             Self::Cooldown { .. } => "reset în pauză (cooldown)",
             Self::Ineligible { .. } => "reset refuzat: neeligibil",
+            Self::Unavailable { reason } if reason.as_deref() == Some("not_next_grant") => {
+                "reset neacceptat: trebuie folosit întâi alt reset"
+            }
+            Self::Unavailable { reason } if reason.as_deref() == Some("unknown_grant") => {
+                "resetul nu mai apare în listă: reîmprospătează și reîncearcă"
+            }
             Self::Unavailable { .. } => "reset indisponibil",
             Self::Transport => "reset: răspuns neconfirmat — reîncercăm",
             Self::AuthError => "reset: token respins",
@@ -159,15 +171,31 @@ pub fn parse_reset_outcome(status: u16, body: &Value) -> ResetOutcome {
         return ResetOutcome::Transport;
     };
     let cooldown = body.get("cooldown_until").and_then(parse_timestamp);
+    let raw_reason = body.get("reason").and_then(Value::as_str);
+    // The provider says it could not tell whether the reset took effect. Nothing may
+    // be assumed, so the pending key stays for reconciliation: the same key is sent
+    // again, never a new one. A definite verdict (`reset`, `already_used`) wins.
+    if matches!(
+        raw_reason,
+        Some("stamp_indeterminate" | "reset_unconfirmed")
+    ) && !matches!(result, "reset" | "already_used")
+    {
+        return ResetOutcome::Transport;
+    }
     // Raw provider reasons can contain arbitrary response data. Retain only a small
     // set of protocol classifications; the user-facing text is always fixed.
-    let reason = body
-        .get("reason")
-        .and_then(Value::as_str)
+    let reason = raw_reason
         .filter(|s| {
             matches!(
                 *s,
-                "not_eligible" | "expired" | "paused" | "disabled" | "no_grants" | "not_available"
+                "not_eligible"
+                    | "expired"
+                    | "paused"
+                    | "disabled"
+                    | "no_grants"
+                    | "not_available"
+                    | "not_next_grant"
+                    | "unknown_grant"
             )
         })
         .map(str::to_owned);

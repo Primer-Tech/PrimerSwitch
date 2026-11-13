@@ -2,7 +2,7 @@
 
 use switcher_runtime::{
     AccountAutomationView, CodexLoginView, CodexReason, CodexSnapshot, ImportPreview, LaunchModel,
-    LaunchOutcome, LoginSession, RuntimeError, RuntimeHandle, SettingsView, Snapshot,
+    LaunchOutcome, LoginSession, ResetKind, RuntimeError, RuntimeHandle, SettingsView, Snapshot,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
@@ -98,6 +98,20 @@ async fn update_account_automation(
 async fn resume_automatic_returns(runtime: State<'_, RuntimeHandle>) -> Reply<Snapshot> {
     runtime
         .resume_automatic_returns()
+        .await
+        .map_err(|e| local_error(&runtime, e))
+}
+/// Uses one banked reset of `kind` on a saved account, the active one or not. An early
+/// use (no limit reached) only goes through when the renderer confirmed it first.
+#[tauri::command]
+async fn claude_use_reset(
+    runtime: State<'_, RuntimeHandle>,
+    id: String,
+    kind: ResetKind,
+    allow_early: bool,
+) -> Reply<Snapshot> {
+    runtime
+        .use_reset(&id, kind, allow_early)
         .await
         .map_err(|e| local_error(&runtime, e))
 }
@@ -563,6 +577,7 @@ fn main() {
             update_settings,
             update_account_automation,
             resume_automatic_returns,
+            claude_use_reset,
             import_current,
             begin_login,
             finish_login,

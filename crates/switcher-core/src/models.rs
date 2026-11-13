@@ -1,6 +1,8 @@
+use crate::{ResetKind, ResetUnavailable, is_reset_window};
 use chrono::{Datelike, Local, LocalResult, NaiveDate, TimeZone, Timelike};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::fmt;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -337,6 +339,28 @@ pub struct ResetGrant {
     pub paused: bool,
     pub usable_now: bool,
     pub use_requires_limit: bool,
+    // The fields below describe the grant to the user (its kind, why it cannot be used
+    // now). They are omitted while default, so older records keep their exact shape.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub label: String,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub resets_total: u32,
+    /// The server's own kind (`session`, `weekly` or `full`), when it names one.
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub grant_type: Option<ResetKind>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub gives_back_weekly: bool,
+    /// Percent used per known window, 0..=100.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub percent_used: BTreeMap<String, u8>,
+    /// Known windows that currently block using this grant.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub blocking: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<ResetUnavailable>,
+}
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 impl Default for ResetGrant {
     fn default() -> Self {
@@ -349,6 +373,13 @@ impl Default for ResetGrant {
             paused: false,
             usable_now: false,
             use_requires_limit: true,
+            label: String::new(),
+            resets_total: 0,
+            grant_type: None,
+            gives_back_weekly: false,
+            percent_used: BTreeMap::new(),
+            blocking: vec![],
+            unavailable_reason: None,
         }
     }
 }
@@ -394,8 +425,70 @@ impl<'de> Deserialize<'de> for ResetGrant {
                 .get("use_requires_limit")
                 .and_then(Value::as_bool)
                 .unwrap_or(true),
+            // Every descriptive field is optional on the wire. A malformed one falls
+            // back to its default and never discards the grant or its usage.
+            label: v
+                .get("label")
+                .and_then(Value::as_str)
+                .map(|s| s.chars().take(MAX_LABEL_CHARS).collect())
+                .unwrap_or_default(),
+            resets_total: v
+                .get("resets_total")
+                .and_then(Value::as_u64)
+                .and_then(|n| u32::try_from(n).ok())
+                .unwrap_or(0),
+            grant_type: v
+                .get("type")
+                .and_then(Value::as_str)
+                .and_then(ResetKind::parse_wire_type),
+            gives_back_weekly: v
+                .get("gives_back_weekly")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            percent_used: v
+                .get("percent_used")
+                .and_then(Value::as_object)
+                .map(|map| {
+                    map.iter()
+                        .filter(|(window, _)| is_reset_window(window))
+                        .filter_map(|(window, value)| {
+                            percent_value(value).map(|p| (window.clone(), p))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            blocking: reset_windows(v.get("blocking")),
+            unavailable_reason: v
+                .get("unavailable_reason")
+                .and_then(Value::as_str)
+                .and_then(ResetUnavailable::parse),
         })
     }
+}
+/// A label is display data the renderer never receives; keep it bounded anyway.
+const MAX_LABEL_CHARS: usize = 100;
+/// A whole percent from 0 to 100, as Claude Code reads it; anything else is ignored.
+fn percent_value(value: &Value) -> Option<u8> {
+    let n = value.as_u64().or_else(|| {
+        value
+            .as_f64()
+            .filter(|n| n.is_finite() && n.fract() == 0.0 && *n >= 0.0)
+            .map(|n| n as u64)
+    })?;
+    u8::try_from(n).ok().filter(|n| *n <= 100)
+}
+/// The known windows of a list, in order; unknown or non-string entries are dropped.
+fn reset_windows(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(Value::as_str)
+                .filter(|window| is_reset_window(window))
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 #[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
 pub struct ResetStatus {
@@ -405,6 +498,12 @@ pub struct ResetStatus {
     pub next_grant_id: Option<String>,
     pub cooldown_until: Option<i64>,
     pub weekly_resets_at: Option<i64>,
+    /// The account is at one of its limits (omitted while false).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub at_limit: bool,
+    /// Known windows the account is at the wall on.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub exhausted: Vec<String>,
 }
 impl<'de> Deserialize<'de> for ResetStatus {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
@@ -433,6 +532,8 @@ impl<'de> Deserialize<'de> for ResetStatus {
                 .map(str::to_owned),
             cooldown_until: v.get("cooldown_until").and_then(parse_timestamp),
             weekly_resets_at: v.get("weekly_resets_at").and_then(parse_timestamp),
+            at_limit: v.get("at_limit").and_then(Value::as_bool).unwrap_or(false),
+            exhausted: reset_windows(v.get("exhausted")),
         })
     }
 }

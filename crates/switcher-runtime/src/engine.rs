@@ -113,6 +113,12 @@ pub enum RuntimeError {
     Import,
     #[error("The previous reset request must be confirmed before another attempt.")]
     PendingReset,
+    #[error("No reset of this kind can be used right now. Refresh and try again.")]
+    ResetNotUsable,
+    #[error("This reset is usable once you reach a limit it refills.")]
+    ResetNeedsLimit,
+    #[error("Using this reset now needs your confirmation first.")]
+    ResetEarlyUse,
     #[error("The Claude Code version could not be detected. Install a recognized version.")]
     CliVersion,
     #[error("Launching Claude from PrimerSwitch is not available on this system.")]
@@ -153,6 +159,9 @@ impl RuntimeError {
             Self::LoginIdentityMismatch=>"Autentificarea a returnat alt cont Claude sau alt spațiu de lucru. Alege spațiul de lucru inițial al contului salvat sau folosește Adaugă un cont.".into(),
             Self::Import=>"Importul nu mai este valid. Selectează din nou dosarul.".into(),
             Self::PendingReset=>"Cererea anterioară de resetare trebuie confirmată înainte de o nouă încercare.".into(),
+            Self::ResetNotUsable=>"Niciun reset de acest tip nu poate fi folosit acum. Reîmprospătează și reîncearcă.".into(),
+            Self::ResetNeedsLimit=>"Acest reset poate fi folosit după ce atingi o limită pe care o reface.".into(),
+            Self::ResetEarlyUse=>"Folosirea acestui reset acum necesită mai întâi confirmarea ta.".into(),
             Self::CliVersion=>"Versiunea Claude Code nu a putut fi detectată. Instalează o versiune recunoscută.".into(),
             Self::LaunchUnsupported=>"Lansarea Claude din PrimerSwitch nu este disponibilă pe acest sistem.".into(),
             Self::LaunchNotInstalled=>"Claude Code nativ nu a fost găsit. Instalează-l, apoi încearcă din nou.".into(),
@@ -182,6 +191,9 @@ impl RuntimeError {
             Self::LoginIdentityMismatch => "loginIdentityMismatch",
             Self::Import => "importExpired",
             Self::PendingReset => "pendingResetError",
+            Self::ResetNotUsable => "resetNotUsable",
+            Self::ResetNeedsLimit => "resetNeedsLimit",
+            Self::ResetEarlyUse => "earlyUseNeedsConfirmation",
             Self::CliVersion => "cliVersionError",
             Self::LaunchUnsupported => "launchUnsupported",
             Self::LaunchNotInstalled => "launchNotInstalled",
@@ -209,7 +221,7 @@ impl RuntimeError {
 }
 
 /// Every parameterless error, for mapping persisted text back to a stable code.
-const KNOWN_ERRORS: [RuntimeError; 22] = [
+const KNOWN_ERRORS: [RuntimeError; 25] = [
     RuntimeError::Storage,
     RuntimeError::UnavailableStorage,
     RuntimeError::UnsupportedContext,
@@ -226,6 +238,9 @@ const KNOWN_ERRORS: [RuntimeError; 22] = [
     RuntimeError::LoginIdentityMismatch,
     RuntimeError::Import,
     RuntimeError::PendingReset,
+    RuntimeError::ResetNotUsable,
+    RuntimeError::ResetNeedsLimit,
+    RuntimeError::ResetEarlyUse,
     RuntimeError::CliVersion,
     RuntimeError::LaunchUnsupported,
     RuntimeError::LaunchNotInstalled,
@@ -481,6 +496,7 @@ enum Command {
     Renewal(String, Option<u8>),
     Automation(String, AccountAutomation),
     ResumeReturns,
+    UseReset(String, ResetKind, bool),
     Settings(Settings),
     ImportCurrent,
     BeginLogin(u64, Option<String>),
@@ -884,7 +900,10 @@ impl RuntimeHandle {
         let full = matches!(command, Command::RefreshAll | Command::Tick(true));
         let wake = matches!(
             command,
-            Command::Settings(_) | Command::Automation(_, _) | Command::ResumeReturns
+            Command::Settings(_)
+                | Command::Automation(_, _)
+                | Command::ResumeReturns
+                | Command::UseReset(..)
         );
         // Dedicated-profile commands only change in-memory launch intent and that
         // account's own profile files. They must not rewrite the global vault: its
@@ -1016,6 +1035,17 @@ impl RuntimeHandle {
         automation: AccountAutomationView,
     ) -> Result<Snapshot, RuntimeError> {
         self.snapshot_command(Command::Automation(id.into(), automation.into()))
+            .await
+    }
+    /// Manually uses one banked reset of `kind` on a saved account, active or not. It
+    /// never switches accounts and does not depend on the automatic reset setting.
+    pub async fn use_reset(
+        &self,
+        id: &str,
+        kind: ResetKind,
+        allow_early: bool,
+    ) -> Result<Snapshot, RuntimeError> {
+        self.snapshot_command(Command::UseReset(id.into(), kind, allow_early))
             .await
     }
     pub async fn resume_automatic_returns(&self) -> Result<Snapshot, RuntimeError> {
@@ -1512,6 +1542,7 @@ impl Engine {
                             .last_reset_outcome
                             .as_ref()
                             .map(|text| safe_reset_text(text, &self.saved.settings.language)),
+                        offers: offers_for(a, now),
                     },
                     primed_at: a.primed_for_reset_at,
                     five_hour_primed_at: a.five_hour_started_at,
@@ -1592,6 +1623,9 @@ impl Engine {
             }
             Command::ResumeReturns => {
                 self.saved.return_hold_until = None;
+            }
+            Command::UseReset(id, kind, allow_early) => {
+                self.use_reset(&id, kind, allow_early).await?;
             }
             Command::ImportCurrent => self.import_current().await?,
             Command::BeginLogin(epoch, account_id) => {
@@ -3497,6 +3531,23 @@ impl Engine {
         {
             return Err(RuntimeError::Provider);
         }
+        let (success, _) = self.send_claim(id, grant, &org, &expected, now).await?;
+        Ok(success)
+    }
+    /// Sends one claim under a durable idempotency key. The pending request and the
+    /// attempt time are saved BEFORE the request leaves; the received outcome is kept on
+    /// its stable account before CLI ownership is checked again, and a success
+    /// invalidates the pre-reset usage reading so no decision is made on the stale 100.
+    /// Shared by the automatic and the manual path.
+    async fn send_claim(
+        &mut self,
+        id: &str,
+        grant: &str,
+        org: &str,
+        expected: &str,
+        now: i64,
+    ) -> Result<(bool, ResetOutcome), RuntimeError> {
+        let i = self.index(id)?;
         let pending = prepare_reset_claim(
             grant,
             self.saved.accounts[i].pending_reset_claim.as_ref(),
@@ -3511,10 +3562,10 @@ impl Engine {
         self.saved.accounts[i].pending_reset_claim = Some(pending.clone());
         self.saved.accounts[i].last_reset_attempt_at = Some(now);
         self.persist()?;
-        self.ensure_context(&expected)?;
+        self.ensure_context(expected)?;
         let outcome = self
             .client()?
-            .claim_reset(&org, grant, &pending.request_id, &token)
+            .claim_reset(org, grant, &pending.request_id, &token)
             .await;
         // Preserve the received outcome on its stable account before checking CLI
         // ownership: an external login cannot erase knowledge of a scarce effect.
@@ -3538,7 +3589,7 @@ impl Engine {
             self.saved.accounts[i].last_usage_at = None;
         }
         self.persist()?;
-        self.ensure_context(&expected)?;
+        self.ensure_context(expected)?;
         if success {
             let label = self.label(id);
             self.notify(if self.ro() {
@@ -3547,7 +3598,97 @@ impl Engine {
                 format!("Reset used on {label}: its limits are available again.")
             });
         }
-        Ok(success)
+        Ok((success, outcome))
+    }
+    /// A manual claim of one kind of banked reset on a saved account. It is the user's
+    /// own action: it works for the active and for an inactive account (using that
+    /// account's own token and workspace, never switching and never touching the CLI
+    /// login), does not depend on the automatic setting and is not gated by
+    /// `decide_resets`. Everything that protects a scarce effect still applies: a fresh
+    /// identity-verified reading, a status read within 120 s, one pending request at a
+    /// time with its key reused after the replay floor, and the key persisted before
+    /// anything is sent.
+    async fn use_reset(
+        &mut self,
+        id: &str,
+        kind: ResetKind,
+        allow_early: bool,
+    ) -> Result<(), RuntimeError> {
+        self.observe_active()?;
+        let i = self.index(id)?;
+        let expected = self.live()?.identity_fingerprint;
+        let org = self.saved.accounts[i]
+            .organization_uuid()
+            .filter(|s| {
+                !s.is_empty()
+                    && s.len() <= 64
+                    && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            })
+            .ok_or(RuntimeError::Identity)?
+            .to_owned();
+        if self.saved.accounts[i]
+            .access_token()
+            .is_none_or(str::is_empty)
+        {
+            return Err(RuntimeError::Identity);
+        }
+        // An explicit use may refresh a reading that is too old to trust, as the
+        // Refresh button does, but never starts the priming a refresh would allow.
+        if !self.fresh(&self.saved.accounts[i]) {
+            self.poll_account_with_priming(id, true, false, false)
+                .await?;
+        }
+        if !self.fresh(&self.saved.accounts[self.index(id)?]) {
+            return Err(RuntimeError::Provider);
+        }
+        if self.endpoint_allowed(id, true) {
+            let _ = self.metadata(id, &expected).await?;
+        }
+        let i = self.index(id)?;
+        let now = self.clock.now();
+        let status = self.saved.accounts[i]
+            .reset_status
+            .clone()
+            .ok_or(RuntimeError::Provider)?;
+        if !recent(self.saved.accounts[i].reset_status_at, now, 120) {
+            return Err(RuntimeError::Provider);
+        }
+        let grant = match self.saved.accounts[i].pending_reset_claim.clone() {
+            // An unresolved request only ever repeats itself: the same grant and key,
+            // after the replay floor. Another kind, or another grant, waits for it.
+            Some(pending) => {
+                if grant_kind(&status, &pending.grant_id) != Some(kind)
+                    || self.saved.accounts[i]
+                        .last_reset_attempt_at
+                        .is_some_and(|last| now.saturating_sub(last) < CLAIM_REPLAY_FLOOR)
+                {
+                    return Err(RuntimeError::PendingReset);
+                }
+                pending.grant_id
+            }
+            None => {
+                plan_manual_claim(&status, kind, now, allow_early)
+                    .map_err(|refusal| match refusal {
+                        ManualRefusal::NotUsable => RuntimeError::ResetNotUsable,
+                        ManualRefusal::NeedsLimit => RuntimeError::ResetNeedsLimit,
+                        ManualRefusal::EarlyUseNeedsConfirmation => RuntimeError::ResetEarlyUse,
+                    })?
+                    .grant_id
+            }
+        };
+        let (_, outcome) = self.send_claim(id, &grant, &org, &expected, now).await?;
+        // The status behind a refusal was wrong in some way (another grant is next, the
+        // account is not at a limit, the grant is gone): the next attempt re-reads it.
+        if matches!(
+            outcome,
+            ResetOutcome::NotLimited
+                | ResetOutcome::Ineligible { .. }
+                | ResetOutcome::Unavailable { .. }
+        ) {
+            let i = self.index(id)?;
+            self.saved.accounts[i].reset_status_at = None;
+        }
+        Ok(())
     }
     async fn import_current(&mut self) -> Result<(), RuntimeError> {
         let live = self.live()?;
@@ -3801,6 +3942,12 @@ fn safe_reset_text(text: &str, locale: &str) -> String {
         ResetOutcome::Cooldown { until: None },
         ResetOutcome::Ineligible { reason: None },
         ResetOutcome::Unavailable { reason: None },
+        ResetOutcome::Unavailable {
+            reason: Some("not_next_grant".into()),
+        },
+        ResetOutcome::Unavailable {
+            reason: Some("unknown_grant".into()),
+        },
         ResetOutcome::Transport,
         ResetOutcome::AuthError,
     ];
@@ -5208,6 +5355,658 @@ mod tests {
                 .unwrap()["request_id"],
             pending.request_id
         );
+    }
+    // Manual use of banked resets by kind (owner request). Fixtures and a fake
+    // transport only: no real account, endpoint or Claude login is involved.
+    fn reset_url(org: &str) -> String {
+        format!("https://api.anthropic.com/api/organizations/{org}/reset_rate_limits")
+    }
+    /// Reset grants as the usage endpoint reports them. Reading the usage is how the
+    /// runtime learns them, so a test sets them there and lets the preflight fetch them.
+    fn serve_resets(fake: &Fake, cedar: Value) {
+        *fake.usage.lock().unwrap() = json!({
+            "five_hour":{"utilization":20,"resets_at":10000},
+            "seven_day":{"utilization":20,"resets_at":90000},
+            "limits":[],
+            "cedar_ember":cedar
+        });
+    }
+    fn grant_json(id: &str, extra: Value) -> Value {
+        let mut value = json!({"id":id,"resets_left":1,"resets_total":1,"usable_now":true,
+            "use_requires_limit":true,"clears":["five_hour"]});
+        value
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        value
+    }
+    /// Fable (needs the weekly limit), weekly and session grants; weekly is exhausted.
+    fn three_kinds() -> Value {
+        json!({
+            "eligible":true,"at_limit":true,"exhausted":["seven_day"],
+            "next_grant_id":"fable-1",
+            "grants":[
+                grant_json("fable-1", json!({"gives_back_weekly":true,"ends_at":5000,
+                    "clears":["seven_day_overage_included"]})),
+                grant_json("weekly-1", json!({"ends_at":6000,"clears":["seven_day"]})),
+                grant_json("session-1", json!({"clears":["five_hour"]}))
+            ]
+        })
+    }
+    struct Claim {
+        url: String,
+        authorization: String,
+        body: Value,
+    }
+    fn claims(fake: &Fake) -> Vec<Claim> {
+        fake.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.url.ends_with("/reset_rate_limits"))
+            .map(|c| Claim {
+                url: c.url.clone(),
+                authorization: c.headers.get("authorization").cloned().unwrap_or_default(),
+                body: c.body.clone().unwrap_or(Value::Null),
+            })
+            .collect()
+    }
+    fn offer(handle: &RuntimeHandle, id: &str, kind: ResetKind) -> Option<ResetOfferView> {
+        view(handle, id)
+            .resets
+            .offers
+            .into_iter()
+            .find(|o| o.kind == kind)
+    }
+    #[tokio::test]
+    async fn a_manual_use_sends_one_claim_for_the_chosen_kind_and_invalidates_the_usage() {
+        let fake = Arc::new(Fake::default());
+        let (temp, handle, _clock, _paths) =
+            fixture(vec![account("a", 1000)], Some("a"), 1000, fake.clone());
+        serve_resets(&fake, three_kinds());
+        fake.replies.lock().unwrap().push_back((
+            "https://api.anthropic.com/api/organizations/org-a/reset_rate_limits",
+            Ok(response(200, json!({"result":"reset","resets_left":0}))),
+        ));
+        let mut notices = handle.notifications();
+        // The fixture leaves automatic resets off, and nothing is at 100%: the manual
+        // use does not depend on either.
+        {
+            let engine = handle.inner.owner.lock().await;
+            assert!(!engine.saved.settings.auto_use_resets_enabled);
+        }
+        let snapshot = handle
+            .use_reset("a", ResetKind::Fable, false)
+            .await
+            .unwrap();
+        let sent = claims(&fake);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].url, reset_url("org-a"));
+        let body = &sent[0].body;
+        assert_eq!(body["program"], "cedar_ember");
+        assert_eq!(body["grant_id"], "fable-1");
+        assert!(!body["request_id"].as_str().unwrap().is_empty());
+        assert!(sent[0].authorization.contains("token-a-SENTINEL"));
+        // The spent Fable reset is gone; the other kinds are untouched.
+        let a = snapshot.accounts.iter().find(|a| a.id == "a").unwrap();
+        assert_eq!(a.resets.available, Some(2));
+        assert!(a.resets.offers.iter().all(|o| o.kind != ResetKind::Fable));
+        assert_eq!(
+            a.resets.offers.iter().map(|o| o.kind).collect::<Vec<_>>(),
+            vec![ResetKind::Session, ResetKind::Weekly]
+        );
+        assert_eq!(
+            a.resets.last_outcome.as_deref(),
+            Some("reset used — limits refilled")
+        );
+        assert!(!a.resets.pending);
+        {
+            let engine = handle.inner.owner.lock().await;
+            // The reading from before the reset is stale: nothing decides on it.
+            assert!(!engine.saved.readings["a"].complete);
+            assert_eq!(engine.saved.accounts[0].last_usage_at, None);
+            assert!(engine.saved.accounts[0].pending_reset_claim.is_none());
+            assert_eq!(engine.active_id.as_deref(), Some("a"));
+        }
+        assert!(
+            notices
+                .try_recv()
+                .unwrap()
+                .body
+                .contains("limits are available again")
+        );
+        // Neither a grant id nor a request id crosses the IPC boundary.
+        let ipc = serde_json::to_string(&handle.get_snapshot()).unwrap();
+        let request_id = body["request_id"].as_str().unwrap();
+        for secret in ["fable-1", "weekly-1", "session-1", request_id] {
+            assert!(
+                !ipc.contains(secret),
+                "{secret} must not be in the snapshot"
+            );
+        }
+        let saved = saved_record(&temp);
+        assert!(saved.accounts[0].pending_reset_claim.is_none());
+    }
+    #[tokio::test]
+    async fn an_inactive_account_uses_its_own_token_and_workspace_and_never_switches() {
+        let fake = Arc::new(Fake::default());
+        let (_temp, handle, _clock, paths) = fixture(
+            vec![account("a", 1000), account("b", 1000)],
+            Some("a"),
+            1000,
+            fake.clone(),
+        );
+        serve_resets(&fake, three_kinds());
+        let credentials_before = std::fs::read(&paths.credentials_file).unwrap();
+        let global_before = std::fs::read(&paths.global_config_file).unwrap();
+        handle
+            .use_reset("b", ResetKind::Weekly, false)
+            .await
+            .unwrap();
+        let sent = claims(&fake);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].url, reset_url("org-b"));
+        assert!(sent[0].authorization.contains("token-b-SENTINEL"));
+        assert!(!sent[0].authorization.contains("token-a-"));
+        assert_eq!(sent[0].body["grant_id"], "weekly-1");
+        // No switch, no write to the live CLI login, no token exchange.
+        assert_eq!(handle.get_snapshot().active_id.as_deref(), Some("a"));
+        assert_eq!(
+            std::fs::read(&paths.credentials_file).unwrap(),
+            credentials_before
+        );
+        assert_eq!(
+            std::fs::read(&paths.global_config_file).unwrap(),
+            global_before
+        );
+        assert_eq!(count(&fake, TOKEN_URL), 0);
+        assert_eq!(count(&fake, INFERENCE_URL), 0);
+        // Only account b's own status changed.
+        assert!(offer(&handle, "b", ResetKind::Weekly).is_none());
+        assert!(view(&handle, "a").resets.offers.is_empty());
+    }
+    #[tokio::test]
+    async fn a_reset_that_needs_a_limit_not_yet_reached_sends_nothing() {
+        let fake = Arc::new(Fake::default());
+        let (temp, handle, _clock, _paths) =
+            fixture(vec![account("a", 1000)], Some("a"), 1000, fake.clone());
+        // Only the five-hour limit is reached; the weekly grant needs the weekly one.
+        serve_resets(
+            &fake,
+            json!({"eligible":true,"at_limit":true,"exhausted":["five_hour"],
+                "grants":[grant_json("weekly-1", json!({"clears":["seven_day"]}))]}),
+        );
+        assert_eq!(
+            handle
+                .use_reset("a", ResetKind::Weekly, true)
+                .await
+                .unwrap_err(),
+            RuntimeError::ResetNeedsLimit
+        );
+        assert!(claims(&fake).is_empty());
+        assert!(
+            saved_record(&temp).accounts[0]
+                .pending_reset_claim
+                .is_none()
+        );
+        assert_eq!(
+            saved_record(&temp).accounts[0].last_reset_attempt_at,
+            None,
+            "a refusal is not an attempt"
+        );
+        let offer = offer(&handle, "a", ResetKind::Weekly).unwrap();
+        assert!(!offer.usable_now);
+        assert_eq!(offer.unavailable_reason, Some(ResetOfferReason::NeedsLimit));
+    }
+    #[tokio::test]
+    async fn an_early_use_needs_confirmation_and_a_missing_kind_is_refused() {
+        let fake = Arc::new(Fake::default());
+        let (_temp, handle, _clock, _paths) =
+            fixture(vec![account("a", 1000)], Some("a"), 1000, fake.clone());
+        serve_resets(
+            &fake,
+            json!({"eligible":true,"grants":[grant_json("full-1", json!({
+                "use_requires_limit":false,"clears":["five_hour","seven_day"],
+                "percent_used":{"five_hour":30,"seven_day":65}}))]}),
+        );
+        // The view marks it as an early use and says how much is left.
+        handle.refresh_account("a").await.unwrap();
+        let early = offer(&handle, "a", ResetKind::Full).unwrap();
+        assert!(early.usable_now);
+        assert_eq!(
+            early.early_use,
+            Some(EarlyUseView {
+                percent_left: Some(35)
+            })
+        );
+        assert_eq!(
+            handle
+                .use_reset("a", ResetKind::Full, false)
+                .await
+                .unwrap_err(),
+            RuntimeError::ResetEarlyUse
+        );
+        assert!(
+            claims(&fake).is_empty(),
+            "nothing is sent without the confirmation"
+        );
+        // No grant of the requested kind: a clear error and still no claim.
+        assert_eq!(
+            handle
+                .use_reset("a", ResetKind::Fable, true)
+                .await
+                .unwrap_err(),
+            RuntimeError::ResetNotUsable
+        );
+        assert!(claims(&fake).is_empty());
+        // Confirmed: it goes out.
+        handle.use_reset("a", ResetKind::Full, true).await.unwrap();
+        assert_eq!(claims(&fake).len(), 1);
+        assert_eq!(claims(&fake)[0].body["grant_id"], "full-1");
+    }
+    #[tokio::test]
+    async fn the_pending_key_is_saved_before_the_claim_leaves() {
+        let fake = Arc::new(Fake::default());
+        let (temp, handle, _clock, _paths) =
+            fixture(vec![account("a", 1000)], Some("a"), 1000, fake.clone());
+        serve_resets(&fake, three_kinds());
+        let started = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        *fake.pause.lock().unwrap() = Some((
+            "https://api.anthropic.com/api/organizations/org-a/reset_rate_limits",
+            started.clone(),
+            resume.clone(),
+        ));
+        let task = {
+            let h = handle.clone();
+            tokio::spawn(async move { h.use_reset("a", ResetKind::Weekly, false).await })
+        };
+        started.notified().await;
+        // The request is on the wire and unanswered: the key is already durable.
+        let on_disk = saved_record(&temp);
+        let pending = on_disk.accounts[0].pending_reset_claim.clone().unwrap();
+        assert_eq!(pending.grant_id, "weekly-1");
+        assert_eq!(on_disk.accounts[0].last_reset_attempt_at, Some(1000));
+        assert_eq!(claims(&fake)[0].body["request_id"], pending.request_id);
+        resume.notify_one();
+        task.await.unwrap().unwrap();
+        assert!(
+            saved_record(&temp).accounts[0]
+                .pending_reset_claim
+                .is_none()
+        );
+    }
+    #[tokio::test]
+    async fn an_unconfirmed_answer_keeps_the_key_and_a_later_use_replays_it() {
+        // Every ambiguous answer, however it arrives, keeps the same pending key.
+        let answers: Vec<Result<HttpResponse, ClientError>> = vec![
+            Err(ClientError::Transport),
+            Ok(response(
+                200,
+                json!({"result":"unavailable","reason":"reset_unconfirmed"}),
+            )),
+            Ok(response(
+                200,
+                json!({"result":"unavailable","reason":"stamp_indeterminate"}),
+            )),
+            Ok(response(503, json!({"result":"unavailable"}))),
+        ];
+        for answer in answers {
+            let fake = Arc::new(Fake::default());
+            let (temp, handle, clock, _paths) =
+                fixture(vec![account("a", 1000)], Some("a"), 1000, fake.clone());
+            serve_resets(&fake, three_kinds());
+            fake.replies.lock().unwrap().push_back((
+                "https://api.anthropic.com/api/organizations/org-a/reset_rate_limits",
+                answer,
+            ));
+            handle
+                .use_reset("a", ResetKind::Weekly, false)
+                .await
+                .unwrap();
+            let key = claims(&fake)[0].body["request_id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let saved = saved_record(&temp);
+            let pending = saved.accounts[0].pending_reset_claim.clone().unwrap();
+            assert_eq!(
+                (pending.grant_id.as_str(), pending.request_id.as_str()),
+                ("weekly-1", key.as_str())
+            );
+            assert_eq!(
+                saved.accounts[0].last_reset_outcome.as_deref(),
+                Some("reset response unconfirmed — retry pending")
+            );
+            // Nothing was spent as far as we know: the grant is still listed, but only
+            // the same request may be repeated, and not yet.
+            let weekly = offer(&handle, "a", ResetKind::Weekly).unwrap();
+            assert!(!weekly.usable_now);
+            assert_eq!(
+                weekly.unavailable_reason,
+                Some(ResetOfferReason::PendingClaim)
+            );
+            assert!(view(&handle, "a").resets.pending);
+            assert_eq!(
+                handle
+                    .use_reset("a", ResetKind::Weekly, false)
+                    .await
+                    .unwrap_err(),
+                RuntimeError::PendingReset,
+                "the replay floor"
+            );
+            // Another kind cannot be claimed while this one is unresolved.
+            clock.0.store(1300, Ordering::SeqCst);
+            assert_eq!(
+                handle
+                    .use_reset("a", ResetKind::Session, false)
+                    .await
+                    .unwrap_err(),
+                RuntimeError::PendingReset
+            );
+            assert_eq!(claims(&fake).len(), 1, "no second request so far");
+            // After the floor the view offers the retry, and it reuses the same key.
+            assert!(offer(&handle, "a", ResetKind::Weekly).unwrap().usable_now);
+            handle
+                .use_reset("a", ResetKind::Weekly, false)
+                .await
+                .unwrap();
+            let sent = claims(&fake);
+            assert_eq!(sent.len(), 2);
+            for claim in &sent {
+                assert_eq!(claim.body["request_id"], key.as_str());
+                assert_eq!(claim.body["grant_id"], "weekly-1");
+            }
+            assert!(
+                saved_record(&temp).accounts[0]
+                    .pending_reset_claim
+                    .is_none()
+            );
+        }
+    }
+    #[tokio::test]
+    async fn a_pending_request_whose_grant_vanished_blocks_every_kind_until_reconciled() {
+        let fake = Arc::new(Fake::default());
+        let (_temp, handle, clock, _paths) =
+            fixture(vec![account("a", 1000)], Some("a"), 1000, fake.clone());
+        serve_resets(&fake, three_kinds());
+        {
+            let mut engine = handle.inner.owner.lock().await;
+            engine.saved.accounts[0].pending_reset_claim =
+                Some(prepare_reset_claim("gone-1", None, 1000).unwrap());
+            engine.saved.accounts[0].last_reset_attempt_at = Some(1000);
+        }
+        clock.0.store(2000, Ordering::SeqCst);
+        for kind in ResetKind::ALL {
+            assert_eq!(
+                handle.use_reset("a", kind, true).await.unwrap_err(),
+                RuntimeError::PendingReset
+            );
+        }
+        assert!(claims(&fake).is_empty());
+        for offer in view(&handle, "a").resets.offers {
+            assert!(!offer.usable_now);
+            assert_eq!(
+                offer.unavailable_reason,
+                Some(ResetOfferReason::PendingClaim)
+            );
+        }
+    }
+    #[tokio::test]
+    async fn a_definite_refusal_clears_the_key_and_the_next_attempt_reads_the_status_again() {
+        let fake = Arc::new(Fake::default());
+        let (temp, handle, clock, _paths) =
+            fixture(vec![account("a", 1000)], Some("a"), 1000, fake.clone());
+        serve_resets(&fake, three_kinds());
+        fake.replies.lock().unwrap().push_back((
+            "https://api.anthropic.com/api/organizations/org-a/reset_rate_limits",
+            Ok(response(
+                200,
+                json!({"result":"unavailable","reason":"not_next_grant"}),
+            )),
+        ));
+        let snapshot = handle
+            .use_reset("a", ResetKind::Weekly, false)
+            .await
+            .unwrap();
+        let a = snapshot.accounts.iter().find(|a| a.id == "a").unwrap();
+        assert_eq!(
+            a.resets.last_outcome.as_deref(),
+            Some("reset not accepted: another reset has to be used first")
+        );
+        assert!(!a.resets.pending);
+        let first_key = claims(&fake)[0].body["request_id"].clone();
+        {
+            let saved = saved_record(&temp);
+            assert!(saved.accounts[0].pending_reset_claim.is_none());
+            assert_eq!(
+                saved.accounts[0].reset_status_at, None,
+                "the status is stale now"
+            );
+        }
+        // Within two minutes the status cannot be re-read, so nothing is sent on it.
+        assert_eq!(
+            handle
+                .use_reset("a", ResetKind::Weekly, false)
+                .await
+                .unwrap_err(),
+            RuntimeError::Provider
+        );
+        assert_eq!(claims(&fake).len(), 1);
+        // Later it re-reads, and a new attempt is a new request.
+        clock.0.store(1130, Ordering::SeqCst);
+        handle
+            .use_reset("a", ResetKind::Weekly, false)
+            .await
+            .unwrap();
+        let sent = claims(&fake);
+        assert_eq!(sent.len(), 2);
+        assert_ne!(sent[1].body["request_id"], first_key);
+    }
+    #[tokio::test]
+    async fn other_definite_verdicts_are_final_and_cooldown_blocks_further_use() {
+        for (answer, text) in [
+            (
+                json!({"result":"not_limited","reason":"not_limited"}),
+                "reset unused: account is not at a limit",
+            ),
+            (json!({"result":"already_used"}), "reset already used"),
+            (
+                json!({"result":"cooldown","cooldown_until":1600}),
+                "reset on cooldown",
+            ),
+        ] {
+            let fake = Arc::new(Fake::default());
+            let (temp, handle, _clock, _paths) =
+                fixture(vec![account("a", 1000)], Some("a"), 1000, fake.clone());
+            serve_resets(&fake, three_kinds());
+            fake.replies.lock().unwrap().push_back((
+                "https://api.anthropic.com/api/organizations/org-a/reset_rate_limits",
+                Ok(response(200, answer.clone())),
+            ));
+            let snapshot = handle
+                .use_reset("a", ResetKind::Weekly, false)
+                .await
+                .unwrap();
+            let a = snapshot.accounts.iter().find(|a| a.id == "a").unwrap();
+            assert_eq!(a.resets.last_outcome.as_deref(), Some(text), "{answer}");
+            assert!(
+                saved_record(&temp).accounts[0]
+                    .pending_reset_claim
+                    .is_none()
+            );
+            if answer["result"] == "cooldown" {
+                assert_eq!(a.resets.cooldown_until, Some(1600));
+                assert!(
+                    a.resets
+                        .offers
+                        .iter()
+                        .all(|o| o.unavailable_reason == Some(ResetOfferReason::Cooldown))
+                );
+            }
+        }
+    }
+    #[tokio::test]
+    async fn a_stale_status_that_cannot_be_refreshed_sends_nothing() {
+        let fake = Arc::new(Fake::default());
+        let (_temp, handle, _clock, _paths) =
+            fixture(vec![account("a", 1000)], Some("a"), 1000, fake.clone());
+        {
+            let mut engine = handle.inner.owner.lock().await;
+            let a = &mut engine.saved.accounts[0];
+            a.reset_status = serde_json::from_value(three_kinds()).ok();
+            a.reset_status_at = Some(500);
+            // Claude asked us to back off: no read is allowed, so the status stays old.
+            a.rate_limited_until = Some(5000);
+        }
+        assert_eq!(
+            handle
+                .use_reset("a", ResetKind::Weekly, false)
+                .await
+                .unwrap_err(),
+            RuntimeError::Provider
+        );
+        assert!(claims(&fake).is_empty());
+        assert_eq!(count(&fake, USAGE_URL), 0);
+    }
+    #[tokio::test]
+    async fn an_unknown_account_or_a_broken_identity_sends_nothing() {
+        let fake = Arc::new(Fake::default());
+        let (_temp, handle, _clock, _paths) =
+            fixture(vec![account("a", 1000)], Some("a"), 1000, fake.clone());
+        serve_resets(&fake, three_kinds());
+        assert_eq!(
+            handle
+                .use_reset("nobody", ResetKind::Weekly, true)
+                .await
+                .unwrap_err(),
+            RuntimeError::MissingAccount
+        );
+        {
+            let mut engine = handle.inner.owner.lock().await;
+            engine.saved.accounts[0].oauth_account["organizationUuid"] = json!("../bad");
+        }
+        assert_eq!(
+            handle
+                .use_reset("a", ResetKind::Weekly, true)
+                .await
+                .unwrap_err(),
+            RuntimeError::Identity
+        );
+        {
+            let mut engine = handle.inner.owner.lock().await;
+            engine.saved.accounts[0].oauth_account["organizationUuid"] = json!("org-a");
+            engine.saved.accounts[0].credentials["claudeAiOauth"]["accessToken"] = json!("");
+        }
+        assert_eq!(
+            handle
+                .use_reset("a", ResetKind::Weekly, true)
+                .await
+                .unwrap_err(),
+            RuntimeError::Identity
+        );
+        assert!(claims(&fake).is_empty());
+    }
+    #[tokio::test]
+    async fn the_demo_and_unavailable_runtimes_refuse_a_manual_use() {
+        let demo = RuntimeHandle::demo();
+        assert_eq!(
+            demo.use_reset("any", ResetKind::Fable, true)
+                .await
+                .unwrap_err(),
+            RuntimeError::ReadOnly
+        );
+    }
+    #[tokio::test]
+    async fn the_offers_view_lists_kinds_in_order_without_ids_and_with_camel_case_keys() {
+        let fake = Arc::new(Fake::default());
+        let (_temp, handle, _clock, _paths) =
+            fixture(vec![account("a", 1000)], Some("a"), 1000, fake.clone());
+        serve_resets(&fake, three_kinds());
+        handle.refresh_account("a").await.unwrap();
+        let offers = view(&handle, "a").resets.offers;
+        assert_eq!(
+            offers.iter().map(|o| o.kind).collect::<Vec<_>>(),
+            vec![ResetKind::Session, ResetKind::Weekly, ResetKind::Fable]
+        );
+        // The account is at its weekly limit: weekly and Fable are usable, the
+        // five-hour reset waits for its own limit.
+        assert!(!offers[0].usable_now);
+        assert_eq!(
+            offers[0].unavailable_reason,
+            Some(ResetOfferReason::NeedsLimit)
+        );
+        assert!(offers[1].usable_now && offers[2].usable_now);
+        assert_eq!(offers[2].ends_at, Some(5000));
+        let json = serde_json::to_value(&offers[0]).unwrap();
+        assert_eq!(
+            json,
+            json!({"kind":"session","resetsLeft":1,"resetsTotal":1,"endsAt":null,
+                "usableNow":false,"unavailableReason":"needsLimit","earlyUse":null})
+        );
+        assert_eq!(serde_json::to_value(&offers[2]).unwrap()["kind"], "fable");
+        // The totals that were already there are unchanged.
+        let resets = view(&handle, "a").resets;
+        assert_eq!(resets.available, Some(3));
+        assert_eq!(resets.expires_at, Some(5000));
+    }
+    #[tokio::test]
+    async fn records_saved_before_the_new_fields_load_and_save_unchanged() {
+        let old_status = json!({"eligible":true,"ineligible_reason":null,"grants":[{"id":"g",
+            "resets_left":2,"starts_at":null,"ends_at":4102444800_i64,"clears":["five_hour"],
+            "paused":false,"usable_now":true,"use_requires_limit":true}],
+            "next_grant_id":"g","cooldown_until":null,"weekly_resets_at":86400});
+        let mut stored = serde_json::to_value(account("a", 1000)).unwrap();
+        stored["reset_status"] = old_status.clone();
+        stored["reset_status_at"] = json!(1000);
+        let old: Persisted = serde_json::from_value(json!({
+            "accounts":[stored],"settings":{},"readings":{},"last_refresh_at":null
+        }))
+        .unwrap();
+        // Saving through the vault and loading again keeps the old shape exactly.
+        let temp = tempfile::tempdir().unwrap();
+        let vault = Vault::with_key(temp.path().join("vault"), [7; 32]).unwrap();
+        vault.save(RECORD, &old).unwrap();
+        let back = vault.load::<Persisted>(RECORD).unwrap().unwrap();
+        let saved = serde_json::to_value(&back).unwrap();
+        assert_eq!(saved["accounts"][0]["reset_status"], old_status);
+        // And the old status gets its offers: one session reset, usable only at its limit.
+        let offers = offers_for(&back.accounts[0], 2000);
+        assert_eq!(offers.len(), 1);
+        assert_eq!(offers[0].kind, ResetKind::Session);
+        assert_eq!(offers[0].resets_left, 2);
+        assert!(!offers[0].usable_now);
+    }
+    #[tokio::test]
+    async fn the_new_refusal_texts_translate_with_the_language() {
+        let fake = Arc::new(Fake::default());
+        let (_temp, handle, _clock, _paths) =
+            fixture(vec![account("a", 1000)], Some("a"), 1000, fake);
+        let refusals = [
+            ResetOutcome::Unavailable {
+                reason: Some("not_next_grant".into()),
+            },
+            ResetOutcome::Unavailable {
+                reason: Some("unknown_grant".into()),
+            },
+            ResetOutcome::Transport,
+        ];
+        for outcome in refusals {
+            {
+                let mut engine = handle.inner.owner.lock().await;
+                engine.saved.accounts[0].last_reset_outcome = Some(outcome.text().into());
+            }
+            for locale in ["ro", "en", "ro"] {
+                let mut settings: Settings = handle.get_snapshot().settings.into();
+                settings.language = locale.into();
+                let snapshot = handle.update_settings(settings).await.unwrap();
+                assert_eq!(
+                    snapshot.accounts[0].resets.last_outcome.as_deref(),
+                    Some(outcome.text_for(locale)),
+                    "{outcome:?} in {locale}"
+                );
+            }
+        }
     }
     fn legacy_fixture() -> Value {
         json!({"name":"Legacy B","oauthAccount":{"accountUuid":"b","organizationUuid":"org-b"},"credentials":{"claudeAiOauth":{"accessToken":"legacy-b-token"}}})

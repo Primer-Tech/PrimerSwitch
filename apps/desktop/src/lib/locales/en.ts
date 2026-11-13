@@ -144,6 +144,50 @@ export const en = {
   expiresIn: 'Expires in {duration}',
   resetCooldown: 'Resets can be used again in {duration}',
   checkingReset: 'Checking the reset result…',
+  // Manual use of banked Claude resets.
+  resetKind_session: '5-hour reset',
+  resetKind_weekly: 'Weekly reset',
+  resetKind_fable: 'Fable reset',
+  resetKind_full: 'Full reset',
+  resetEffect_session: 'Refills your 5-hour limit now.',
+  resetEffect_weekly: 'Refills your weekly limit now.',
+  resetEffect_fable: 'Returns what Fable used to your weekly limit.',
+  resetEffect_full: 'Refills all your limits now.',
+  resetsLeft: '{count} left',
+  resetUseBy: 'Use by {date}',
+  resetNoExpiry: 'No expiry date',
+  resetUse: 'Use',
+  resetRetry: 'Retry',
+  resetUsing: 'Resetting usage…',
+  resetUseLabel: 'Use a {kind} on {name}',
+  resetRetryLabel: 'Retry the {kind} on {name}',
+  resetsNone: 'No resets available.',
+  resetsCached: 'Saved reading. Refresh to check the current availability.',
+  resetConfirmTitle: 'Use a reset?',
+  resetConfirmAccount: 'Account: {name}',
+  resetConfirmDetail: '{left} left · use by {date}',
+  resetConfirmDetailNoDate: '{left} left',
+  resetConfirmYes: 'Yes, use it',
+  resetConfirmNo: 'No, keep it',
+  resetConfirmRetry:
+    'The last attempt was not confirmed. Sending the same request again cannot use a second reset.',
+  resetEarlyWarning:
+    'You still have {percent}% of your limit left. Use this reset anyway?',
+  resetEarlyWarningUnknown:
+    "You haven't reached a limit yet. Use this reset anyway?",
+  resetReason_cooldown: 'On cooldown. Try again in a minute.',
+  resetReason_blockedFiveHour:
+    "Can't be used while you're at your 5-hour limit.",
+  resetReason_blockedSevenDay:
+    "Can't be used while you're at your weekly limit.",
+  resetReason_blockedOpus: "Can't be used while you're at your Opus limit.",
+  resetReason_blockedSonnet: "Can't be used while you're at your Sonnet limit.",
+  resetReason_blockedOther:
+    "Can't be used while you're at another limit it doesn't refill.",
+  resetReason_cannotClear: "Doesn't refill the limit you've reached.",
+  resetReason_needsLimit: 'Usable once you reach a limit it refills.',
+  resetReason_unavailable: "Can't be used right now.",
+  resetReason_pendingClaim: 'Waiting to confirm the last attempt.',
   estimatedRenewal: 'Estimated renewal',
   manualRenewalDescription: 'A user-entered estimate, not a billing date.',
   codexSetupTitle: 'Codex setup',
@@ -383,6 +427,11 @@ export const en = {
   importExpired: 'The import is no longer valid. Select the folder again.',
   pendingResetError:
     'The previous reset request must be confirmed before another attempt.',
+  resetNotUsable:
+    'No reset of this kind can be used right now. Refresh and try again.',
+  resetNeedsLimit: 'This reset is usable once you reach a limit it refills.',
+  earlyUseNeedsConfirmation:
+    'Using this reset now needs your confirmation first.',
   cliVersionError:
     'The Claude Code version could not be detected. Install a recognized version.',
   browserError: 'Could not open the browser. Try signing in again.',

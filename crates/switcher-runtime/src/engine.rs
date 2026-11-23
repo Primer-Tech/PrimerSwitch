@@ -503,7 +503,7 @@ enum Command {
     Renewal(String, Option<u8>),
     Automation(String, AccountAutomation),
     ResumeReturns,
-    UseReset(String, ResetKind, bool),
+    UseReset(String, Option<ResetKind>, bool),
     Settings(Settings),
     ImportCurrent,
     BeginLogin(u64, Option<String>),
@@ -1045,11 +1045,11 @@ impl RuntimeHandle {
             .await
     }
     /// Manually uses one banked reset of `kind` on a saved account, active or not. It
-    /// never switches accounts and does not depend on the automatic reset setting.
+    /// never switches accounts. A missing kind only retries an existing claim.
     pub async fn use_reset(
         &self,
         id: &str,
-        kind: ResetKind,
+        kind: Option<ResetKind>,
         allow_early: bool,
     ) -> Result<Snapshot, RuntimeError> {
         self.snapshot_command(Command::UseReset(id.into(), kind, allow_early))
@@ -1552,6 +1552,7 @@ impl Engine {
                             .last_reset_outcome
                             .as_ref()
                             .map(|text| safe_reset_text(text, &self.saved.settings.language)),
+                        retry_pending: can_retry_pending_without_offer(a, now),
                         offers: offers_for(a, now),
                     },
                     primed_at: a.primed_for_reset_at,
@@ -3195,51 +3196,6 @@ impl Engine {
         }
         Ok(())
     }
-    /// Decision inputs: fresh usage only, reset offers only when read within 120 s, and
-    /// no active reading unless every account is known (unknown inactive budget must
-    /// not let last-resort exhaustion be assumed).
-    fn decision_infos(&self, now: i64, offers_any_age: bool) -> Vec<AccountUsageInfo> {
-        let mut infos = self.infos(true);
-        let all_fresh = infos
-            .iter()
-            .filter(|i| i.is_active || i.account.automation.enabled)
-            .all(|i| i.usage.is_some());
-        for info in &mut infos {
-            if !offers_any_age && !recent(info.account.reset_status_at, now, 120) {
-                info.account.reset_status = None;
-            }
-            if !all_fresh && info.is_active {
-                info.usage = None;
-            }
-        }
-        infos
-    }
-    /// Accounts whose reset offers need a fresh read before deciding: unresolved claims,
-    /// and accounts whose cached offer would produce an action now. Merely holding a
-    /// grant no longer costs a usage request every cycle; the decision itself still
-    /// uses only offers read within 120 seconds.
-    fn reset_revalidation_targets(&self, now: i64) -> Vec<String> {
-        let mut targets: Vec<String> = self
-            .saved
-            .accounts
-            .iter()
-            .filter(|a| {
-                a.provider == ProviderId::Claude && a.pending_reset_claim.is_some() && self.fresh(a)
-            })
-            .map(|a| a.id.clone())
-            .collect();
-        for action in decide_resets(
-            &self.decision_infos(now, true),
-            self.threshold(),
-            self.active_model.as_deref(),
-            now,
-        ) {
-            if !targets.contains(&action.account_id) {
-                targets.push(action.account_id);
-            }
-        }
-        targets
-    }
     /// Records an automatic switch failure for the status line and notifies about it,
     /// at most every `SWITCH_FAILURE_NOTICE` seconds for the same target and cause.
     fn switch_failed(&mut self, target: &str, error: &RuntimeError, now: i64) {
@@ -3269,102 +3225,6 @@ impl Engine {
         let now = self.clock.now();
         if self.automatic_return(fast).await? {
             return Ok(());
-        }
-        if self.saved.settings.auto_use_resets_enabled {
-            if !fast {
-                for id in self.reset_revalidation_targets(now) {
-                    let i = self.index(&id)?;
-                    if recent(self.saved.accounts[i].reset_status_at, now, 120)
-                        || !self.endpoint_allowed(&id, true)
-                    {
-                        continue;
-                    }
-                    let expected = self.live()?.identity_fingerprint;
-                    match self.metadata(&id, &expected).await {
-                        Ok(_) => {}
-                        Err(RuntimeError::ExternalChange) => {
-                            return Err(RuntimeError::ExternalChange);
-                        }
-                        // One account's failed read only skips that account's resets;
-                        // its cooldown is recorded and the rest of automation continues.
-                        Err(_) => {}
-                    }
-                }
-            }
-            let pending: Vec<String> = self
-                .saved
-                .accounts
-                .iter()
-                .filter(|a| a.pending_reset_claim.is_some() && self.fresh(a))
-                .map(|a| a.id.clone())
-                .collect();
-            for id in pending {
-                let i = self.index(&id)?;
-                let Some(pending) = self.saved.accounts[i].pending_reset_claim.clone() else {
-                    continue;
-                };
-                let missing = self.saved.accounts[i]
-                    .reset_status
-                    .as_ref()
-                    .is_some_and(|s| !s.grants.iter().any(|g| g.id == pending.grant_id));
-                if !(missing
-                    && recent(self.saved.accounts[i].reset_status_at, now, 120)
-                    && self.saved.accounts[i]
-                        .last_reset_attempt_at
-                        .is_none_or(|last| now.saturating_sub(last) >= 300))
-                {
-                    continue;
-                }
-                let reset = match self.claim(&id, &pending.grant_id, true).await {
-                    Ok(reset) => reset,
-                    Err(RuntimeError::ExternalChange) => {
-                        return Err(RuntimeError::ExternalChange);
-                    }
-                    Err(_) => false,
-                };
-                if reset && self.active_id.as_deref() == Some(&id) {
-                    return Ok(());
-                }
-            }
-            for action in decide_resets(
-                &self.decision_infos(now, false),
-                self.threshold(),
-                self.active_model.as_deref(),
-                now,
-            ) {
-                let i = self.index(&action.account_id)?;
-                if !self.fresh(&self.saved.accounts[i]) {
-                    continue;
-                }
-                // Last resort: an enabled reset may switch to the account holding it
-                // even when ordinary automatic switching is off (B17).
-                if action.switch_first {
-                    if !self.saved.accounts[i].automation.enabled {
-                        continue;
-                    }
-                    self.saved.last_auto_switch_at = Some(now);
-                    self.persist()?;
-                    if let Err(error) = self.switch_to(&action.account_id, fast, false).await {
-                        self.switch_failed(&action.account_id, &error, now);
-                        return Err(error);
-                    }
-                }
-                let reset = match self.claim(&action.account_id, &action.grant_id, fast).await {
-                    Ok(reset) => reset,
-                    Err(RuntimeError::ExternalChange) => {
-                        return Err(RuntimeError::ExternalChange);
-                    }
-                    // A refused or unrevalidated claim on one account never blocks the
-                    // remaining actions or the switch below.
-                    Err(_) => false,
-                };
-                if reset && self.active_id.as_deref() == Some(&action.account_id) {
-                    return Ok(());
-                }
-                if action.switch_first {
-                    return Ok(());
-                }
-            }
         }
         let infos = self.infos(true);
         let Some(active) = infos.iter().find(|i| i.is_active && i.usage.is_some()) else {
@@ -3533,67 +3393,10 @@ impl Engine {
         }
         Ok(false)
     }
-    async fn claim(&mut self, id: &str, grant: &str, fast: bool) -> Result<bool, RuntimeError> {
-        let expected = self.live()?.identity_fingerprint;
-        let i = self.index(id)?;
-        if !self.fresh(&self.saved.accounts[i]) {
-            return Err(RuntimeError::Provider);
-        }
-        if !ResetGrant::is_valid_id(grant) {
-            return Err(RuntimeError::PendingReset);
-        }
-        let org = self.saved.accounts[i]
-            .organization_uuid()
-            .filter(|s| {
-                !s.is_empty()
-                    && s.len() <= 64
-                    && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-            })
-            .ok_or(RuntimeError::Identity)?
-            .to_owned();
-        // Ordinary mutation preflight can refresh eligibility. Strict fast ticks
-        // use only already-fresh offers and never issue metadata requests.
-        if !fast && self.endpoint_allowed(id, true) {
-            let _ = self.metadata(id, &expected).await?;
-        }
-        let i = self.index(id)?;
-        let now = self.clock.now();
-        let status = self.saved.accounts[i]
-            .reset_status
-            .as_ref()
-            .ok_or(RuntimeError::Provider)?;
-        let replay = self.saved.accounts[i]
-            .pending_reset_claim
-            .as_ref()
-            .is_some_and(|p| p.grant_id == grant);
-        if !recent(self.saved.accounts[i].reset_status_at, now, 120)
-            || (!replay && !status.available(now).iter().any(|g| g.id == grant))
-        {
-            return Err(RuntimeError::Provider);
-        }
-        let infos = self.decision_infos(now, false);
-        if replay
-            && self.saved.accounts[i]
-                .last_reset_attempt_at
-                .is_some_and(|last| now.saturating_sub(last) < 300)
-        {
-            return Err(RuntimeError::PendingReset);
-        }
-        if !replay
-            && !decide_resets(&infos, self.threshold(), self.active_model.as_deref(), now)
-                .iter()
-                .any(|action| action.account_id == id && action.grant_id == grant)
-        {
-            return Err(RuntimeError::Provider);
-        }
-        let (success, _) = self.send_claim(id, grant, &org, &expected, now).await?;
-        Ok(success)
-    }
     /// Sends one claim under a durable idempotency key. The pending request and the
     /// attempt time are saved BEFORE the request leaves; the received outcome is kept on
     /// its stable account before CLI ownership is checked again, and a success
     /// invalidates the pre-reset usage reading so no decision is made on the stale 100.
-    /// Shared by the automatic and the manual path.
     async fn send_claim(
         &mut self,
         id: &str,
@@ -3601,7 +3404,7 @@ impl Engine {
         org: &str,
         expected: &str,
         now: i64,
-    ) -> Result<(bool, ResetOutcome), RuntimeError> {
+    ) -> Result<ResetOutcome, RuntimeError> {
         let i = self.index(id)?;
         let pending = prepare_reset_claim(
             grant,
@@ -3653,20 +3456,19 @@ impl Engine {
                 format!("Reset used on {label}: its limits are available again.")
             });
         }
-        Ok((success, outcome))
+        Ok(outcome)
     }
     /// A manual claim of one kind of banked reset on a saved account. It is the user's
     /// own action: it works for the active and for an inactive account (using that
     /// account's own token and workspace, never switching and never touching the CLI
-    /// login), does not depend on the automatic setting and is not gated by
-    /// `decide_resets`. Everything that protects a scarce effect still applies: a fresh
+    /// login). It requires a fresh
     /// identity-verified reading, a status read within 120 s, one pending request at a
     /// time with its key reused after the replay floor, and the key persisted before
     /// anything is sent.
     async fn use_reset(
         &mut self,
         id: &str,
-        kind: ResetKind,
+        kind: Option<ResetKind>,
         allow_early: bool,
     ) -> Result<(), RuntimeError> {
         self.observe_active()?;
@@ -3712,7 +3514,7 @@ impl Engine {
             // An unresolved request only ever repeats itself: the same grant and key,
             // after the replay floor. Another kind, or another grant, waits for it.
             Some(pending) => {
-                if grant_kind(&status, &pending.grant_id) != Some(kind)
+                if kind.is_some_and(|kind| grant_kind(&status, &pending.grant_id) != Some(kind))
                     || self.saved.accounts[i]
                         .last_reset_attempt_at
                         .is_some_and(|last| now.saturating_sub(last) < CLAIM_REPLAY_FLOOR)
@@ -3722,6 +3524,7 @@ impl Engine {
                 pending.grant_id
             }
             None => {
+                let kind = kind.ok_or(RuntimeError::PendingReset)?;
                 plan_manual_claim(&status, kind, now, allow_early)
                     .map_err(|refusal| match refusal {
                         ManualRefusal::NotUsable => RuntimeError::ResetNotUsable,
@@ -3731,7 +3534,7 @@ impl Engine {
                     .grant_id
             }
         };
-        let (_, outcome) = self.send_claim(id, &grant, &org, &expected, now).await?;
+        let outcome = self.send_claim(id, &grant, &org, &expected, now).await?;
         // The status behind a refusal was wrong in some way (another grant is next, the
         // account is not at a limit, the grant is gone): the next attempt re-reads it.
         if matches!(
@@ -4230,7 +4033,6 @@ mod tests {
             accounts,
             settings: Settings {
                 auto_switch_enabled: false,
-                auto_use_resets_enabled: false,
                 auto_start_window_enabled: false,
                 ..Settings::default()
             },
@@ -4262,7 +4064,7 @@ mod tests {
         // Historical contract: release 7e8411509488a5bf7217f10d7c6cccbf726c4562.
         // Literal synthetic JSON avoids deriving the old format from new defaults.
         let historical: Value = serde_json::from_str(r#"{
-          "settings": {"poll_interval":900,"threshold":70.5,"auto_switch_enabled":false,"auto_start_window_enabled":false,"auto_use_resets_enabled":false,"appearance":"light","language":"ro"},
+          "settings": {"poll_interval":900,"threshold":70.5,"auto_switch_enabled":false,"auto_start_window_enabled":false,"auto_use_resets_enabled":true,"appearance":"light","language":"ro"},
           "last_refresh_at":997,
           "readings": {
             "a":{"scoped_at":995,"complete":true,"error":null,"priming_attempt_at":994},
@@ -4308,7 +4110,12 @@ mod tests {
           ]
         }"#).unwrap();
         let parsed: Persisted = serde_json::from_value(historical.clone()).unwrap();
-        assert_eq!(serde_json::to_value(&parsed).unwrap(), historical);
+        let mut expected = historical.clone();
+        expected["settings"]
+            .as_object_mut()
+            .unwrap()
+            .remove("auto_use_resets_enabled");
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), expected);
         let parent = std::env::temp_dir().canonicalize().unwrap();
         let temp = tempfile::Builder::new()
             .prefix("primerswitch-preview-one-compatibility-")
@@ -4344,14 +4151,12 @@ mod tests {
         assert_eq!(snapshot.settings.language, "ro");
         assert_eq!(snapshot.settings.poll_interval, 900);
         assert_eq!(snapshot.settings.threshold, 70.5);
-        // The reset order did not exist yet: it loads as the original order and is
-        // not written back, so the record below stays byte-for-byte the same.
+        // Legacy records without an account order retain the original ordering.
         assert!(snapshot.settings.prefer_soonest_weekly_reset);
         assert!(snapshot.accounts.iter().all(|a| !a.identity_verified));
         let public = serde_json::to_string(&snapshot).unwrap();
         assert!(!public.contains("HISTORICAL_FIXTURE_ACCESS"));
         assert!(!public.contains("HISTORICAL_FIXTURE_REFRESH"));
-        let mut expected = historical.clone();
         // Ownership is intentionally reverified after process restart. All other
         // account, quota, renewal and pending scheduling/reset fields stay intact.
         for account in expected["accounts"].as_array_mut().unwrap() {
@@ -4742,55 +4547,7 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn reset_pending_key_is_persisted_before_send_and_reused_after_lost_reply() {
-        let fake = Arc::new(Fake::default());
-        let (temp, handle, clock, _paths) =
-            fixture(vec![account("a", 1000)], Some("a"), 1000, fake.clone());
-        handle.tick(true).await.unwrap();
-        let reset_url = "https://api.anthropic.com/api/organizations/org-a/reset_rate_limits";
-        fake.replies
-            .lock()
-            .unwrap()
-            .push_back((reset_url, Err(ClientError::Transport)));
-        let request_id = {
-            let mut engine = handle.inner.owner.lock().await;
-            engine.saved.settings.auto_use_resets_enabled = true;
-            let a = &mut engine.saved.accounts[0];
-            a.last_usage.as_mut().unwrap().five_hour.utilization = 100.0;
-            a.reset_status = Some(ResetStatus {
-                grants: vec![ResetGrant {
-                    id: "g".into(),
-                    resets_left: 1,
-                    ..ResetGrant::default()
-                }],
-                ..ResetStatus::default()
-            });
-            a.reset_status_at = Some(1000);
-            engine.claim("a", "g", true).await.unwrap();
-            let vault = Vault::with_key(temp.path().join("vault"), [7; 32]).unwrap();
-            vault.load::<Persisted>(RECORD).unwrap().unwrap().accounts[0]
-                .pending_reset_claim
-                .as_ref()
-                .unwrap()
-                .request_id
-                .clone()
-        };
-        clock.0.store(1300, Ordering::SeqCst);
-        {
-            let mut engine = handle.inner.owner.lock().await;
-            assert!(engine.claim("a", "g", false).await.unwrap());
-            assert!(engine.saved.accounts[0].pending_reset_claim.is_none());
-            assert!(!engine.saved.readings["a"].complete);
-        }
-        let calls = fake.calls.lock().unwrap();
-        let claims: Vec<_> = calls.iter().filter(|c| c.url == reset_url).collect();
-        assert_eq!(claims.len(), 2);
-        for claim in claims {
-            assert_eq!(claim.body.as_ref().unwrap()["request_id"], request_id);
-        }
-    }
-    #[tokio::test]
-    async fn reset_success_blocks_same_cycle_switch_on_stale_full_usage() {
+    async fn automation_leaves_fable_credits_unused_at_the_limit_and_near_expiry() {
         let fake = Arc::new(Fake::default());
         let (_temp, handle, _clock, _paths) = fixture(
             vec![account("a", 1000), account("b", 1000)],
@@ -4801,27 +4558,34 @@ mod tests {
         handle.tick(true).await.unwrap();
         let mut engine = handle.inner.owner.lock().await;
         engine.saved.settings.auto_switch_enabled = true;
-        engine.saved.settings.auto_use_resets_enabled = true;
         for account in &mut engine.saved.accounts {
-            account.last_usage.as_mut().unwrap().five_hour.utilization = 100.0;
+            account.last_usage.as_mut().unwrap().seven_day.utilization = 100.0;
         }
         engine.saved.accounts[0].reset_status = Some(ResetStatus {
             grants: vec![ResetGrant {
                 id: "g".into(),
-                resets_left: 1,
+                resets_left: 2,
+                gives_back_weekly: true,
+                clears: vec!["seven_day".into()],
+                usable_now: true,
+                ends_at: Some(4000),
                 ..ResetGrant::default()
             }],
             ..ResetStatus::default()
         });
         engine.saved.accounts[0].reset_status_at = Some(1000);
-        engine.saved.accounts[0].preferred_return_reset_at = Some(10000);
+        engine.automate(false).await.unwrap();
         engine.automate(true).await.unwrap();
         assert_eq!(engine.active_id.as_deref(), Some("a"));
-        assert!(!engine.saved.readings["a"].complete);
-        assert_eq!(engine.saved.accounts[0].preferred_return_reset_at, None);
+        assert!(engine.saved.accounts[0].pending_reset_claim.is_none());
         assert_eq!(
-            engine.saved.accounts[0].preferred_return_handled_reset_at,
-            Some(10000)
+            engine.saved.accounts[0]
+                .reset_status
+                .as_ref()
+                .unwrap()
+                .grants[0]
+                .resets_left,
+            2
         );
         assert_eq!(
             fake.calls
@@ -4830,7 +4594,7 @@ mod tests {
                 .iter()
                 .filter(|c| c.url.ends_with("/reset_rate_limits"))
                 .count(),
-            1
+            0
         );
     }
     #[tokio::test]
@@ -5393,6 +5157,10 @@ mod tests {
         engine.saved.accounts[0].reset_status_at = Some(1300);
         engine.saved.accounts[0].reset_status = Some(ResetStatus::default());
         engine.reconcile_pending("a").unwrap();
+        engine.automate(false).await.unwrap();
+        engine.automate(true).await.unwrap();
+        assert!(engine.snapshot(false).accounts[0].resets.retry_pending);
+        assert!(claims(&fake).is_empty());
         assert_eq!(
             engine.saved.accounts[0].pending_reset_claim,
             Some(pending.clone())
@@ -5401,7 +5169,7 @@ mod tests {
             "https://api.anthropic.com/api/organizations/org-a/reset_rate_limits",
             Ok(response(200, json!({"result":"already_used"}))),
         ));
-        assert!(!engine.claim("a", "g", true).await.unwrap());
+        engine.use_reset("a", None, false).await.unwrap();
         assert!(engine.saved.accounts[0].pending_reset_claim.is_none());
         assert_eq!(
             fake.calls
@@ -5488,14 +5256,8 @@ mod tests {
             Ok(response(200, json!({"result":"reset","resets_left":0}))),
         ));
         let mut notices = handle.notifications();
-        // The fixture leaves automatic resets off, and nothing is at 100%: the manual
-        // use does not depend on either.
-        {
-            let engine = handle.inner.owner.lock().await;
-            assert!(!engine.saved.settings.auto_use_resets_enabled);
-        }
         let snapshot = handle
-            .use_reset("a", ResetKind::Fable, false)
+            .use_reset("a", Some(ResetKind::Fable), false)
             .await
             .unwrap();
         let sent = claims(&fake);
@@ -5559,7 +5321,7 @@ mod tests {
         let credentials_before = std::fs::read(&paths.credentials_file).unwrap();
         let global_before = std::fs::read(&paths.global_config_file).unwrap();
         handle
-            .use_reset("b", ResetKind::Weekly, false)
+            .use_reset("b", Some(ResetKind::Weekly), false)
             .await
             .unwrap();
         let sent = claims(&fake);
@@ -5597,7 +5359,7 @@ mod tests {
         );
         assert_eq!(
             handle
-                .use_reset("a", ResetKind::Weekly, true)
+                .use_reset("a", Some(ResetKind::Weekly), true)
                 .await
                 .unwrap_err(),
             RuntimeError::ResetNeedsLimit
@@ -5640,7 +5402,7 @@ mod tests {
         );
         assert_eq!(
             handle
-                .use_reset("a", ResetKind::Full, false)
+                .use_reset("a", Some(ResetKind::Full), false)
                 .await
                 .unwrap_err(),
             RuntimeError::ResetEarlyUse
@@ -5652,14 +5414,17 @@ mod tests {
         // No grant of the requested kind: a clear error and still no claim.
         assert_eq!(
             handle
-                .use_reset("a", ResetKind::Fable, true)
+                .use_reset("a", Some(ResetKind::Fable), true)
                 .await
                 .unwrap_err(),
             RuntimeError::ResetNotUsable
         );
         assert!(claims(&fake).is_empty());
         // Confirmed: it goes out.
-        handle.use_reset("a", ResetKind::Full, true).await.unwrap();
+        handle
+            .use_reset("a", Some(ResetKind::Full), true)
+            .await
+            .unwrap();
         assert_eq!(claims(&fake).len(), 1);
         assert_eq!(claims(&fake)[0].body["grant_id"], "full-1");
     }
@@ -5678,7 +5443,7 @@ mod tests {
         ));
         let task = {
             let h = handle.clone();
-            tokio::spawn(async move { h.use_reset("a", ResetKind::Weekly, false).await })
+            tokio::spawn(async move { h.use_reset("a", Some(ResetKind::Weekly), false).await })
         };
         started.notified().await;
         // The request is on the wire and unanswered: the key is already durable.
@@ -5720,7 +5485,7 @@ mod tests {
                 answer,
             ));
             handle
-                .use_reset("a", ResetKind::Weekly, false)
+                .use_reset("a", Some(ResetKind::Weekly), false)
                 .await
                 .unwrap();
             let key = claims(&fake)[0].body["request_id"]
@@ -5748,7 +5513,7 @@ mod tests {
             assert!(view(&handle, "a").resets.pending);
             assert_eq!(
                 handle
-                    .use_reset("a", ResetKind::Weekly, false)
+                    .use_reset("a", Some(ResetKind::Weekly), false)
                     .await
                     .unwrap_err(),
                 RuntimeError::PendingReset,
@@ -5758,7 +5523,7 @@ mod tests {
             clock.0.store(1300, Ordering::SeqCst);
             assert_eq!(
                 handle
-                    .use_reset("a", ResetKind::Session, false)
+                    .use_reset("a", Some(ResetKind::Session), false)
                     .await
                     .unwrap_err(),
                 RuntimeError::PendingReset
@@ -5767,7 +5532,7 @@ mod tests {
             // After the floor the view offers the retry, and it reuses the same key.
             assert!(offer(&handle, "a", ResetKind::Weekly).unwrap().usable_now);
             handle
-                .use_reset("a", ResetKind::Weekly, false)
+                .use_reset("a", Some(ResetKind::Weekly), false)
                 .await
                 .unwrap();
             let sent = claims(&fake);
@@ -5798,7 +5563,7 @@ mod tests {
         clock.0.store(2000, Ordering::SeqCst);
         for kind in ResetKind::ALL {
             assert_eq!(
-                handle.use_reset("a", kind, true).await.unwrap_err(),
+                handle.use_reset("a", Some(kind), true).await.unwrap_err(),
                 RuntimeError::PendingReset
             );
         }
@@ -5825,7 +5590,7 @@ mod tests {
             )),
         ));
         let snapshot = handle
-            .use_reset("a", ResetKind::Weekly, false)
+            .use_reset("a", Some(ResetKind::Weekly), false)
             .await
             .unwrap();
         let a = snapshot.accounts.iter().find(|a| a.id == "a").unwrap();
@@ -5846,7 +5611,7 @@ mod tests {
         // Within two minutes the status cannot be re-read, so nothing is sent on it.
         assert_eq!(
             handle
-                .use_reset("a", ResetKind::Weekly, false)
+                .use_reset("a", Some(ResetKind::Weekly), false)
                 .await
                 .unwrap_err(),
             RuntimeError::Provider
@@ -5855,7 +5620,7 @@ mod tests {
         // Later it re-reads, and a new attempt is a new request.
         clock.0.store(1130, Ordering::SeqCst);
         handle
-            .use_reset("a", ResetKind::Weekly, false)
+            .use_reset("a", Some(ResetKind::Weekly), false)
             .await
             .unwrap();
         let sent = claims(&fake);
@@ -5884,7 +5649,7 @@ mod tests {
                 Ok(response(200, answer.clone())),
             ));
             let snapshot = handle
-                .use_reset("a", ResetKind::Weekly, false)
+                .use_reset("a", Some(ResetKind::Weekly), false)
                 .await
                 .unwrap();
             let a = snapshot.accounts.iter().find(|a| a.id == "a").unwrap();
@@ -5920,7 +5685,7 @@ mod tests {
         }
         assert_eq!(
             handle
-                .use_reset("a", ResetKind::Weekly, false)
+                .use_reset("a", Some(ResetKind::Weekly), false)
                 .await
                 .unwrap_err(),
             RuntimeError::Provider
@@ -5936,7 +5701,7 @@ mod tests {
         serve_resets(&fake, three_kinds());
         assert_eq!(
             handle
-                .use_reset("nobody", ResetKind::Weekly, true)
+                .use_reset("nobody", Some(ResetKind::Weekly), true)
                 .await
                 .unwrap_err(),
             RuntimeError::MissingAccount
@@ -5947,7 +5712,7 @@ mod tests {
         }
         assert_eq!(
             handle
-                .use_reset("a", ResetKind::Weekly, true)
+                .use_reset("a", Some(ResetKind::Weekly), true)
                 .await
                 .unwrap_err(),
             RuntimeError::Identity
@@ -5959,7 +5724,7 @@ mod tests {
         }
         assert_eq!(
             handle
-                .use_reset("a", ResetKind::Weekly, true)
+                .use_reset("a", Some(ResetKind::Weekly), true)
                 .await
                 .unwrap_err(),
             RuntimeError::Identity
@@ -5970,7 +5735,7 @@ mod tests {
     async fn the_demo_and_unavailable_runtimes_refuse_a_manual_use() {
         let demo = RuntimeHandle::demo();
         assert_eq!(
-            demo.use_reset("any", ResetKind::Fable, true)
+            demo.use_reset("any", Some(ResetKind::Fable), true)
                 .await
                 .unwrap_err(),
             RuntimeError::ReadOnly
@@ -6178,7 +5943,10 @@ mod tests {
         ] {
             engine.saved.accounts[0].oauth_account["organizationUuid"] = json!(organization);
             assert_eq!(
-                engine.claim("a", "g", true).await.unwrap_err(),
+                engine
+                    .use_reset("a", Some(ResetKind::Full), false)
+                    .await
+                    .unwrap_err(),
                 RuntimeError::Identity
             );
             assert!(engine.saved.accounts[0].pending_reset_claim.is_none());
@@ -6187,7 +5955,10 @@ mod tests {
         engine.saved.accounts[0].oauth_account["organizationUuid"] = json!("org-a");
         engine.saved.accounts[0].credentials["claudeAiOauth"]["accessToken"] = json!("");
         assert_eq!(
-            engine.claim("a", "g", true).await.unwrap_err(),
+            engine
+                .use_reset("a", Some(ResetKind::Full), false)
+                .await
+                .unwrap_err(),
             RuntimeError::Identity
         );
         assert!(engine.saved.accounts[0].pending_reset_claim.is_none());
@@ -6912,7 +6683,6 @@ mod tests {
         {
             let mut e = handle.inner.owner.lock().await;
             e.saved.settings.auto_switch_enabled = true;
-            e.saved.settings.auto_use_resets_enabled = true;
             let i = e.index("b").unwrap();
             e.saved.accounts[i].reset_status = Some(grant(false, None));
             e.saved.accounts[i].reset_status_at = Some(1000);
@@ -6927,57 +6697,6 @@ mod tests {
         assert_eq!(handle.get_snapshot().active_id.as_deref(), Some("b"));
         // Only the switch target's own revalidation; no read just for the banked grant.
         assert_eq!(count(&fake, USAGE_URL), usage + 1);
-    }
-    #[tokio::test]
-    async fn a_failed_reset_revalidation_skips_only_that_account() {
-        let fake = Arc::new(Fake::default());
-        let (_temp, handle, clock, _paths) = fixture(
-            vec![account("a", 1000), account("b", 1000), account("c", 1000)],
-            Some("a"),
-            1000,
-            fake.clone(),
-        );
-        handle.tick(true).await.unwrap();
-        {
-            let mut e = handle.inner.owner.lock().await;
-            e.saved.settings.auto_switch_enabled = true;
-            e.saved.settings.auto_use_resets_enabled = true;
-            // c holds an offer expiring within three hours and sits at its real limit,
-            // so the expiry guard wants to use it.
-            let i = e.index("c").unwrap();
-            e.saved.accounts[i]
-                .last_usage
-                .as_mut()
-                .unwrap()
-                .five_hour
-                .utilization = 100.0;
-            e.saved.accounts[i].reset_status = Some(grant(true, Some(4900)));
-            e.saved.accounts[i].reset_status_at = Some(1000);
-        }
-        clock.0.store(1300, Ordering::SeqCst);
-        fake.failing_usage.lock().unwrap().push((
-            "token-c",
-            ClientError::RateLimited {
-                retry_after: Some(60),
-            },
-        ));
-        fake.replies
-            .lock()
-            .unwrap()
-            .push_back((INFERENCE_URL, Ok(infer("0.96", "0.2"))));
-        handle.tick(true).await.unwrap();
-        assert_eq!(handle.get_snapshot().active_id.as_deref(), Some("b"));
-        assert!(
-            !fake
-                .calls
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|c| c.url.ends_with("/reset_rate_limits"))
-        );
-        let engine = handle.inner.owner.lock().await;
-        let c = engine.index("c").unwrap();
-        assert!(engine.saved.accounts[c].rate_limited_until.is_some());
     }
     #[tokio::test]
     async fn a_failed_automatic_switch_notifies_once_and_names_its_target() {
@@ -7374,7 +7093,6 @@ mod tests {
         let mut settings: Settings = handle.get_snapshot().settings.into();
         settings.auto_switch_enabled = true;
         settings.auto_start_window_enabled = true;
-        settings.auto_use_resets_enabled = true;
         handle.update_settings(settings).await.unwrap();
         let mut spent = infer("0.80", "0.20");
         spent

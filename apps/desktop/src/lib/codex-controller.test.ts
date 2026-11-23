@@ -154,20 +154,20 @@ describe('Codex contract and redacted IPC', () => {
     const { c, call, event } = setup(raw);
     await c.start();
     const before = call.mock.calls.length;
-    expect(await c.consumeReset(raw.accounts[0].id)).toBe(false);
+    expect(await c.consumeReset(raw.accounts[0].id, 'RESET')).toBe(false);
     expect(call).toHaveBeenCalledTimes(before);
     raw.revision++;
     raw.accounts[0].reset.usable = codexCapability();
     raw.demo = true;
     event(raw);
-    expect(await c.consumeReset(raw.accounts[0].id)).toBe(false);
+    expect(await c.consumeReset(raw.accounts[0].id, 'RESET')).toBe(false);
     raw.demo = false;
     raw.revision++;
     event(raw);
     const pending = deferred();
     call.mockReturnValueOnce(pending.promise);
-    const first = c.consumeReset(raw.accounts[0].id);
-    expect(await c.consumeReset(raw.accounts[0].id)).toBe(false);
+    const first = c.consumeReset(raw.accounts[0].id, 'RESET');
+    expect(await c.consumeReset(raw.accounts[0].id, 'RESET')).toBe(false);
     const result = structuredClone(raw);
     result.revision++;
     result.accounts[0].reset = {

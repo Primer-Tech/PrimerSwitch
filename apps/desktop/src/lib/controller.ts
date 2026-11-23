@@ -376,13 +376,22 @@ export function createController(bridge: Bridge = nativeBridge) {
    */
   async function useReset(
     id: string,
-    kind: ResetKind,
+    kind: ResetKind | null,
+    confirmation: string,
     allowEarly = false,
   ): Promise<boolean> {
+    const resets = state.snapshot?.accounts.find(
+      (account) => account.id === id,
+    )?.resets;
+    if (kind === null && resets?.retryPending)
+      return action('claude_use_reset', {
+        id,
+        kind,
+        allowEarly: false,
+        confirmation,
+      });
     const parsed = resetKindSchema.safeParse(kind);
-    const offer = state.snapshot?.accounts
-      .find((account) => account.id === id)
-      ?.resets.offers.find((candidate) => candidate.kind === kind);
+    const offer = resets?.offers.find((candidate) => candidate.kind === kind);
     if (!parsed.success || !offer || !offer.usableNow) {
       set({ error: codeMessage('resetNotUsable', locale()) });
       return false;
@@ -391,6 +400,7 @@ export function createController(bridge: Bridge = nativeBridge) {
       id,
       kind: parsed.data,
       allowEarly: allowEarly && offer.earlyUse !== null,
+      confirmation,
     });
   }
   async function cancelLogin() {

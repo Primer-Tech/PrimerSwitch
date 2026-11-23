@@ -50,7 +50,6 @@ pub struct SettingsView {
     pub codex_threshold: Option<f64>,
     pub auto_switch_enabled: bool,
     pub auto_start_window_enabled: bool,
-    pub auto_use_resets_enabled: bool,
     pub appearance: String,
     pub language: String,
     /// Claude and Codex: the account whose weekly limit resets soonest goes first.
@@ -65,7 +64,6 @@ impl From<&Settings> for SettingsView {
             codex_threshold: s.codex_threshold,
             auto_switch_enabled: s.auto_switch_enabled,
             auto_start_window_enabled: s.auto_start_window_enabled,
-            auto_use_resets_enabled: s.auto_use_resets_enabled,
             appearance: s.appearance.clone(),
             language: s.language.clone(),
             prefer_soonest_weekly_reset: s.prefer_soonest_weekly_reset,
@@ -81,7 +79,6 @@ impl From<SettingsView> for Settings {
             codex_threshold: s.codex_threshold,
             auto_switch_enabled: s.auto_switch_enabled,
             auto_start_window_enabled: s.auto_start_window_enabled,
-            auto_use_resets_enabled: s.auto_use_resets_enabled,
             appearance: s.appearance,
             language: s.language,
             prefer_soonest_weekly_reset: s.prefer_soonest_weekly_reset,
@@ -202,6 +199,9 @@ pub struct ResetView {
     pub expires_at: Option<i64>,
     pub cooldown_until: Option<i64>,
     pub pending: bool,
+    /// An unresolved claim can be retried even when its offer has disappeared.
+    #[serde(default)]
+    pub retry_pending: bool,
     pub last_outcome: Option<String>,
     /// One entry per kind of reset the account holds, in display order. Neither grant
     /// ids nor request ids are part of it.
@@ -273,6 +273,22 @@ impl From<&ResetOffer> for ResetOfferView {
             }),
         }
     }
+}
+pub(crate) fn can_retry_pending_without_offer(account: &StoredAccount, now: i64) -> bool {
+    let Some(pending) = &account.pending_reset_claim else {
+        return false;
+    };
+    account
+        .last_reset_attempt_at
+        .is_none_or(|last| now.saturating_sub(last) >= CLAIM_REPLAY_FLOOR)
+        && account.reset_status.as_ref().is_some_and(|status| {
+            let kind = grant_kind(status, &pending.grant_id);
+            kind.is_none_or(|kind| {
+                !reset_offers(status, now)
+                    .iter()
+                    .any(|offer| offer.kind == kind)
+            })
+        })
 }
 /// The kinds of reset an account holds and whether each can be used now. A pending
 /// claim limits the account to repeating that one request, after the replay floor.

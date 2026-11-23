@@ -32,7 +32,6 @@ export const settingsSchema = z
     codexThreshold: z.number().finite().min(50).max(100).nullable().optional(),
     autoSwitchEnabled: z.boolean(),
     autoStartWindowEnabled: z.boolean(),
-    autoUseResetsEnabled: z.boolean(),
     appearance: z.enum(['system', 'light', 'dark']),
     language: z.enum(['en', 'ro']).default('en'),
     /** Claude and Codex: the account whose weekly limit resets soonest goes first. */
@@ -163,6 +162,7 @@ export const accountSchema = z
         pending: z.boolean(),
         lastOutcome: z.string().nullable(),
         offers: z.array(resetOfferSchema),
+        retryPending: z.boolean().optional(),
       })
       .strict(),
     primedAt: timestamp,
@@ -204,7 +204,6 @@ export const defaults: Settings = {
   threshold: 95,
   autoSwitchEnabled: true,
   autoStartWindowEnabled: true,
-  autoUseResetsEnabled: true,
   appearance: 'dark',
   language: 'en',
   preferSoonestWeeklyReset: true,

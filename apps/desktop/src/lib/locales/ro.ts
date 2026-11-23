@@ -170,11 +170,12 @@ export const ro: Record<keyof typeof en, string> = {
   resetChoosePrompt: 'Alege una ca să continui.',
   resetsCached:
     'Citire salvată. Reîmprospătează pentru a verifica disponibilitatea actuală.',
+  resetConfirmRetryTitle: 'Reîncerci resetarea anterioară?',
   resetConfirmTitle: 'Folosești o resetare?',
   resetConfirmAccount: 'Cont: {name}',
   resetConfirmDetail: 'Rămase: {left} · de folosit până la {date}',
   resetConfirmDetailNoDate: 'Rămase: {left}',
-  resetConfirmYes: 'Da, folosește',
+  resetConfirmType: 'Tastează {keyword} pentru a confirma.',
   resetConfirmNo: 'Nu, o păstrez',
   resetConfirmRetry:
     'Ultima încercare nu a fost confirmată. Trimiterea aceleiași cereri încă o dată nu poate consuma a doua resetare.',
@@ -279,9 +280,6 @@ export const ro: Record<keyof typeof en, string> = {
   primeWindow: 'Pornește ferestrele de 5 ore și săptămânală',
   primeHelp:
     'Când fereastra de 5 ore sau cea săptămânală a unui cont se încheie, trimite un mesaj foarte scurt la următoarea verificare pentru a porni fereastra următoare, ca resetarea ei să vină mai devreme. Se aplică și conturilor inactive. Dacă ambele ferestre se încheie simultan, un singur mesaj le pornește pe amândouă.',
-  autoResets: 'Folosește automat resetările',
-  resetsHelp:
-    'Când toate conturile sunt la limită, folosește o resetare disponibilă. Dacă resetarea aparține altui cont, PrimerSwitch comută mai întâi pe acel cont, chiar dacă comutarea automată este oprită. O resetare care expiră curând este folosită pe contul ei, fără comutare.',
   pollInterval: 'Interval de verificare',
   minutes: '{count} min',
   pollingHelp:

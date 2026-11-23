@@ -245,7 +245,7 @@ describe('desktop workflows', () => {
     );
     await waitFor(() => expect(trigger).toHaveFocus());
   });
-  it('retains four enabled toggles, polling bounds, and fractional thresholds', async () => {
+  it('retains the three enabled toggles, polling bounds, and fractional thresholds', async () => {
     const raw = snapshot();
     raw.settings.threshold = 99.5;
     setup(raw);
@@ -256,7 +256,7 @@ describe('desktop workflows', () => {
     screen
       .getAllByRole('switch')
       .forEach((toggle) => expect(toggle).toBeChecked());
-    expect(screen.getAllByRole('switch')).toHaveLength(4);
+    expect(screen.getAllByRole('switch')).toHaveLength(3);
     expect(screen.getByRole('slider')).toHaveAttribute('min', '120');
     expect(screen.getByRole('slider')).toHaveAttribute('max', '900');
     expect(screen.getByRole('slider')).toHaveAttribute('step', '30');
@@ -268,10 +268,9 @@ describe('desktop workflows', () => {
     );
     expect(screen.queryByRole('spinbutton')).not.toBeInTheDocument();
     expect(screen.getByText(t('en', 'primeHelp'))).toBeVisible();
-    // Resets may switch accounts even with automatic switching off (B17): say so.
     expect(
-      screen.getByText(/even when automatic switching is off/),
-    ).toBeVisible();
+      screen.queryByRole('switch', { name: /use resets automatically/i }),
+    ).not.toBeInTheDocument();
   });
   it('saves the weekly reset order with the other automation settings', async () => {
     const { call } = setup();
@@ -329,7 +328,7 @@ describe('desktop workflows', () => {
     expect(
       automation.getByText('Start the 5-hour and weekly windows'),
     ).toBeVisible();
-    expect(automation.getByText('Use resets automatically')).toBeVisible();
+    expect(automation.queryByText('Use resets automatically')).toBeNull();
     await fireEvent.click(
       screen.getByRole('button', { name: 'Open settings' }),
     );
@@ -361,7 +360,7 @@ describe('desktop workflows', () => {
           (toggle) =>
             toggle.closest('label')?.querySelector('strong')?.textContent,
         ),
-    ).toEqual([t('en', 'primeWindow'), t('en', 'autoResets')]);
+    ).toEqual([t('en', 'primeWindow')]);
   });
   it('disables every mutation in demo while keeping details readable', async () => {
     const { call } = setup(snapshot({ demo: true }));

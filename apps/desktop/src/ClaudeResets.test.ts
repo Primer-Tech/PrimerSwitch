@@ -110,6 +110,12 @@ const noQuestion = () => {
     screen.queryByRole('dialog', { name: 'Which reset do you want to use?' }),
   ).toBeNull();
 };
+const resetInput = (dialog: ReturnType<typeof within>) =>
+  dialog.getByRole('textbox', { name: /RESET/ });
+async function confirmReset(dialog: ReturnType<typeof within>) {
+  await fireEvent.input(resetInput(dialog), { target: { value: 'RESET' } });
+  await fireEvent.click(dialog.getByRole('button', { name: 'OK' }));
+}
 afterEach(() => language.set('en'));
 
 describe('Claude banked resets', () => {
@@ -178,12 +184,29 @@ describe('Claude banked resets', () => {
       expect(confirm.getByText(/Account: Personal/)).toBeVisible();
       expect(confirm.getByText(/1 left · use by/)).toBeVisible();
       expect(confirm.queryByRole('alert')).toBeNull();
-      await fireEvent.click(
-        confirm.getByRole('button', { name: 'Yes, use it' }),
-      );
+      const ok = confirm.getByRole('button', { name: 'OK' });
+      for (const value of ['', 'reset', 'RESET ']) {
+        await fireEvent.input(resetInput(confirm), { target: { value } });
+        expect(ok).toBeDisabled();
+        await fireEvent.click(ok);
+      }
+      await fireEvent.input(resetInput(confirm), {
+        target: { value: 'RESET' },
+      });
+      expect(ok).toBeEnabled();
+      expect(calls(s.call, 'claude_use_reset')).toHaveLength(0);
+      await fireEvent.click(ok);
       await waitFor(() =>
         expect(calls(s.call, 'claude_use_reset')).toEqual([
-          ['claude_use_reset', { id: 'b', kind: 'fable', allowEarly: false }],
+          [
+            'claude_use_reset',
+            {
+              id: 'b',
+              kind: 'fable',
+              allowEarly: false,
+              confirmation: 'RESET',
+            },
+          ],
         ]),
       );
       // While it runs the button says so, and nothing else can be started.
@@ -250,12 +273,13 @@ describe('Claude banked resets', () => {
           'You still have 35% of your limit left. Use this reset anyway?',
         ),
       ).toBeVisible();
-      await fireEvent.click(
-        confirm.getByRole('button', { name: 'Yes, use it' }),
-      );
+      await confirmReset(confirm);
       await waitFor(() =>
         expect(calls(s.call, 'claude_use_reset')).toEqual([
-          ['claude_use_reset', { id: 'b', kind: 'full', allowEarly: true }],
+          [
+            'claude_use_reset',
+            { id: 'b', kind: 'full', allowEarly: true, confirmation: 'RESET' },
+          ],
         ]),
       );
     });
@@ -289,17 +313,39 @@ describe('Claude banked resets', () => {
         resetSection(details).getByRole('button', { name: 'Use reset' }),
       );
       const confirm = within(question());
-      await fireEvent.click(
-        confirm.getByRole('button', { name: 'Yes, use it' }),
-      );
+      await confirmReset(confirm);
       expect(
         await confirm.findByText(
           'This reset is usable once you reach a limit it refills.',
         ),
       ).toBeVisible();
-      expect(
-        confirm.getByRole('button', { name: 'Yes, use it' }),
-      ).toBeEnabled();
+      expect(confirm.getByRole('button', { name: 'OK' })).toBeDisabled();
+      expect(resetInput(confirm)).toHaveValue('');
+    });
+
+    it('requires confirmation to replay a pending claim whose offer disappeared', async () => {
+      const s = setup(
+        snapshot({
+          accounts: accounts([], [], { pending: true, retryPending: true }),
+        }),
+      );
+      s.reply('claude_use_reset', () => snapshot({ revision: 8 }));
+      const details = await openDetails();
+      await fireEvent.click(
+        resetSection(details).getByRole('button', { name: 'Retry' }),
+      );
+      const confirm = within(
+        screen.getByRole('dialog', { name: 'Retry the previous reset?' }),
+      );
+      expect(confirm.getByRole('button', { name: 'OK' })).toBeDisabled();
+      expect(calls(s.call, 'claude_use_reset')).toHaveLength(0);
+      await confirmReset(confirm);
+      expect(calls(s.call, 'claude_use_reset')).toEqual([
+        [
+          'claude_use_reset',
+          { id: 'b', kind: null, allowEarly: false, confirmation: 'RESET' },
+        ],
+      ]);
     });
 
     it('says Retry for an unconfirmed request and still goes straight to its kind', async () => {
@@ -339,12 +385,18 @@ describe('Claude banked resets', () => {
         }),
       ).toBeNull();
       s.reply('claude_use_reset', () => snapshot({ revision: 8 }));
-      await fireEvent.click(
-        confirm.getByRole('button', { name: 'Yes, use it' }),
-      );
+      await confirmReset(confirm);
       await waitFor(() =>
         expect(calls(s.call, 'claude_use_reset')).toEqual([
-          ['claude_use_reset', { id: 'b', kind: 'weekly', allowEarly: false }],
+          [
+            'claude_use_reset',
+            {
+              id: 'b',
+              kind: 'weekly',
+              allowEarly: false,
+              confirmation: 'RESET',
+            },
+          ],
         ]),
       );
     });
@@ -393,7 +445,7 @@ describe('Claude banked resets', () => {
       ).toHaveAccessibleDescription(/^2 left Refills your weekly limit now\./);
       // No early-use warning until an early kind is chosen, and confirm waits.
       expect(choice.queryByRole('alert')).toBeNull();
-      const yes = choice.getByRole('button', { name: 'Yes, use it' });
+      const yes = choice.getByRole('button', { name: 'OK' });
       expect(yes).toBeDisabled();
       expect(yes).toHaveAccessibleDescription('Choose one to continue.');
       expect(choice.getByRole('button', { name: 'No, keep it' })).toBeEnabled();
@@ -411,12 +463,19 @@ describe('Claude banked resets', () => {
       ).not.toBeChecked();
       expect(choice.queryByRole('alert')).toBeNull();
       expect(choice.queryByText('Choose one to continue.')).toBeNull();
-      const yes = choice.getByRole('button', { name: 'Yes, use it' });
-      expect(yes).toBeEnabled();
-      await fireEvent.click(yes);
+      expect(choice.getByRole('button', { name: 'OK' })).toBeDisabled();
+      await confirmReset(choice);
       await waitFor(() =>
         expect(calls(s.call, 'claude_use_reset')).toEqual([
-          ['claude_use_reset', { id: 'b', kind: 'fable', allowEarly: false }],
+          [
+            'claude_use_reset',
+            {
+              id: 'b',
+              kind: 'fable',
+              allowEarly: false,
+              confirmation: 'RESET',
+            },
+          ],
         ]),
       );
       await waitFor(() => noQuestion());
@@ -431,17 +490,22 @@ describe('Claude banked resets', () => {
       expect(warning).toHaveTextContent(
         'You still have 35% of your limit left. Use this reset anyway?',
       );
-      // The warning belongs to the picked kind only.
+      await fireEvent.input(resetInput(choice), { target: { value: 'RESET' } });
+      expect(choice.getByRole('button', { name: 'OK' })).toBeEnabled();
+      // The warning and typed confirmation belong to the picked kind only.
       await fireEvent.click(choice.getByRole('radio', { name: 'Fable reset' }));
       expect(choice.queryByRole('alert')).toBeNull();
+      expect(resetInput(choice)).toHaveValue('');
+      expect(choice.getByRole('button', { name: 'OK' })).toBeDisabled();
       await fireEvent.click(choice.getByRole('radio', { name: 'Full reset' }));
       expect(choice.getByRole('alert')).toBeVisible();
-      await fireEvent.click(
-        choice.getByRole('button', { name: 'Yes, use it' }),
-      );
+      await confirmReset(choice);
       await waitFor(() =>
         expect(calls(s.call, 'claude_use_reset')).toEqual([
-          ['claude_use_reset', { id: 'b', kind: 'full', allowEarly: true }],
+          [
+            'claude_use_reset',
+            { id: 'b', kind: 'full', allowEarly: true, confirmation: 'RESET' },
+          ],
         ]),
       );
     });
@@ -456,9 +520,7 @@ describe('Claude banked resets', () => {
       await fireEvent.click(
         choice.getByRole('radio', { name: 'Weekly reset' }),
       );
-      await fireEvent.click(
-        choice.getByRole('button', { name: 'Yes, use it' }),
-      );
+      await confirmReset(choice);
       const busy = await choice.findByRole('button', {
         name: 'Resetting usage…',
       });
@@ -476,9 +538,8 @@ describe('Claude banked resets', () => {
       ).toBeVisible();
       // The pick stays, so the owner can try again or choose another kind.
       expect(choice.getByRole('radio', { name: 'Weekly reset' })).toBeChecked();
-      expect(
-        await choice.findByRole('button', { name: 'Yes, use it' }),
-      ).toBeEnabled();
+      expect(await choice.findByRole('button', { name: 'OK' })).toBeDisabled();
+      expect(resetInput(choice)).toHaveValue('');
       expect(calls(s.call, 'claude_use_reset')).toHaveLength(1);
     });
 
@@ -531,9 +592,7 @@ describe('Claude banked resets', () => {
         }),
       );
       await fireEvent.click(choice.getByRole('radio', { name: 'Fable reset' }));
-      await fireEvent.click(
-        choice.getByRole('button', { name: 'Yes, use it' }),
-      );
+      await confirmReset(choice);
       await waitFor(() => noQuestion());
       await waitFor(() => expect(document.activeElement).toBe(trigger));
     });
@@ -541,7 +600,8 @@ describe('Claude banked resets', () => {
     it('drops a pick whose kind is no longer usable', async () => {
       const { s, details, choice } = await openChooser();
       await fireEvent.click(choice.getByRole('radio', { name: 'Full reset' }));
-      expect(choice.getByRole('button', { name: 'Yes, use it' })).toBeEnabled();
+      await fireEvent.input(resetInput(choice), { target: { value: 'RESET' } });
+      expect(choice.getByRole('button', { name: 'OK' })).toBeEnabled();
       s.reply('refresh_account', () =>
         snapshot({
           revision: 10,
@@ -553,9 +613,7 @@ describe('Claude banked resets', () => {
         expect(choice.queryByRole('radio', { name: 'Full reset' })).toBeNull(),
       );
       expect(choice.queryByRole('alert')).toBeNull();
-      expect(
-        choice.getByRole('button', { name: 'Yes, use it' }),
-      ).toBeDisabled();
+      expect(choice.getByRole('button', { name: 'OK' })).toBeDisabled();
     });
   });
 
@@ -635,12 +693,13 @@ describe('Claude banked resets', () => {
     const trigger = card.getByRole('button', { name: 'Use reset' });
     trigger.focus();
     await fireEvent.click(trigger);
-    await fireEvent.click(
-      within(question()).getByRole('button', { name: 'Yes, use it' }),
-    );
+    await confirmReset(within(question()));
     await waitFor(() =>
       expect(calls(s.call, 'claude_use_reset')).toEqual([
-        ['claude_use_reset', { id: 'a', kind: 'fable', allowEarly: false }],
+        [
+          'claude_use_reset',
+          { id: 'a', kind: 'fable', allowEarly: false, confirmation: 'RESET' },
+        ],
       ]),
     );
   });
@@ -688,16 +747,19 @@ describe('Claude banked resets', () => {
     expect(choice.getByText(/Account: Studio/)).toBeVisible();
     for (const option of choice.getAllByRole('radio'))
       expect(option).not.toBeChecked();
-    expect(choice.getByRole('button', { name: 'Yes, use it' })).toBeDisabled();
+    expect(choice.getByRole('button', { name: 'OK' })).toBeDisabled();
     s.reply('claude_use_reset', () => snapshot({ revision: 3 }));
     await fireEvent.click(choice.getByRole('radio', { name: 'Full reset' }));
     expect(choice.getByRole('alert')).toHaveTextContent(
       'You still have 12% of your limit left.',
     );
-    await fireEvent.click(choice.getByRole('button', { name: 'Yes, use it' }));
+    await confirmReset(choice);
     await waitFor(() =>
       expect(calls(s.call, 'claude_use_reset')).toEqual([
-        ['claude_use_reset', { id: 'a', kind: 'full', allowEarly: true }],
+        [
+          'claude_use_reset',
+          { id: 'a', kind: 'full', allowEarly: true, confirmation: 'RESET' },
+        ],
       ]),
     );
   });
@@ -741,7 +803,7 @@ describe('Claude banked resets', () => {
     expect(choice.getByRole('radiogroup')).toBeVisible();
     for (const option of choice.getAllByRole('radio'))
       expect(option).not.toBeChecked();
-    const yes = choice.getByRole('button', { name: 'Da, folosește' });
+    const yes = choice.getByRole('button', { name: 'OK' });
     expect(yes).toBeDisabled();
     expect(yes).toHaveAccessibleDescription('Alege una ca să continui.');
     await fireEvent.click(
@@ -754,10 +816,13 @@ describe('Claude banked resets', () => {
       choice.getByRole('radio', { name: 'Resetare completă' }),
     ).toHaveAccessibleDescription(/^Rămase: 1 Reface acum toate limitele\./);
     expect(choice.getByRole('button', { name: 'Nu, o păstrez' })).toBeEnabled();
-    await fireEvent.click(yes);
+    await confirmReset(choice);
     await waitFor(() =>
       expect(calls(s.call, 'claude_use_reset')).toEqual([
-        ['claude_use_reset', { id: 'b', kind: 'full', allowEarly: true }],
+        [
+          'claude_use_reset',
+          { id: 'b', kind: 'full', allowEarly: true, confirmation: 'RESET' },
+        ],
       ]),
     );
     expect(document.body.textContent).not.toMatch(/[ŞşŢţ]/);

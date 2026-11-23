@@ -126,34 +126,6 @@ fn explicit_priority_follows_headroom_and_precedes_existing_weekly_order() {
     );
 }
 
-#[test]
-fn per_account_binding_thresholds_and_exclusion_apply_to_last_resort_resets() {
-    let active = info("active", 100.0, 0.0, None, true);
-    let mut excluded = with_grant(
-        info("excluded", 100.0, 0.0, None, false),
-        grant("g", Some(100000)),
-    );
-    excluded.account.automation.enabled = false;
-    assert!(decide_resets(&[active.clone(), excluded.clone()], 95.0, None, 0).is_empty());
-    excluded.account.automation.enabled = true;
-    assert_eq!(
-        decide_resets(&[active, excluded], 95.0, None, 0)[0].account_id,
-        "excluded"
-    );
-    let mut custom = with_grant(
-        info("custom", 75.0, 0.0, None, true),
-        ResetGrant {
-            use_requires_limit: false,
-            ..grant("g", Some(100000))
-        },
-    );
-    custom.account.automation.threshold = Some(70.0);
-    assert_eq!(
-        decide_resets(&[custom], 95.0, None, 0)[0].account_id,
-        "custom"
-    );
-}
-
 fn usage(five: f64, seven: f64, weekly_reset: Option<i64>) -> UsageResponse {
     UsageResponse {
         five_hour: UsageWindow {
@@ -185,13 +157,6 @@ fn grant(id: &str, end: Option<i64>) -> ResetGrant {
         ..ResetGrant::default()
     }
 }
-fn with_grant(mut info: AccountUsageInfo, g: ResetGrant) -> AccountUsageInfo {
-    info.account.reset_status = Some(ResetStatus {
-        grants: vec![g],
-        ..ResetStatus::default()
-    });
-    info
-}
 fn headers(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
     entries
         .iter()
@@ -203,7 +168,7 @@ fn headers(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
 fn settings_defaults_and_constraints() {
     let s = Settings::default();
     assert_eq!((s.poll_interval, s.threshold), (300, 95.0));
-    assert!(s.auto_switch_enabled && s.auto_start_window_enabled && s.auto_use_resets_enabled);
+    assert!(s.auto_switch_enabled && s.auto_start_window_enabled);
     assert!(s.prefer_soonest_weekly_reset);
     assert_eq!(s.candidate_order(), SOONEST);
     assert_eq!(s.appearance, "dark");
@@ -320,10 +285,10 @@ fn active_in_plan_excluded_as_target() {
     );
 }
 #[test]
-fn settings_saved_before_the_reset_order_existed_keep_every_value_and_the_original_order() {
+fn legacy_settings_keep_supported_values_and_default_to_the_original_account_order() {
     // Literal record written by an earlier release, before the setting existed.
-    let historical = json!({"poll_interval":900,"threshold":70.5,"auto_switch_enabled":false,
-        "auto_start_window_enabled":false,"auto_use_resets_enabled":false,
+    let mut historical = json!({"poll_interval":900,"threshold":70.5,"auto_switch_enabled":false,
+        "auto_start_window_enabled":false,"auto_use_resets_enabled":true,
         "appearance":"light","language":"ro"});
     let loaded: Settings = serde_json::from_value(historical.clone()).unwrap();
     assert_eq!(
@@ -335,7 +300,6 @@ fn settings_saved_before_the_reset_order_existed_keep_every_value_and_the_origin
             codex_threshold: None,
             auto_switch_enabled: false,
             auto_start_window_enabled: false,
-            auto_use_resets_enabled: false,
             appearance: "light".into(),
             language: "ro".into(),
             prefer_soonest_weekly_reset: true,
@@ -343,9 +307,12 @@ fn settings_saved_before_the_reset_order_existed_keep_every_value_and_the_origin
     );
     assert_eq!(loaded.candidate_order(), SOONEST);
     assert!(loaded.validate().is_ok());
-    // The default is not written, so such a record round-trips unchanged...
+    historical
+        .as_object_mut()
+        .unwrap()
+        .remove("auto_use_resets_enabled");
     assert_eq!(serde_json::to_value(&loaded).unwrap(), historical);
-    // ...while the opt-out is written and read back.
+    // The account order opt-out is still written and read back.
     let off = Settings {
         prefer_soonest_weekly_reset: false,
         ..loaded.clone()
@@ -560,156 +527,11 @@ fn offers_enforce_validity_eligibility_cooldown_and_next_id() {
     assert!(s.available(1000).is_empty());
     s.cooldown_until = Some(1000);
     assert_eq!(s.available(1000).len(), 1);
-    let mut i = with_grant(
-        info("active", 100.0, 10.0, None, true),
-        grant("early", Some(5000)),
-    );
-    let status = i.account.reset_status.as_mut().unwrap();
-    status.grants.push(grant("next", Some(6000)));
-    status.next_grant_id = Some("next".into());
-    assert_eq!(
-        decide_resets(&[i.clone()], 95.0, None, 1000)[0].grant_id,
-        "next"
-    );
-    status_missing_next(&mut i);
-    assert!(decide_resets(&[i], 95.0, None, 1000).is_empty());
 }
-fn status_missing_next(i: &mut AccountUsageInfo) {
-    i.account.reset_status.as_mut().unwrap().next_grant_id = Some("absent".into());
-}
+
 #[test]
-fn last_resort_requires_no_usable_alternative_and_prefers_active() {
-    let a = with_grant(
-        info("a", 100.0, 100.0, Some(8000), true),
-        grant("a_grant", Some(20000)),
-    );
-    let b = with_grant(
-        info("b", 100.0, 100.0, Some(9000), false),
-        grant("b_grant", Some(15000)),
-    );
-    let result = decide_resets(&[a.clone(), b.clone()], 95.0, None, 1000);
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].account_id, "a");
-    assert!(!result[0].switch_first);
-    assert!(
-        decide_resets(
-            &[a.clone(), info("free", 10.0, 10.0, None, false)],
-            95.0,
-            None,
-            1000
-        )
-        .is_empty()
-    );
-    let mut no_grant = a;
-    no_grant.account.reset_status = None;
-    let result = decide_resets(&[no_grant, b], 95.0, None, 1000);
-    assert_eq!(result[0].account_id, "b");
-    assert!(result[0].switch_first);
-}
-#[test]
-fn last_resort_real_limit_and_all_blocking_windows() {
-    let g = ResetGrant {
-        clears: vec!["five_hour".into()],
-        ..grant("g", Some(20000))
-    };
-    assert!(
-        decide_resets(
-            &[with_grant(info("a", 100.0, 100.0, None, true), g.clone())],
-            95.0,
-            None,
-            1000
-        )
-        .is_empty()
-    );
-    assert!(
-        decide_resets(
-            &[with_grant(info("a", 95.0, 20.0, None, true), g.clone())],
-            95.0,
-            None,
-            1000
-        )
-        .is_empty()
-    );
-    assert_eq!(
-        decide_resets(
-            &[with_grant(
-                info("a", 95.0, 20.0, None, true),
-                ResetGrant {
-                    use_requires_limit: false,
-                    ..g
-                }
-            )],
-            95.0,
-            None,
-            1000
-        )
-        .len(),
-        1
-    );
-}
-#[test]
-fn model_only_binding_needs_model_clear_but_simultaneous_week_uses_compatibility_assumption() {
-    let mut i = info("a", 20.0, 20.0, None, true);
-    i.usage.as_mut().unwrap().limits = Some(vec![UsageLimit {
-        kind: "weekly_scoped".into(),
-        group: "weekly".into(),
-        percent: 100.0,
-        scope: Some(json!({"model":{"display_name":"Opus"}})),
-        ..UsageLimit::default()
-    }]);
-    i = with_grant(i, grant("g", Some(20000)));
-    assert!(decide_resets(&[i.clone()], 95.0, Some("opus"), 1000).is_empty());
-    i.account.reset_status.as_mut().unwrap().grants[0].clears = vec!["seven_day_opus".into()];
-    assert_eq!(
-        decide_resets(&[i.clone()], 95.0, Some("opus"), 1000).len(),
-        1
-    );
-    i.usage.as_mut().unwrap().seven_day.utilization = 100.0;
-    i.account.reset_status.as_mut().unwrap().grants[0].clears =
-        vec!["seven_day_overage_included".into()];
-    assert_eq!(decide_resets(&[i], 95.0, Some("opus"), 1000).len(), 1);
-}
-#[test]
-fn expiry_exact_boundary_usable_now_no_switch_and_single_action() {
-    let a = info("a", 10.0, 10.0, None, true);
-    let mut b = with_grant(
-        info("b", 100.0, 10.0, None, false),
-        ResetGrant {
-            usable_now: true,
-            ..grant("g", Some(11800))
-        },
-    );
-    let result = decide_resets(&[a.clone(), b.clone()], 95.0, None, 1000);
-    assert_eq!(result.len(), 1);
-    assert!(!result[0].switch_first);
-    assert_eq!(result[0].reason, "expiră curând");
-    b.account.reset_status.as_mut().unwrap().grants[0].ends_at = Some(11801);
-    assert!(decide_resets(&[a.clone(), b.clone()], 95.0, None, 1000).is_empty());
-    b.account.reset_status.as_mut().unwrap().grants[0].ends_at = Some(11800);
-    b.account.reset_status.as_mut().unwrap().grants[0].usable_now = false;
-    assert!(decide_resets(&[a, b], 95.0, None, 1000).is_empty());
-    let active = with_grant(
-        info("x", 100.0, 10.0, None, true),
-        ResetGrant {
-            usable_now: true,
-            ..grant("g", Some(11800))
-        },
-    );
-    assert_eq!(decide_resets(&[active], 95.0, None, 1000).len(), 1);
-}
-#[test]
-fn reset_retry_and_fresh_status_backoff_preserve_pending_key() {
-    let mut i = with_grant(info("a", 100.0, 10.0, None, true), grant("g", Some(200000)));
-    i.account.last_reset_attempt_at = Some(1000);
-    i.account.reset_status_at = Some(1001);
-    assert!(decide_resets(&[i.clone()], 95.0, None, 2799).is_empty());
-    assert_eq!(decide_resets(&[i.clone()], 95.0, None, 2800).len(), 1);
-    i.account.reset_status_at = Some(1000);
-    assert!(decide_resets(&[i.clone()], 95.0, None, 2800).is_empty());
+fn pending_reset_identity_is_reused_without_expiry() {
     let pending = prepare_reset_claim("g", None, 1000).unwrap();
-    i.account.pending_reset_claim = Some(pending.clone());
-    assert!(decide_resets(&[i.clone()], 95.0, None, 1299).is_empty());
-    assert_eq!(decide_resets(&[i], 95.0, None, 1300).len(), 1);
     assert_eq!(
         prepare_reset_claim("g", Some(&pending), 100000).unwrap(),
         pending

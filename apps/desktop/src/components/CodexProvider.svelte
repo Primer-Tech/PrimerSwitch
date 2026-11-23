@@ -30,6 +30,7 @@
   import Modal from './Modal.svelte';
   import Icon from './Icon.svelte';
   import CodexResets from './CodexResets.svelte';
+  import ResetConfirmation from './ResetConfirmation.svelte';
   import CodexApiKeyDialog from './CodexApiKeyDialog.svelte';
   import CodexFallbackDialog from './CodexFallbackDialog.svelte';
   let {
@@ -152,6 +153,16 @@
   let details = $derived(view.rows.find((r) => r.id === detailsId) ?? null);
   const account = (id: string | undefined): CodexAccount | null =>
     snapshot?.accounts.find((a) => a.id === id) ?? null;
+  let resetRequest = $state<{ id: string; trigger: HTMLElement } | null>(null);
+  let resetAccount = $derived(account(resetRequest?.id));
+  let resetRow = $derived(view.rows.find((row) => row.id === resetRequest?.id));
+  let resetting = $derived(
+    pending === 'codex_consume_reset' &&
+      $controller.pendingId === resetRequest?.id,
+  );
+  $effect(() => {
+    if (resetRequest && !resetAccount && !resetting) resetRequest = null;
+  });
   onMount(() => {
     void controller.start();
   });
@@ -249,6 +260,11 @@
       await tick();
       focusOutcome(returnFocus);
     }
+  }
+  async function confirmReset(confirmation: string) {
+    if (!resetAccount?.reset.usable.enabled || locked) return;
+    await controller.consumeReset(resetAccount.id, confirmation);
+    resetRequest = null;
   }
   /** Billing consent: nothing is saved until the owner confirms in the dialog. */
   function askFallback(id: string, trigger: HTMLElement | null) {
@@ -639,7 +655,9 @@
           {locked}
           working={pending === 'codex_consume_reset' &&
             $controller.pendingId === activeRaw.id}
-          onreset={() => void controller.consumeReset(activeRaw!.id)}
+          onreset={(trigger) => {
+            if (activeRaw) resetRequest = { id: activeRaw.id, trigger };
+          }}
           onrefresh={() => void controller.refreshAccount(activeRaw!.id)}
         />
       </section>
@@ -817,7 +835,7 @@
               {locked}
               working={pending === 'codex_consume_reset' &&
                 $controller.pendingId === saved.id}
-              onreset={() => void controller.consumeReset(saved.id)}
+              onreset={(trigger) => (resetRequest = { id: saved.id, trigger })}
               onrefresh={() => void controller.refreshAccount(saved.id)}
             />
           </section>
@@ -850,6 +868,38 @@
       {/snippet}
     </AccountDetails>
   </Modal>{/if}
+{#if resetRequest && resetAccount && resetRow}
+  <Modal
+    title={t(
+      $language,
+      resetAccount.reset.pending ? 'codexRetryReset' : 'resetConfirmTitle',
+    )}
+    returnFocus={resetRequest.trigger}
+    onclose={() => {
+      if (!resetting) resetRequest = null;
+    }}
+  >
+    <p class="modal-intro">
+      <strong
+        >{t($language, 'resetConfirmAccount', {
+          name: identityLabel(resetRow, view.rows),
+        })}</strong
+      >
+      <br />{t(
+        $language,
+        resetAccount.reset.pending ? 'codexResetPending' : 'codexResetHelp',
+      )}
+    </p>
+    {#key resetAccount.reset.pending}
+      <ResetConfirmation
+        working={resetting}
+        disabled={locked || !resetAccount.reset.usable.enabled}
+        onconfirm={(confirmation) => void confirmReset(confirmation)}
+        oncancel={() => (resetRequest = null)}
+      />
+    {/key}
+  </Modal>
+{/if}
 {#if fallbackTarget}<CodexFallbackDialog
     pending={pending === 'codex_set_api_key_fallback'}
     disabled={locked}

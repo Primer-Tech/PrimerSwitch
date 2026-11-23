@@ -626,7 +626,6 @@ pub struct Settings {
     pub codex_threshold: Option<f64>,
     pub auto_switch_enabled: bool,
     pub auto_start_window_enabled: bool,
-    pub auto_use_resets_enabled: bool,
     pub appearance: String,
     pub language: String,
     /// Claude and Codex (owner request 2026-10-03): among usable accounts, use the one
@@ -650,7 +649,6 @@ impl Default for Settings {
             codex_threshold: None,
             auto_switch_enabled: true,
             auto_start_window_enabled: true,
-            auto_use_resets_enabled: true,
             appearance: "dark".into(),
             language: "en".into(),
             prefer_soonest_weekly_reset: true,

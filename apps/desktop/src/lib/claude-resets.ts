@@ -44,6 +44,8 @@ export function resetDeadline(timestamp: number, locale: Language): string {
 }
 
 /** One kind of reset the account holds, in the words the page shows. */
+export type ResetSelection = ResetKind | 'pending';
+
 export interface ResetRowView {
   kind: ResetKind;
   /** "Fable reset", "Full reset", "5-hour reset", "Weekly reset". */

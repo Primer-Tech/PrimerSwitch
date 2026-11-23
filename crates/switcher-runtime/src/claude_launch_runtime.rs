@@ -452,7 +452,6 @@ mod tests {
             readings,
             settings: Settings {
                 auto_switch_enabled: false,
-                auto_use_resets_enabled: false,
                 auto_start_window_enabled: false,
                 ..Settings::default()
             },

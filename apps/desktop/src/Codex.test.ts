@@ -90,6 +90,12 @@ function switched(
   };
   return raw;
 }
+async function confirmCodexReset(title = 'Use a reset?') {
+  const dialog = within(screen.getByRole('dialog', { name: title }));
+  const input = dialog.getByRole('textbox', { name: /RESET/ });
+  await fireEvent.input(input, { target: { value: 'RESET' } });
+  await fireEvent.click(dialog.getByRole('button', { name: 'OK' }));
+}
 afterEach(() => language.set('en'));
 describe('Codex accounts page', () => {
   it.each(['plus', 'team', 'business'])(
@@ -121,8 +127,24 @@ describe('Codex accounts page', () => {
       call.mockReturnValueOnce(pending.promise);
       const button = resets.getByRole('button', { name: 'Use one reset' });
       await fireEvent.click(button);
+      const dialog = within(
+        screen.getByRole('dialog', { name: 'Use a reset?' }),
+      );
+      const ok = dialog.getByRole('button', { name: 'OK' });
+      const input = dialog.getByRole('textbox', { name: /RESET/ });
+      expect(ok).toBeDisabled();
+      await fireEvent.input(input, { target: { value: 'Reset' } });
+      expect(ok).toBeDisabled();
+      await fireEvent.click(ok);
+      expect(
+        call.mock.calls.filter(
+          ([command]) => command === 'codex_consume_reset',
+        ),
+      ).toHaveLength(0);
+      await confirmCodexReset();
       expect(call).toHaveBeenLastCalledWith('codex_consume_reset', {
         id: account.id,
+        confirmation: 'RESET',
       });
       expect(
         resets.getByRole('button', { name: 'Resetting usage…' }),
@@ -155,6 +177,34 @@ describe('Codex accounts page', () => {
       ).toHaveAttribute('aria-valuenow', '0');
     },
   );
+  it('cancels a typed reset and clears the confirmation when reopened', async () => {
+    const raw = codexSnapshot();
+    raw.accounts[0].reset.usable = codexCapability();
+    const { call } = await setup(raw);
+    const button = section('Available resets').getByRole('button', {
+      name: 'Use one reset',
+    });
+    await fireEvent.click(button);
+    const question = () => screen.getByRole('dialog', { name: 'Use a reset?' });
+    await fireEvent.input(
+      within(question()).getByRole('textbox', { name: /RESET/ }),
+      { target: { value: 'RESET' } },
+    );
+    await fireEvent.click(
+      within(question()).getByRole('button', { name: 'Cancel' }),
+    );
+    await waitFor(() => expect(document.activeElement).toBe(button));
+    await fireEvent.click(button);
+    expect(
+      within(question()).getByRole('textbox', { name: /RESET/ }),
+    ).toHaveValue('');
+    expect(
+      within(question()).getByRole('button', { name: 'OK' }),
+    ).toBeDisabled();
+    expect(
+      call.mock.calls.filter(([command]) => command === 'codex_consume_reset'),
+    ).toHaveLength(0);
+  });
   it.each(['en', 'ro'] as const)(
     'shows exact localized reset expiry dates and explicit non-expiring credits (%s)',
     async (locale) => {
@@ -265,8 +315,10 @@ describe('Codex accounts page', () => {
     await fireEvent.click(
       resets.getByRole('button', { name: 'Verifică resetarea anterioară' }),
     );
+    await confirmCodexReset('Verifică resetarea anterioară');
     expect(call).toHaveBeenLastCalledWith('codex_consume_reset', {
       id: raw.accounts[0].id,
+      confirmation: 'RESET',
     });
     expect(
       await screen.findAllByText('Resetarea a fost aplicată.'),
@@ -303,8 +355,10 @@ describe('Codex accounts page', () => {
     await fireEvent.click(
       dialog.getByRole('button', { name: 'Use one reset' }),
     );
+    await confirmCodexReset();
     expect(call).toHaveBeenLastCalledWith('codex_consume_reset', {
       id: raw.accounts[1].id,
+      confirmation: 'RESET',
     });
     expect(
       call.mock.calls.some(([command]) => command === 'codex_switch_account'),

@@ -101,15 +101,24 @@ async fn resume_automatic_returns(runtime: State<'_, RuntimeHandle>) -> Reply<Sn
         .await
         .map_err(|e| local_error(&runtime, e))
 }
-/// Uses one banked reset of `kind` on a saved account, the active one or not. An early
-/// use (no limit reached) only goes through when the renderer confirmed it first.
+fn require_reset_confirmation(confirmation: &str) -> Reply<()> {
+    if confirmation == "RESET" {
+        Ok(())
+    } else {
+        Err("resetConfirmationRequired".into())
+    }
+}
+
+/// Redeems a banked Claude reset or replays a pending request for a saved account.
 #[tauri::command]
 async fn claude_use_reset(
     runtime: State<'_, RuntimeHandle>,
     id: String,
-    kind: ResetKind,
+    kind: Option<ResetKind>,
     allow_early: bool,
+    confirmation: String,
 ) -> Reply<Snapshot> {
+    require_reset_confirmation(&confirmation)?;
     runtime
         .use_reset(&id, kind, allow_early)
         .await
@@ -479,7 +488,9 @@ async fn codex_refresh_all(runtime: State<'_, RuntimeHandle>) -> Reply<CodexSnap
 async fn codex_consume_reset(
     runtime: State<'_, RuntimeHandle>,
     id: String,
+    confirmation: String,
 ) -> Reply<CodexSnapshot> {
+    require_reset_confirmation(&confirmation)?;
     runtime
         .codex_consume_reset(&id)
         .await
@@ -752,6 +763,17 @@ fn navigation_allowed(scheme: &str, host: Option<&str>, port: Option<u16>) -> bo
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reset_redemption_requires_the_exact_confirmation_word() {
+        assert!(super::require_reset_confirmation("RESET").is_ok());
+        for value in ["", "reset", "Reset", "RESET ", " RESET"] {
+            assert_eq!(
+                super::require_reset_confirmation(value).unwrap_err(),
+                "resetConfirmationRequired"
+            );
+        }
+    }
+
     use super::{ExitDecision, exit_decision, launch_after_folder, navigation_allowed};
     #[test]
     fn exit_decisions_cover_all_inputs() {

@@ -3,7 +3,6 @@
 //! held/usable tests and the early-use rule mirror what Claude Code itself applies to
 //! the same server data, so PrimerSwitch and the CLI agree on what can be used.
 //!
-//! None of this is automatic policy: `decide_resets` is unchanged and never calls it.
 use crate::{ResetGrant, ResetStatus};
 use serde::{Deserialize, Serialize};
 

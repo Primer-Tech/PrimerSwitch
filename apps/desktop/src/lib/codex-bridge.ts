@@ -13,7 +13,7 @@ export interface CodexCommandArgs {
   codex_set_api_key_flex: { id: string; enabled: boolean };
   codex_set_api_key_fallback: { id: string; enabled: boolean };
   codex_refresh_account: { id: string };
-  codex_consume_reset: { id: string };
+  codex_consume_reset: { id: string; confirmation: string };
   codex_refresh_all: undefined;
   codex_switch_account: { id: string };
   codex_delete_account: { id: string };

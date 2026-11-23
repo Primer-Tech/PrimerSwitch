@@ -272,7 +272,6 @@ describe('redacted IPC and runtime reconciliation', () => {
       threshold: 95,
       autoSwitchEnabled: true,
       autoStartWindowEnabled: true,
-      autoUseResetsEnabled: true,
       appearance: 'dark',
       language: 'en',
       preferSoonestWeeklyReset: true,

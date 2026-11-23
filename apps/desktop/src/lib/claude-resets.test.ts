@@ -348,11 +348,12 @@ describe('using a reset through the controller', () => {
     after.revision = 9;
     after.accounts[1].resets.lastOutcome = 'reset used — limits refilled';
     call.mockResolvedValueOnce(after);
-    expect(await c.useReset('b', 'fable', false)).toBe(true);
+    expect(await c.useReset('b', 'fable', 'RESET', false)).toBe(true);
     expect(call).toHaveBeenLastCalledWith('claude_use_reset', {
       id: 'b',
       kind: 'fable',
       allowEarly: false,
+      confirmation: 'RESET',
     });
     expect(get(c).snapshot?.revision).toBe(9);
     expect(get(c).pending).toBeNull();
@@ -362,21 +363,23 @@ describe('using a reset through the controller', () => {
   it('forwards the early-use confirmation only for an offer that is an early use', async () => {
     const early = setup(usable('full', { earlyUse: { percentLeft: 35 } }));
     await early.c.start();
-    await early.c.useReset('b', 'full', true);
+    await early.c.useReset('b', 'full', 'RESET', true);
     expect(early.call).toHaveBeenLastCalledWith('claude_use_reset', {
       id: 'b',
       kind: 'full',
       allowEarly: true,
+      confirmation: 'RESET',
     });
     early.c.dispose();
     // A stale "yes" cannot turn an ordinary use into a confirmed early one.
     const plain = setup(usable('full'));
     await plain.c.start();
-    await plain.c.useReset('b', 'full', true);
+    await plain.c.useReset('b', 'full', 'RESET', true);
     expect(plain.call).toHaveBeenLastCalledWith('claude_use_reset', {
       id: 'b',
       kind: 'full',
       allowEarly: false,
+      confirmation: 'RESET',
     });
     plain.c.dispose();
   });
@@ -395,7 +398,7 @@ describe('using a reset through the controller', () => {
       ['nobody', 'weekly'],
       ['b', 'monthly'],
     ] as const) {
-      expect(await c.useReset(id, kind as never, true)).toBe(false);
+      expect(await c.useReset(id, kind as never, 'RESET', true)).toBe(false);
       expect(get(c).error).toBe(t('en', 'resetNotUsable'));
     }
     expect(call.mock.calls.length).toBe(before);
@@ -410,16 +413,16 @@ describe('using a reset through the controller', () => {
     );
     vi.useRealTimers();
     call.mockReturnValueOnce(slow);
-    const first = c.useReset('b', 'weekly', false);
+    const first = c.useReset('b', 'weekly', 'RESET', false);
     const calls = call.mock.calls.length;
-    expect(await c.useReset('b', 'weekly', false)).toBe(false);
+    expect(await c.useReset('b', 'weekly', 'RESET', false)).toBe(false);
     expect(call.mock.calls.length).toBe(calls);
     await first;
     c.dispose();
     const demo = setup({ ...usable('weekly'), demo: true });
     await demo.c.start();
     const before = demo.call.mock.calls.length;
-    expect(await demo.c.useReset('b', 'weekly', false)).toBe(false);
+    expect(await demo.c.useReset('b', 'weekly', 'RESET', false)).toBe(false);
     expect(demo.call.mock.calls.length).toBe(before);
     demo.c.dispose();
   });
@@ -436,13 +439,13 @@ describe('using a reset through the controller', () => {
     ] as const) {
       // The native side answers with the message text of its own language.
       call.mockRejectedValueOnce(t('ro', key));
-      expect(await c.useReset('b', 'weekly', false)).toBe(false);
+      expect(await c.useReset('b', 'weekly', 'RESET', false)).toBe(false);
       expect(get(c).error).toBe(t('en', key));
       expect(safeError(t('en', key), 'ro')).toBe(t('ro', key));
     }
     // Text that is not a catalog message and looks like a secret is never shown.
     call.mockRejectedValueOnce(new Error('access_token sk-ant-SECRET'));
-    await c.useReset('b', 'weekly', false);
+    await c.useReset('b', 'weekly', 'RESET', false);
     expect(get(c).error).toBe(t('en', 'failedAction'));
     expect(get(c).pending).toBeNull();
     c.dispose();

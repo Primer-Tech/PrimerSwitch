@@ -7,7 +7,7 @@
     safeError,
     type Controller,
   } from '../lib/controller';
-  import type { AccountView, ErrorView, ResetKind } from '../lib/types';
+  import type { AccountView, ErrorView } from '../lib/types';
   import { claudeView } from '../lib/claude-view';
   import type {
     AccountRowView,
@@ -23,6 +23,7 @@
   import Modal from './Modal.svelte';
   import Icon from './Icon.svelte';
   import ClaudeLaunch from './ClaudeLaunch.svelte';
+  import type { ResetSelection } from '../lib/claude-resets';
   import ClaudeResets from './ClaudeResets.svelte';
   import ClaudeResetConfirm from './ClaudeResetConfirm.svelte';
   import ClaudeResetChoice from './ClaudeResetChoice.svelte';
@@ -66,11 +67,11 @@
    * The reset the user asked to use and has not confirmed yet. With one usable kind the
    * kind is known; with several it stays null until the chooser has an answer.
    */
-  let resetRequest = $state<{ id: string; kind: ResetKind | null } | null>(
+  let resetRequest = $state<{ id: string; kind: ResetSelection | null } | null>(
     null,
   );
   /** The reset whose request is running. */
-  let resetting = $state<{ id: string; kind: ResetKind } | null>(null);
+  let resetting = $state<string | null>(null);
   let resetFocus = $state<HTMLElement | null>(null);
   let detailsId = $state<string | null>(null);
   let deleteTarget = $state<AccountRowView | null>(null);
@@ -85,6 +86,10 @@
     snapshot?.accounts.find((account) => account.id === id) ?? null;
   let resetRows = $derived(
     view.rows.find((r) => r.id === resetRequest?.id)?.resets?.rows ?? [],
+  );
+  let canRetryPending = $derived(
+    resetRequest?.kind === 'pending' &&
+      !!raw(resetRequest.id)?.resets.retryPending,
   );
   let confirmRow = $derived(
     resetRequest?.kind
@@ -101,7 +106,9 @@
   $effect(() => {
     if (
       resetRequest &&
-      !(resetRequest.kind ? confirmRow : choiceRows.length) &&
+      !(resetRequest.kind
+        ? confirmRow || canRetryPending
+        : choiceRows.length) &&
       !resetting
     )
       resetRequest = null;
@@ -172,19 +179,30 @@
   }
   // Using a reset spends a scarce, one-off credit: it is always confirmed first. One
   // usable kind goes straight to its question; several are chosen from, with no default.
-  function askReset(id: string, kinds: ResetKind[], trigger: HTMLElement) {
+  function askReset(id: string, kinds: ResetSelection[], trigger: HTMLElement) {
     if (!kinds.length) return;
     resetFocus = trigger;
     resetRequest = { id, kind: kinds.length === 1 ? kinds[0] : null };
   }
-  async function confirmReset(kind: ResetKind) {
+  async function confirmReset(kind: ResetSelection, confirmation: string) {
     const request = resetRequest;
     // The early-use confirmation comes from the offer as it is now, never from an
     // earlier view of it.
     const row = resetRows.find((r) => r.kind === kind);
-    if (!request || !row || resetting) return;
-    resetting = { id: request.id, kind };
-    const done = await controller.useReset(request.id, kind, !!row.early);
+    if (
+      !request ||
+      locked ||
+      resetting ||
+      !(kind === 'pending' ? canRetryPending : row?.canUse)
+    )
+      return;
+    resetting = request.id;
+    const done = await controller.useReset(
+      request.id,
+      kind === 'pending' ? null : kind,
+      confirmation,
+      !!row?.early,
+    );
     resetting = null;
     if (done) resetRequest = null;
   }
@@ -338,11 +356,6 @@
       label: t($language, 'primeWindow'),
       on: !!snapshot?.settings.autoStartWindowEnabled,
     },
-    {
-      kind: 'toggle',
-      label: t($language, 'autoResets'),
-      on: !!snapshot?.settings.autoUseResetsEnabled,
-    },
   ]);
   let activeRaw = $derived(raw(view.active?.id));
 </script>
@@ -416,7 +429,7 @@
           account={activeRaw}
           {now}
           {locked}
-          working={resetting?.id === activeRaw.id}
+          working={resetting === activeRaw.id}
           onuse={(kinds, trigger) => askReset(activeRaw.id, kinds, trigger)}
         />{/if}
       <div class="renewal-summary">
@@ -527,7 +540,7 @@
             {now}
             {locked}
             heading={`${t($language, 'availableResets')}${account.resets.available === null ? '' : ` · ${account.resets.available}`}`}
-            working={resetting?.id === account.id}
+            working={resetting === account.id}
             onuse={(kinds, trigger) => askReset(account.id, kinds, trigger)}
           />
         {/if}
@@ -535,14 +548,15 @@
     </AccountDetails>
   </Modal>{/if}
 
-{#if resetRequest && confirmRow}<ClaudeResetConfirm
+{#if resetRequest && (confirmRow || (resetRequest.kind === 'pending' && (canRetryPending || resetting)))}<ClaudeResetConfirm
     name={confirmName}
     row={confirmRow}
     working={!!resetting}
-    disabled={locked}
+    disabled={locked || (!confirmRow && !canRetryPending)}
     error={$controller.error ? safeError($controller.error, $language) : null}
     returnFocus={resetFocus}
-    onconfirm={() => void confirmReset(confirmRow.kind)}
+    onconfirm={(confirmation) =>
+      void confirmReset(confirmRow?.kind ?? 'pending', confirmation)}
     oncancel={() => (resetRequest = null)}
   />{:else if resetRequest && choiceRows.length}<ClaudeResetChoice
     name={confirmName}
@@ -551,7 +565,7 @@
     disabled={locked}
     error={$controller.error ? safeError($controller.error, $language) : null}
     returnFocus={resetFocus}
-    onconfirm={(kind) => void confirmReset(kind)}
+    onconfirm={(kind, confirmation) => void confirmReset(kind, confirmation)}
     oncancel={() => (resetRequest = null)}
   />{/if}
 

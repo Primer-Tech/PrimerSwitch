@@ -164,11 +164,12 @@ export const en = {
   resetChooseTitle: 'Which reset do you want to use?',
   resetChoosePrompt: 'Choose one to continue.',
   resetsCached: 'Saved reading. Refresh to check the current availability.',
+  resetConfirmRetryTitle: 'Retry the previous reset?',
   resetConfirmTitle: 'Use a reset?',
   resetConfirmAccount: 'Account: {name}',
   resetConfirmDetail: '{left} left · use by {date}',
   resetConfirmDetailNoDate: '{left} left',
-  resetConfirmYes: 'Yes, use it',
+  resetConfirmType: 'Type {keyword} to confirm.',
   resetConfirmNo: 'No, keep it',
   resetConfirmRetry:
     'The last attempt was not confirmed. Sending the same request again cannot use a second reset.',
@@ -271,9 +272,6 @@ export const en = {
   primeWindow: 'Start the 5-hour and weekly windows',
   primeHelp:
     "When an account's 5-hour or weekly window ends, send one very short message at the next check to start the next window, so its next reset comes sooner. This also applies to inactive accounts. If both windows end together, one message starts both.",
-  autoResets: 'Use resets automatically',
-  resetsHelp:
-    'When every account is at its limit, use a banked reset. If the reset belongs to another account, PrimerSwitch switches to that account first, even when automatic switching is off. A reset about to expire is used on its own account without switching.',
   pollInterval: 'Check interval',
   minutes: '{count} min',
   pollingHelp:

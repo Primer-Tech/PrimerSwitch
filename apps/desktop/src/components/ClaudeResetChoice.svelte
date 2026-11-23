@@ -3,6 +3,7 @@
   import type { ResetRowView } from '../lib/claude-resets';
   import type { ResetKind } from '../lib/types';
   import Modal from './Modal.svelte';
+  import ResetConfirmation from './ResetConfirmation.svelte';
   let {
     name,
     rows,
@@ -22,7 +23,7 @@
     disabled: boolean;
     error?: string | null;
     returnFocus?: HTMLElement | null;
-    onconfirm: (kind: ResetKind) => void;
+    onconfirm: (kind: ResetKind, confirmation: string) => void;
     oncancel: () => void;
   } = $props();
   const uid = $props.id();
@@ -85,21 +86,18 @@
       {pickedRow.early.text}
     </p>{/if}
   {#if error}<p class="warning-text choice-note" role="alert">{error}</p>{/if}
-  <div class="modal-actions">
-    <button disabled={working} onclick={oncancel}
-      >{t($language, 'resetConfirmNo')}</button
-    ><button
-      class="primary"
-      disabled={!pickedRow || disabled || working}
-      aria-describedby={pickedRow ? undefined : `${uid}-prompt`}
-      onclick={() => {
-        if (pickedRow && !disabled && !working) onconfirm(pickedRow.kind);
+  {#key pickedRow?.kind}
+    <ResetConfirmation
+      {working}
+      disabled={!pickedRow || disabled}
+      describedBy={pickedRow ? undefined : `${uid}-prompt`}
+      cancelLabel={t($language, 'resetConfirmNo')}
+      onconfirm={(confirmation) => {
+        if (pickedRow) onconfirm(pickedRow.kind, confirmation);
       }}
-      >{working
-        ? t($language, 'resetUsing')
-        : t($language, 'resetConfirmYes')}</button
-    >
-  </div>
+      {oncancel}
+    />
+  {/key}
 </Modal>
 
 <style>

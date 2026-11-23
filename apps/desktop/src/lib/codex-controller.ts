@@ -374,7 +374,10 @@ export function createCodexController(bridge: CodexBridge = codexNativeBridge) {
       set({ pending: null, pendingId: null });
     }
   }
-  async function consumeReset(id: string): Promise<boolean> {
+  async function consumeReset(
+    id: string,
+    confirmation: string,
+  ): Promise<boolean> {
     const account = state.snapshot?.accounts.find(
       (account) => account.id === id,
     );
@@ -386,7 +389,9 @@ export function createCodexController(bridge: CodexBridge = codexNativeBridge) {
       notice: null,
     });
     try {
-      const result = accept(await bridge.call('codex_consume_reset', { id }));
+      const result = accept(
+        await bridge.call('codex_consume_reset', { id, confirmation }),
+      );
       const reset = result.accounts.find((account) => account.id === id)?.reset;
       if (reset?.lastOutcome && !reset.pending) {
         set({

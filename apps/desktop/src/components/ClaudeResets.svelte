@@ -1,8 +1,8 @@
 <script lang="ts">
   import { language, t } from '../lib/i18n';
   import { safeError } from '../lib/controller';
-  import { resetsView } from '../lib/claude-resets';
-  import type { AccountView, ResetKind } from '../lib/types';
+  import { resetsView, type ResetSelection } from '../lib/claude-resets';
+  import type { AccountView } from '../lib/types';
   let {
     account,
     now,
@@ -23,13 +23,16 @@
      * Asks to use a reset. It passes the kinds that can be used now; the page asks which
      * one when there are several, and confirms it with the user first.
      */
-    onuse: (kinds: ResetKind[], trigger: HTMLElement) => void;
+    onuse: (kinds: ResetSelection[], trigger: HTMLElement) => void;
   } = $props();
   const uid = $props.id();
   let resets = $derived(resetsView(account, now, $language));
+  let canUse = $derived(
+    !!account.resets.retryPending || resets.usable.length > 0,
+  );
   // While nothing can be used the button points at the reason it is disabled.
   let describedBy = $derived(
-    resets.usable.length
+    canUse
       ? undefined
       : resets.rows.length === 0
         ? `${uid}-none`
@@ -71,18 +74,25 @@
     </p>{/if}
   <button
     class="primary reset-use"
-    disabled={locked || working || !resets.usable.length}
+    disabled={locked || working || !canUse}
     aria-describedby={describedBy}
     onclick={(event) => {
-      if (locked || working || !resets.usable.length) return;
+      if (locked || working || !canUse) return;
       onuse(
-        resets.usable.map((row) => row.kind),
+        account.resets.retryPending
+          ? ['pending']
+          : resets.usable.map((row) => row.kind),
         event.currentTarget,
       );
     }}
     >{working
       ? t($language, 'resetUsing')
-      : t($language, resets.retry ? 'resetRetry' : 'resetUse')}</button
+      : t(
+          $language,
+          resets.retry || account.resets.retryPending
+            ? 'resetRetry'
+            : 'resetUse',
+        )}</button
   >
   {#if account.decisionFresh === false && resets.rows.length}<p class="help">
       {t($language, 'resetsCached')}

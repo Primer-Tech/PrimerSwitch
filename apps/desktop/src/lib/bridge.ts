@@ -19,7 +19,12 @@ export interface CommandArgs {
   update_account_automation: { id: string; automation: AccountAutomation };
   resume_automatic_returns: undefined;
   /** Uses one banked reset of a kind; the native side re-checks everything. */
-  claude_use_reset: { id: string; kind: ResetKind; allowEarly: boolean };
+  claude_use_reset: {
+    id: string;
+    kind: ResetKind | null;
+    allowEarly: boolean;
+    confirmation: string;
+  };
   import_current: undefined;
   begin_login: { accountId?: string | null } | undefined;
   finish_login: { id: string; code: string };

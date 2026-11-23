@@ -161,17 +161,6 @@
           bind:checked={draft.autoStartWindowEnabled}
         /></label
       >
-      <label class="toggle-row"
-        ><span
-          ><strong>{t(locale, 'autoResets')}</strong><small
-            >{t(locale, 'resetsHelp')}</small
-          ></span
-        ><input
-          type="checkbox"
-          role="switch"
-          bind:checked={draft.autoUseResetsEnabled}
-        /></label
-      >
     </fieldset>
     <fieldset disabled={disabled || saving}>
       <legend class="sr-only">{t(locale, 'globalPreferences')}</legend>

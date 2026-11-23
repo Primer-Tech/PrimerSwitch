@@ -16,7 +16,7 @@
     account: CodexAccount;
     locked: boolean;
     working?: boolean;
-    onreset: () => void;
+    onreset: (trigger: HTMLButtonElement) => void;
     onrefresh: () => void;
   } = $props();
   const uid = $props.id();
@@ -99,7 +99,7 @@
       class="primary"
       disabled={locked || !account.reset.usable.enabled}
       aria-describedby={`${uid}-help`}
-      onclick={onreset}
+      onclick={(event) => onreset(event.currentTarget)}
       >{t(
         $language,
         working

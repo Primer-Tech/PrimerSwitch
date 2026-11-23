@@ -51,7 +51,6 @@ OAuth fields live under `credentials.claudeAiOauth`; access/refresh tokens, expi
 | Auto-switch threshold | 95 percent | `autoSwitchThreshold`; stepper 50–100, step 1 |
 | Automatic switching | Enabled | `autoSwitchEnabled` |
 | Start reopened weekly window | Enabled | `autoStartWindowEnabled` |
-| Automatically use banked resets | Enabled | `autoUseResetsEnabled` |
 | Weekly reset order | Soonest weekly reset first (added later; on is the original order) | `preferSoonestWeeklyReset`, default on; records saved before it existed load as on (B13) |
 | Appearance | System | `appearance`: `system`, `light`, `dark` |
 | Near-limit band and cadence | Threshold minus 3 points; 30 seconds | Active-only tick unless all accounts were found exhausted |
@@ -63,7 +62,7 @@ OAuth fields live under `credentials.claudeAiOauth`; access/refresh tokens, expi
 | Metadata 429 cooldown | `min(60 × 2^(n−1), 900)` seconds | Respect a larger numeric `Retry-After` |
 | Repeated exhausted notification | At most once per 1,800 seconds | Earliest main-window reset across accounts |
 
-Preserve these Claude policy defaults in the replacement. The owner explicitly selected English as the new default language and dark as the initial appearance; existing explicit appearance settings remain preserved. Settings must be validated in Rust. Import out-of-range preferences by reporting/clamping them to supported UI ranges, rather than accepting arbitrary persisted values. Provider settings stay independent, with one owner decision (2026-10-03): automatic switching, the threshold, the check interval and the weekly reset order also drive Codex ([CODEX_USAGE.md](CODEX_USAGE.md)), with these Claude defaults, while priming and banked resets stay Claude-only.
+Preserve these Claude policy defaults in the replacement. The owner explicitly selected English as the new default language and dark as the initial appearance; existing explicit appearance settings remain preserved. Settings must be validated in Rust. Import out-of-range preferences by reporting/clamping them to supported UI ranges, rather than accepting arbitrary persisted values. Provider settings stay independent, with one owner decision (2026-10-03): automatic switching, the threshold, the check interval and the weekly reset order also drive Codex ([CODEX_USAGE.md](CODEX_USAGE.md)), with these Claude defaults, while window priming is Claude-only. Banked credits from either provider require manual confirmation.
 
 ### B03 — Subscription and renewal
 
@@ -146,7 +145,7 @@ Show saved usage immediately after restart and retain it on a network error, wit
 
 Version 0.2.4 retains the old threshold as a fallback and adds independent Claude/Codex defaults. Each account can inherit its provider default or set a finite 50..100 percent-used override. Eligibility, headroom, near-limit polling, binding-window checks, reset decisions and renderer status use that account's effective threshold. Existing records retain the previous behavior by default.
 
-Accounts can be excluded as automatic destinations, including last-resort Claude reset switching, while remaining manually selectable. An explicit priority from 1 (highest) to 99 ranks candidates after preferred headroom and before the existing weekly ordering. Equal or absent priorities use the original tie breakers.
+Accounts can be excluded as automatic destinations, while remaining manually selectable. An explicit priority from 1 (highest) to 99 ranks candidates after preferred headroom and before the existing weekly ordering. Equal or absent priorities use the original tie breakers.
 
 An account with inclusion, explicit priority and **Return after 5-hour reset** enabled can return automatically after a five-hour window previously observed above its preferred-headroom ceiling (effective threshold minus five points) naturally recovers. Its remembered reset must have passed and fresh identity/usage evidence must confirm preferred headroom in every applicable binding window. Only a higher-priority inactive account can pull the user back; a healthy active account otherwise remains selected. Unknown windows or reset times never imply available quota. A fresh explicit zero-usage five-hour window with no new reset date can prove unused/unstarted recovery after the known old reset; an absent window cannot, and nonzero usage with no new reset remains ineligible. The observed/handled reset ledger persists, preventing repeated returns for one reset. A manual selection pauses returns for 15 minutes, with an explicit resume action. A ten-minute automatic-switch cooldown also gates returns, including across restart; provider switching/credential ownership guards remain authoritative. Natural recovery is separate from Claude window priming and banked resets.
 
@@ -170,7 +169,7 @@ Owner option (2026-10-03): `preferSoonestWeeklyReset`, default on, keeps exactly
 
 On each full cycle, reread configured model and active identity; poll the active account and due inactive accounts, spacing requests. Fast ticks poll only the active account. Cached inactive data younger than 15 minutes avoids unnecessary startup calls. Near-limit polling applies at `>= T − 3`, including model-aware weekly usage; it is suppressed after a result that all accounts are exhausted.
 
-After readings/profile/priming, evaluate reset actions, then auto-switch unless a reset just succeeded on the active account. After a switch, reload active state and reread before deciding further actions. Replace the old recursive refresh with an event/state transition so one user click or timer cannot run multiple overlapping cycles.
+After readings, profile checks and priming, evaluate automatic switching. After a switch, reload active state and reread before deciding further actions. Replace the old recursive refresh with an event/state transition so one user click or timer cannot run multiple overlapping cycles.
 
 No active account means no automatic switch. No usable active reading suspends it. At `>= T` in either binding window, use B13; if none qualifies, show the earliest five-hour/seven-day reset among accounts and throttle repeated exhausted notifications to 30 minutes. Successful and failed switches notify the user. Freshness and identity checks apply before any mutation.
 
@@ -184,35 +183,21 @@ The original marks a reset primed even when the toggle is disabled, so re-enabli
 
 ## 6. Banked Claude resets
 
-### B16 — Offer and binding windows
+### B16 through B18 — Manual redemption
 
-Reset grants have `id`, `resets_left`, optional validity/cooldown times, `clears`, `paused`, `usable_now`, `use_requires_limit` and related metadata. Grant IDs match `^[a-z0-9_-]{1,40}$`. When decoded, missing `use_requires_limit` means true, missing `paused` means false, missing `usable_now` means false. A missing/empty `clears` list means five-hour plus seven-day; `seven_day_overage_included` also covers `seven_day`.
+The owner requested manual-only redemption for Claude and Codex on 2026-11-23. The app shows the target account and applicable warnings before spending a credit. The user must type `RESET` exactly and select **OK**, including for retries. With several usable Claude kinds, the user picks one first. Changing the selection clears the confirmation text.
 
-An offer requires remaining uses, unpaused state, start reached, end not reached, eligibility not explicitly false, and no cooldown. Respect the server's `next_grant_id` when present; otherwise choose the earliest-expiring offer. Unknown validity times sort after known expiry.
-
-Binding windows are five-hour at/over threshold, account-wide seven-day at/over threshold, and `seven_day_<lowercase-model-label>` if only a matching scoped window is binding. A required real limit is checked at **100**, independently of the user threshold. Source behavior assumes account-wide weekly clearing covers a simultaneously exhausted model row; this is a compatibility assumption that needs verification, not documented server semantics.
-
-### B17 — Last resort
-
-Only when the active account is over threshold and **no other account is usable**, seek a grant that clears every blocking window on its account and satisfies a required real limit. Prefer the active account. Otherwise choose earliest grant expiry, then latest weekly reset. A selected inactive account is switched to before claiming.
-
-The reset automation toggle is independent of ordinary auto-switching: an enabled last-resort reset can switch to its inactive account even when the ordinary auto-switch toggle is off. Preserve and explain that distinction in the UI.
-
-The source's last-resort branch does not require `usable_now`; the expiry branch does. Capture that distinction in tests. Do not invent a common additional gate without verifying current contract semantics and recording a deliberate deviation.
-
-### B18 — Expiry guard
-
-For each other account not already selected this cycle, a usable-now offer expiring within **3 hours** may be claimed, with the real-limit condition when required. It can act on an inactive account **without switching**. At most one action per account per cycle. This is independent of whether another account has free budget; it prevents an expiring offer from being lost.
+Earlier versions enabled automatic Claude redemption by default. They could spend a credit as a last resort when no account was usable or when an eligible offer was within three hours of expiring. The app now ignores that legacy setting. The scheduler sends no claims or replays.
 
 ### B19 — Claims, retries and outcomes
 
-Before sending, durably save a pending claim containing account, grant, request UUID and timestamp, plus last-attempt time. Retry an unconfirmed answer after at least 5 minutes using the same request ID for the same grant. The source abandons a pending request after 24 hours; the replacement must first reconcile ambiguous old claims rather than immediately risk a second redemption.
+Before sending, durably save a pending claim containing account, grant, request UUID and timestamp, plus last-attempt time. An explicit retry of an unconfirmed answer can replay the same request ID for the same grant after at least five minutes, even if the grant is no longer listed. The source abandons a pending request after 24 hours; the replacement must first reconcile ambiguous old claims rather than immediately risk a second redemption.
 
-A final non-success verdict requires at least 30 minutes and reset status newer than the prior attempt before another claim. Claim outcomes are `reset`, `already_used`, `not_limited`, `cooldown`, `ineligible`, `unavailable` (including unknown named results), authentication failure, or unconfirmed transport. 401/403 are final auth failures; 429 is unconfirmed. A readable named verdict on other HTTP errors is accepted by the source, even though its comment mentions only 4xx. Without a named verdict, errors/unreadable bodies remain unconfirmed. Treat 5xx ambiguity conservatively in the replacement and test it explicitly.
+Claim outcomes are `reset`, `already_used`, `not_limited`, `cooldown`, `ineligible`, `unavailable` (including unknown named results), authentication failure, or unconfirmed transport. 401/403 are final auth failures; 429 is unconfirmed. A readable named verdict on other HTTP errors is accepted by the source, even though its comment mentions only 4xx. Without a named verdict, errors/unreadable bodies remain unconfirmed. Treat 5xx ambiguity conservatively in the replacement and test it explicitly.
 
-On success, use supplied remaining uses or decrement, remove spent grants, clear the consumed `next_grant_id`, and apply cooldown. `already_used` removes that grant; cooldown verdict updates its time. A success invalidates pre-reset usage for decisions and schedules reread; do not auto-switch on the stale 100 in that cycle. After an action switched accounts, stop consuming the old action list and recompute.
+On success, use supplied remaining uses or decrement, remove spent grants, clear the consumed `next_grant_id`, and apply cooldown. `already_used` removes that grant; cooldown verdict updates its time. A success invalidates pre-reset usage for decisions and schedules reread; do not auto-switch on the stale 100 in that cycle.
 
-Notifications combine switch + reset result. Reset refusal without a switch remains on the card; reset success notifies even without switching. Detailed outcomes remain visible on the card after restart.
+The account card shows reset refusals. A successful reset produces a notification. Detailed outcomes remain visible on the card after restart.
 
 ## 7. Interface parity
 
